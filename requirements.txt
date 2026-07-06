@@ -1,0 +1,7 @@
+numpy
+pandas
+pyTelegramBotAPI
+requests
+yfinance
+xgboost
+scikit-learn
