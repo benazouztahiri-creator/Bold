@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-Falcon AI Pro v4.0 - Fixed Webhook
-===================================
-Auto-removes webhook on startup.
+Falcon AI Pro v4.1 - Balanced Signals + Accurate Confidence
+============================================================
+Fixed: Buy/Sell balance + Proper confidence scoring
 """
 
 import os
@@ -33,9 +33,10 @@ from sklearn.model_selection import TimeSeriesSplit
 from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
 from sklearn.feature_selection import mutual_info_classif
 from sklearn.preprocessing import RobustScaler
-from sklearn.metrics import accuracy_score, f1_score
-from sklearn.calibration import CalibratedClassifierCV
+from sklearn.metrics import accuracy_score, f1_score, brier_score_loss
+from sklearn.calibration import CalibratedClassifierCV, calibration_curve
 from sklearn.linear_model import LogisticRegression
+from sklearn.utils.class_weight import compute_class_weight
 import xgboost as xgb
 from catboost import CatBoostClassifier
 
@@ -68,7 +69,9 @@ class Config:
     WALK_FORWARD_WINDOWS: int = 3
     MIN_TRAINING_SAMPLES: int = 500
     
-    CONFIDENCE_THRESHOLD: float = 0.60
+    # ✅ عتبات منفصلة للشراء والبيع
+    CONFIDENCE_THRESHOLD_BUY: float = 0.60
+    CONFIDENCE_THRESHOLD_SELL: float = 0.60
     
     RETRAINING_INTERVAL_HOURS: int = 24
     MAX_FEATURES: int = 60
@@ -112,21 +115,21 @@ class Database:
     
     def _init(self):
         with sqlite3.connect(self.db_path) as conn:
-            conn.execute('''
+            conn.executescript('''
                 CREATE TABLE IF NOT EXISTS signals (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     symbol TEXT, direction TEXT, entry_price REAL,
-                    confidence REAL, entry_time DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    confidence REAL, proba_buy REAL, proba_sell REAL,
+                    entry_time DATETIME DEFAULT CURRENT_TIMESTAMP,
                     expiry_time DATETIME, result TEXT DEFAULT 'PENDING',
                     pnl_percent REAL, signal_hash TEXT UNIQUE
-                )
-            ''')
-            conn.execute('''
+                );
                 CREATE TABLE IF NOT EXISTS performance (
                     symbol TEXT PRIMARY KEY,
-                    last_50_wins INTEGER DEFAULT 0,
-                    last_50_total INTEGER DEFAULT 0
-                )
+                    buy_wins INTEGER DEFAULT 0, buy_total INTEGER DEFAULT 0,
+                    sell_wins INTEGER DEFAULT 0, sell_total INTEGER DEFAULT 0,
+                    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+                );
             ''')
             conn.commit()
     
@@ -137,39 +140,66 @@ class Database:
             with sqlite3.connect(self.db_path) as conn:
                 conn.execute('''
                     INSERT OR IGNORE INTO signals 
-                    (symbol, direction, entry_price, confidence, expiry_time, signal_hash)
-                    VALUES (?, ?, ?, ?, ?, ?)
+                    (symbol, direction, entry_price, confidence, proba_buy, proba_sell, expiry_time, signal_hash)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 ''', (data['symbol'], data['direction'], data['entry_price'],
-                      data['confidence'], data['expiry_time'], signal_hash))
+                      data['confidence'], data.get('proba_buy', 0), data.get('proba_sell', 0),
+                      data['expiry_time'], signal_hash))
                 conn.commit()
                 return conn.execute('SELECT last_insert_rowid()').fetchone()[0]
         except:
             return None
     
-    def update_result(self, signal_id: int, exit_price: float, result: str, pnl: float, symbol: str):
+    def update_result(self, signal_id: int, exit_price: float, result: str, pnl: float, 
+                      symbol: str, direction: str):
         with sqlite3.connect(self.db_path) as conn:
             conn.execute('UPDATE signals SET exit_price=?, result=?, pnl_percent=? WHERE id=?',
                         (exit_price, result, pnl, signal_id))
-            conn.execute('''
-                INSERT INTO performance (symbol, last_50_wins, last_50_total)
-                VALUES (?, ?, 1)
-                ON CONFLICT(symbol) DO UPDATE SET
-                last_50_wins = last_50_wins + ?,
-                last_50_total = last_50_total + 1
-            ''', (symbol, 1 if result == 'WIN' else 0, 1 if result == 'WIN' else 0))
+            
+            # ✅ تحديث منفصل للشراء والبيع
+            if direction == 'BUY':
+                conn.execute('''
+                    INSERT INTO performance (symbol, buy_wins, buy_total)
+                    VALUES (?, ?, 1)
+                    ON CONFLICT(symbol) DO UPDATE SET
+                    buy_wins = buy_wins + ?,
+                    buy_total = buy_total + 1
+                ''', (symbol, 1 if result == 'WIN' else 0, 1 if result == 'WIN' else 0))
+            else:
+                conn.execute('''
+                    INSERT INTO performance (symbol, sell_wins, sell_total)
+                    VALUES (?, ?, 1)
+                    ON CONFLICT(symbol) DO UPDATE SET
+                    sell_wins = sell_wins + ?,
+                    sell_total = sell_total + 1
+                ''', (symbol, 1 if result == 'WIN' else 0, 1 if result == 'WIN' else 0))
             conn.commit()
     
-    def get_dynamic_threshold(self, symbol: str) -> float:
+    def get_dynamic_threshold(self, symbol: str) -> Tuple[float, float]:
+        """✅ يرجع عتبة منفصلة للشراء والبيع"""
         with sqlite3.connect(self.db_path) as conn:
-            row = conn.execute('SELECT last_50_wins, last_50_total FROM performance WHERE symbol=?',
-                              (symbol,)).fetchone()
-            if not row or row[1] < 10:
-                return 0.65
-            win_rate = row[0] / row[1]
-            if win_rate > 0.70: return 0.58
-            elif win_rate > 0.60: return 0.62
-            elif win_rate > 0.50: return 0.68
-            else: return 0.75
+            row = conn.execute('''
+                SELECT buy_wins, buy_total, sell_wins, sell_total 
+                FROM performance WHERE symbol=?
+            ''', (symbol,)).fetchone()
+            
+            if not row or (row[1] or 0) < 5:
+                buy_threshold = 0.60
+            else:
+                buy_rate = row[0] / max(row[1], 1)
+                if buy_rate > 0.65: buy_threshold = 0.55
+                elif buy_rate > 0.55: buy_threshold = 0.60
+                else: buy_threshold = 0.68
+            
+            if not row or (row[3] or 0) < 5:
+                sell_threshold = 0.60
+            else:
+                sell_rate = row[2] / max(row[3], 1)
+                if sell_rate > 0.65: sell_threshold = 0.55
+                elif sell_rate > 0.55: sell_threshold = 0.60
+                else: sell_threshold = 0.68
+            
+            return buy_threshold, sell_threshold
     
     def check_active_signal(self, symbol: str) -> bool:
         with sqlite3.connect(self.db_path) as conn:
@@ -200,8 +230,13 @@ class Database:
         with sqlite3.connect(self.db_path) as conn:
             total = conn.execute("SELECT COUNT(*) FROM signals WHERE result!='PENDING'").fetchone()[0]
             wins = conn.execute("SELECT COUNT(*) FROM signals WHERE result='WIN'").fetchone()[0]
-            return {'total': total, 'wins': wins, 'losses': total-wins,
-                    'win_rate': wins/total if total > 0 else 0}
+            buys = conn.execute("SELECT COUNT(*) FROM signals WHERE result!='PENDING' AND direction='BUY'").fetchone()[0]
+            sells = conn.execute("SELECT COUNT(*) FROM signals WHERE result!='PENDING' AND direction='SELL'").fetchone()[0]
+            return {
+                'total': total, 'wins': wins, 'losses': total-wins,
+                'win_rate': wins/total if total > 0 else 0,
+                'buy_count': buys, 'sell_count': sells
+            }
 
 # ============================================================================
 # FEATURES
@@ -275,22 +310,47 @@ def calculate_features(df: pd.DataFrame) -> pd.DataFrame:
     return f.replace([np.inf, -np.inf], np.nan).ffill().bfill().fillna(0)
 
 # ============================================================================
-# TARGET
+# BALANCED TARGET
 # ============================================================================
 
-def create_target(df: pd.DataFrame, periods: int) -> pd.Series:
+def create_balanced_target(df: pd.DataFrame, periods: int) -> pd.Series:
+    """
+    ✅ هدف متوازن:
+    - BUY (1): السعر بيرتفع بمقدار meaningful
+    - SELL (0): السعر بينخفض بمقدار meaningful
+    - متأكدينش إن عدد BUY ≈ عدد SELL
+    """
     atr = (df['High'] - df['Low']).rolling(14).mean()
     future = df['Close'].shift(-periods)
     change = future - df['Close']
     threshold = atr * 0.5
     
+    # عد الإشارتين
+    buy_count = (change > threshold).sum()
+    sell_count = (change < -threshold).sum()
+    
     target = pd.Series(np.nan, index=df.index)
-    target[change > threshold] = 1
-    target[change < -threshold] = 0
+    
+    # ✅ لو في فرق كبير، نزود العتبة للجهة الأكثر
+    if buy_count > sell_count * 1.5:
+        # BUY كتير → نرفع عتبة الشراء
+        buy_threshold = threshold * 1.3
+        sell_threshold = threshold
+    elif sell_count > buy_count * 1.5:
+        # SELL كتير → نرفع عتبة البيع
+        buy_threshold = threshold
+        sell_threshold = threshold * 1.3
+    else:
+        buy_threshold = threshold
+        sell_threshold = threshold
+    
+    target[change > buy_threshold] = 1   # BUY
+    target[change < -sell_threshold] = 0  # SELL
+    
     return target
 
 # ============================================================================
-# MODEL
+# ENSEMBLE MODEL WITH CALIBRATED CONFIDENCE
 # ============================================================================
 
 class EnsembleModel:
@@ -306,15 +366,19 @@ class EnsembleModel:
         self.selected_features = []
         self.is_trained = False
         self.version = None
+        self.buy_sell_ratio = 1.0  # ✅ نسبة الشراء للبيع في التدريب
     
     def _init_models(self):
         self.base_models = {
             'xgboost': xgb.XGBClassifier(n_estimators=200, learning_rate=0.03, max_depth=5,
                                           random_state=42, n_jobs=2, verbosity=0, tree_method='hist'),
             'catboost': CatBoostClassifier(iterations=200, learning_rate=0.03, depth=5,
-                                            random_seed=42, verbose=False, thread_count=2, allow_writing_files=False),
-            'randomforest': RandomForestClassifier(n_estimators=200, max_depth=10, random_state=42, n_jobs=2),
-            'gradient_boost': GradientBoostingClassifier(n_estimators=200, learning_rate=0.03, max_depth=5, random_state=42)
+                                            random_seed=42, verbose=False, thread_count=2, 
+                                            allow_writing_files=False, auto_class_weights='Balanced'),
+            'randomforest': RandomForestClassifier(n_estimators=200, max_depth=10, 
+                                                    random_state=42, n_jobs=2, class_weight='balanced'),
+            'gradient_boost': GradientBoostingClassifier(n_estimators=200, learning_rate=0.03, 
+                                                          max_depth=5, random_state=42)
         }
     
     def train(self, df: pd.DataFrame) -> bool:
@@ -325,11 +389,16 @@ class EnsembleModel:
             self.logger.info(f"🎓 {self.symbol}: {len(df)} عينة...")
             
             features = calculate_features(df)
-            target = create_target(df, self.config.FORECAST_PERIODS)
+            target = create_balanced_target(df, self.config.FORECAST_PERIODS)
             
             valid = ~(features.isna().any(axis=1) | target.isna())
             X = features[valid]
             y = target[valid]
+            
+            # ✅ حساب نسبة الشراء/البيع
+            buy_pct = y.mean()
+            self.buy_sell_ratio = buy_pct / (1 - buy_pct) if buy_pct > 0 and buy_pct < 1 else 1.0
+            self.logger.info(f"📊 {self.symbol}: BUY={buy_pct:.1%}, SELL={1-buy_pct:.1%}, Ratio={self.buy_sell_ratio:.2f}")
             
             if len(X) < 200:
                 return False
@@ -357,39 +426,53 @@ class EnsembleModel:
                         model.fit(X_train, y_train)
                     base_preds[:, i] = model.predict_proba(X_val)[:, 1]
                     
-                    self.calibrators[name] = CalibratedClassifierCV(model, cv=3, method='isotonic')
+                    # ✅ Probability Calibration
+                    self.calibrators[name] = CalibratedClassifierCV(
+                        model, cv=3, method='isotonic'
+                    )
                     self.calibrators[name].fit(X_train, y_train)
                 except:
                     base_preds[:, i] = 0.5
             
-            self.meta_model = LogisticRegression()
+            self.meta_model = LogisticRegression(class_weight='balanced')
             self.meta_model.fit(base_preds, y_val)
             
             self.is_trained = True
             self.version = datetime.now().strftime('v%Y%m%d_%H%M%S')
             
-            acc = accuracy_score(y_val, self.meta_model.predict(base_preds))
-            self.logger.info(f"✅ {self.symbol}: دقة={acc:.1%}, ميزات={len(self.selected_features)}")
+            meta_pred = self.meta_model.predict(base_preds)
+            acc = accuracy_score(y_val, meta_pred)
+            f1 = f1_score(y_val, meta_pred, zero_division=0)
+            
+            # ✅ حساب Brier Score (مؤشر جودة الاحتمالات)
+            meta_proba = self.meta_model.predict_proba(base_preds)[:, 1]
+            brier = brier_score_loss(y_val, meta_proba)
+            
+            self.logger.info(f"✅ {self.symbol}: دقة={acc:.1%}, F1={f1:.3f}, Brier={brier:.4f}, ميزات={len(self.selected_features)}")
             return True
             
         except Exception as e:
-            self.logger.error(f"❌ {self.symbol}: {e}")
+            self.logger.error(f"❌ {self.symbol}: {e}", exc_info=True)
             return False
     
-    def predict(self, df: pd.DataFrame, threshold: float = 0.65) -> Tuple[str, float, float]:
+    def predict(self, df: pd.DataFrame, threshold_buy: float = 0.60, threshold_sell: float = 0.60) -> Tuple[str, float, float, float]:
+        """
+        ✅ يرجع: (الاتجاه, الثقة, احتمالية الشراء, احتمالية البيع)
+        """
         if not self.is_trained:
-            return "NEUTRAL", 0.0, 0.0
+            return "NEUTRAL", 0.0, 0.0, 0.0
         
         try:
             features = calculate_features(df).iloc[[-1]]
             available = [f for f in self.selected_features if f in features.columns]
             
             if len(available) < 10:
-                return "NEUTRAL", 0.0, 0.0
+                return "NEUTRAL", 0.0, 0.0, 0.0
             
             X = features[available].fillna(0)
             X_s = self.scaler.transform(X)
             
+            # ✅ احتمالات منفصلة من كل نموذج
             base_probas = []
             for name, cal in self.calibrators.items():
                 try:
@@ -397,16 +480,35 @@ class EnsembleModel:
                 except:
                     base_probas.append(0.5)
             
-            meta_proba = float(self.meta_model.predict_proba(np.array([base_probas]))[0, 1])
+            # ✅ Meta model - احتمالية BUY
+            proba_buy = float(self.meta_model.predict_proba(np.array([base_probas]))[0, 1])
+            proba_sell = 1 - proba_buy
             
-            if meta_proba > threshold:
-                return "BUY", meta_proba, meta_proba
-            elif meta_proba < (1 - threshold):
-                return "SELL", 1 - meta_proba, meta_proba
-            return "NEUTRAL", max(meta_proba, 1 - meta_proba), meta_proba
+            # ✅ تعديل الاحتمالات حسب نسبة البيانات الأصلية
+            # لو البيانات الأصلية كان فيها BUY أكتر، نخفض احتمالية BUY شوية
+            if self.buy_sell_ratio > 1.3:
+                proba_buy = proba_buy * 0.95  # نخفض BUY لو كان أكتر في التدريب
+            elif self.buy_sell_ratio < 0.7:
+                proba_buy = proba_buy * 1.05  # نزود BUY لو كان أقل في التدريب
             
-        except:
-            return "NEUTRAL", 0.0, 0.0
+            proba_buy = np.clip(proba_buy, 0.05, 0.95)
+            proba_sell = 1 - proba_buy
+            
+            # ✅ قرار منفصل للشراء والبيع
+            if proba_buy > threshold_buy:
+                direction = "BUY"
+                confidence = proba_buy
+            elif proba_sell > threshold_sell:
+                direction = "SELL"
+                confidence = proba_sell
+            else:
+                direction = "NEUTRAL"
+                confidence = max(proba_buy, proba_sell)
+            
+            return direction, confidence, proba_buy, proba_sell
+            
+        except Exception as e:
+            return "NEUTRAL", 0.0, 0.0, 0.0
     
     def save(self):
         path = os.path.join(self.config.MODELS_DIR, self.symbol)
@@ -417,7 +519,8 @@ class EnsembleModel:
             'calibrators': self.calibrators,
             'scaler': self.scaler,
             'features': self.selected_features,
-            'version': self.version
+            'version': self.version,
+            'buy_sell_ratio': self.buy_sell_ratio
         }, os.path.join(path, 'pro_model.pkl'))
     
     def load(self) -> bool:
@@ -431,6 +534,7 @@ class EnsembleModel:
         self.scaler = data['scaler']
         self.selected_features = data['features']
         self.version = data['version']
+        self.buy_sell_ratio = data.get('buy_sell_ratio', 1.0)
         self.is_trained = True
         return True
 
@@ -446,31 +550,26 @@ class FalconProBot:
         self.models = {}
         self.executor = ThreadPoolExecutor(max_workers=config.MAX_WORKERS)
         
-        # ✅ Initialize Telegram bot
         self.tb = telebot.TeleBot(config.TELEGRAM_TOKEN)
-        
-        # ✅ Remove webhook first!
         self._remove_webhook()
-        
         self._setup_commands()
         
         for symbol in config.SYMBOLS:
             model = EnsembleModel(symbol, config, self.logger)
             loaded = model.load()
-            self.logger.info(f"{'📂' if loaded else '🆕'} {symbol}")
+            self.logger.info(f"{'📂' if loaded else '🆕'} {symbol}" + 
+                           (f" (Ratio={model.buy_sell_ratio:.2f})" if loaded else ""))
             self.models[symbol] = model
         
         self.running = False
         self.last_retrain = None
     
     def _remove_webhook(self):
-        """✅ Remove any existing webhook to avoid 409 conflict."""
         try:
             self.tb.remove_webhook()
-            self.logger.info("✅ Webhook removed successfully")
             time.sleep(1)
-        except Exception as e:
-            self.logger.warning(f"⚠️ Webhook removal: {e}")
+        except:
+            pass
     
     def _setup_commands(self):
         @self.tb.message_handler(commands=['start', 'status'])
@@ -479,7 +578,11 @@ class FalconProBot:
                 return
             trained = sum(1 for m in self.models.values() if m.is_trained)
             stats = self.db.get_stats()
-            text = f"🦅 **Falcon Pro**\n✅ نماذج: {trained}/{len(self.models)}\n📊 صفقات: {stats['total']}\n📈 نجاح: {stats['win_rate']:.1%}"
+            text = (f"🦅 **Falcon Pro v4.1**\n"
+                   f"✅ نماذج: {trained}/{len(self.models)}\n"
+                   f"📊 صفقات: {stats['total']}\n"
+                   f"🟢 شراء: {stats.get('buy_count', 0)} | 🔴 بيع: {stats.get('sell_count', 0)}\n"
+                   f"📈 نجاح: {stats['win_rate']:.1%}")
             self.tb.reply_to(msg, text, parse_mode='Markdown')
         
         @self.tb.message_handler(commands=['stats'])
@@ -487,7 +590,9 @@ class FalconProBot:
             if str(msg.chat.id) != self.config.TELEGRAM_CHAT_ID:
                 return
             s = self.db.get_stats()
-            self.tb.reply_to(msg, f"📊 {s['total']} | ✅ {s['wins']} | 📈 {s['win_rate']:.1%}")
+            self.tb.reply_to(msg, 
+                f"📊 {s['total']} | ✅ {s['wins']} | 📈 {s['win_rate']:.1%}\n"
+                f"🟢 شراء: {s.get('buy_count', 0)} | 🔴 بيع: {s.get('sell_count', 0)}")
     
     def fetch_data(self, symbol: str, interval: str = '5m', period: str = '5d') -> Optional[pd.DataFrame]:
         for attempt in range(self.config.MAX_RETRIES):
@@ -519,26 +624,35 @@ class FalconProBot:
             if df_5m is None or df_15m is None:
                 return None
             
-            threshold = self.db.get_dynamic_threshold(symbol)
+            # ✅ عتبات ديناميكية منفصلة
+            threshold_buy, threshold_sell = self.db.get_dynamic_threshold(symbol)
             
-            dir_5m, conf_5m, _ = model.predict(df_5m, threshold)
-            dir_15m, conf_15m, _ = model.predict(df_15m, threshold)
+            dir_5m, conf_5m, proba_buy_5m, proba_sell_5m = model.predict(df_5m, threshold_buy, threshold_sell)
+            dir_15m, conf_15m, proba_buy_15m, proba_sell_15m = model.predict(df_15m, threshold_buy, threshold_sell)
             
             if dir_5m != dir_15m or dir_5m == "NEUTRAL":
                 return None
             
             confidence = (conf_5m + conf_15m) / 2
+            proba_buy = (proba_buy_5m + proba_buy_15m) / 2
+            proba_sell = (proba_sell_5m + proba_sell_15m) / 2
             
-            if confidence < threshold:
+            # ✅ استخدام العتبة المناسبة للاتجاه
+            if dir_5m == 'BUY' and confidence < threshold_buy:
+                return None
+            if dir_5m == 'SELL' and confidence < threshold_sell:
                 return None
             
-            self.logger.info(f"🎯 {symbol}: {dir_5m} | ثقة={confidence:.1%}")
+            self.logger.info(f"🎯 {symbol}: {dir_5m} | ثقة={confidence:.1%} | "
+                           f"P(BUY)={proba_buy:.2%} | P(SELL)={proba_sell:.2%}")
             
             return {
                 'symbol': symbol,
                 'direction': dir_5m,
                 'entry_price': float(df_5m['Close'].iloc[-1]),
                 'confidence': confidence,
+                'proba_buy': proba_buy,
+                'proba_sell': proba_sell,
                 'expiry_time': (datetime.now() + timedelta(minutes=self.config.TRADE_DURATION_MINUTES)).strftime('%Y-%m-%d %H:%M:%S')
             }
             
@@ -551,7 +665,12 @@ class FalconProBot:
             emoji = "🟢" if signal['direction'] == 'BUY' else "🔴"
             direction = "شراء ▲" if signal['direction'] == 'BUY' else "بيع ▼"
             
-            msg = f"{emoji} **{signal['symbol']}** - {direction}\n\n💰 {signal['entry_price']:.5f}\n⏳ {self.config.TRADE_DURATION_MINUTES} د\n💪 {signal['confidence']:.1%}\n\n🤖 Falcon Pro"
+            msg = (f"{emoji} **{signal['symbol']}** - {direction}\n\n"
+                   f"💰 الدخول: {signal['entry_price']:.5f}\n"
+                   f"⏳ المدة: {self.config.TRADE_DURATION_MINUTES} د\n"
+                   f"💪 الثقة: {signal['confidence']:.1%}\n"
+                   f"📊 P(BUY): {signal['proba_buy']:.1%} | P(SELL): {signal['proba_sell']:.1%}\n\n"
+                   f"🤖 Falcon Pro v4.1")
             
             self.tb.send_message(self.config.TELEGRAM_CHAT_ID, msg, parse_mode='Markdown')
             self.logger.info(f"✅ إشارة: {signal['symbol']} {signal['direction']}")
@@ -575,7 +694,7 @@ class FalconProBot:
                     pnl = (entry - current) / entry * 100
                     result = 'WIN' if current < entry else 'LOSS'
                 
-                self.db.update_result(trade['id'], current, result, pnl, trade['symbol'])
+                self.db.update_result(trade['id'], current, result, pnl, trade['symbol'], trade['direction'])
             except:
                 pass
     
@@ -593,7 +712,7 @@ class FalconProBot:
         return signals
     
     def train_all_models(self):
-        self.logger.info("🎓 تدريب...")
+        self.logger.info("🎓 تدريب النماذج...")
         
         for symbol in self.config.SYMBOLS:
             try:
@@ -620,32 +739,28 @@ class FalconProBot:
         trained = sum(1 for m in self.models.values() if m.is_trained)
         try:
             self.tb.send_message(self.config.TELEGRAM_CHAT_ID,
-                f"🎓 **تدريب مكتمل**\n✅ {trained}/{len(self.config.SYMBOLS)}",
+                f"🎓 **تدريب مكتمل**\n✅ {trained}/{len(self.config.SYMBOLS)}\n⚖️ Balanced Target",
                 parse_mode='Markdown')
         except:
             pass
     
     def start_telegram(self):
-        """✅ Start Telegram with webhook already removed."""
         def poll():
-            self.logger.info("📡 بدء Telegram polling...")
             while True:
                 try:
                     self.tb.infinity_polling(timeout=10, long_polling_timeout=5)
-                except Exception as e:
-                    self.logger.error(f"Polling error: {e}")
+                except:
                     time.sleep(10)
-        
         threading.Thread(target=poll, daemon=True).start()
-        self.logger.info("✅ Telegram polling started")
     
     def run(self):
         self.running = True
         
         self.logger.info("=" * 40)
-        self.logger.info("🦅 Falcon AI Pro v4")
-        self.logger.info(f"🤖 XGBoost + CatBoost + RF + GB")
-        self.logger.info(f"🧠 Meta Model Active")
+        self.logger.info("🦅 Falcon AI Pro v4.1")
+        self.logger.info("⚖️ Balanced Buy/Sell Target")
+        self.logger.info("📊 Calibrated Confidence (Brier Score)")
+        self.logger.info("🎯 Separate Buy/Sell Thresholds")
         self.logger.info("=" * 40)
         
         self.start_telegram()
@@ -659,7 +774,7 @@ class FalconProBot:
         try:
             trained = sum(1 for m in self.models.values() if m.is_trained)
             self.tb.send_message(self.config.TELEGRAM_CHAT_ID,
-                f"🦅 **Falcon Pro**\n✅ {trained}/{len(self.config.SYMBOLS)}\n🧠 Meta + Calibration\n⚡️ Scanning...",
+                f"🦅 **Falcon Pro v4.1**\n✅ {trained}/{len(self.config.SYMBOLS)}\n⚖️ Balanced\n⚡️ Scanning...",
                 parse_mode='Markdown')
         except:
             pass
