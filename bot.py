@@ -1224,4 +1224,5 @@ class PerAssetModel:
         except:
             return 1.0
     
-    def save(self) ->
+    def save(self):
+    pass
