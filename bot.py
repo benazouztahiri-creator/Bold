@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
 """
-Falcon AI Pro v5.4 - Clean Signals
-====================================
-Simple, clean signal format.
-30-second continuous scanning.
+Falcon AI Pro v6.0 - Smart Trade Duration
+===========================================
+AI calculates optimal trade duration based on market conditions.
 """
 
 import os
@@ -58,8 +57,11 @@ class Config:
     TELEGRAM_TOKEN: str = os.environ.get('TELEGRAM_TOKEN', '8773849578:AAH9a6-8hU5YFYTad2EA5jQyfffIoeL8npk')
     TELEGRAM_CHAT_ID: str = os.environ.get('TELEGRAM_CHAT_ID', '7553333305')
     
-    TRADE_DURATION_MINUTES: int = 10
     SCAN_INTERVAL_SECONDS: int = 30
+    
+    # ✅ مدة الصفقة الذكية (بيحددها البوت تلقائياً)
+    MIN_TRADE_DURATION: int = 3   # أقل مدة
+    MAX_TRADE_DURATION: int = 15  # أقصى مدة
     
     SYMBOLS: List[str] = field(default_factory=lambda: [
         'EURUSD=X', 'GBPUSD=X', 'USDJPY=X', 'AUDUSD=X',
@@ -151,7 +153,8 @@ class Database:
                 CREATE TABLE IF NOT EXISTS signals (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     symbol TEXT, direction TEXT, entry_price REAL,
-                    confidence REAL, entry_time DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    confidence REAL, trade_duration INTEGER,
+                    market_speed TEXT, entry_time DATETIME DEFAULT CURRENT_TIMESTAMP,
                     expiry_time DATETIME, result TEXT DEFAULT 'PENDING',
                     pnl_percent REAL, signal_hash TEXT UNIQUE
                 )
@@ -165,10 +168,12 @@ class Database:
             with sqlite3.connect(self.db_path) as conn:
                 conn.execute('''
                     INSERT OR IGNORE INTO signals 
-                    (symbol, direction, entry_price, confidence, expiry_time, signal_hash)
-                    VALUES (?, ?, ?, ?, ?, ?)
+                    (symbol, direction, entry_price, confidence, trade_duration,
+                     market_speed, expiry_time, signal_hash)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 ''', (data['symbol'], data['direction'], data['entry_price'],
-                      data['confidence'], data['expiry_time'], signal_hash))
+                      data['confidence'], data['trade_duration'],
+                      data.get('market_speed', ''), data['expiry_time'], signal_hash))
                 conn.commit()
                 return conn.execute('SELECT last_insert_rowid()').fetchone()[0]
         except:
@@ -198,7 +203,7 @@ class Database:
             ''', (symbol, cutoff)).fetchone()[0]
             return count > 0
     
-    def get_pending_trades(self) -> List[Dict]:
+    def get_expired_trades(self) -> List[Dict]:
         with sqlite3.connect(self.db_path) as conn:
             conn.row_factory = sqlite3.Row
             rows = conn.execute('''
@@ -217,6 +222,99 @@ class Database:
                 'win_rate': wins/total if total > 0 else 0,
                 'total_pnl': total_pnl
             }
+
+# ============================================================================
+# MARKET ANALYZER - أهم جزء!
+# ============================================================================
+
+class MarketAnalyzer:
+    """
+    ✅ يحلل السوق ويحدد:
+    1. سرعة الحركة (سريع/متوسط/هادئ)
+    2. مدة الصفقة المثالية
+    """
+    
+    @staticmethod
+    def analyze(df_5m: pd.DataFrame, df_15m: pd.DataFrame) -> Dict:
+        """
+        تحليل شامل للسوق وتحديد مدة الصفقة
+        """
+        # ========== 1. حساب سرعة الحركة (ATR) ==========
+        atr_5m = MarketAnalyzer._calculate_atr(df_5m, 14)
+        atr_15m = MarketAnalyzer._calculate_atr(df_15m, 14)
+        
+        current_atr = atr_5m.iloc[-1]
+        avg_atr = atr_15m.rolling(50).mean().iloc[-1] if len(atr_15m) >= 50 else current_atr
+        
+        atr_ratio = current_atr / avg_atr if avg_atr > 0 else 1.0
+        
+        # ========== 2. حساب قوة الترند (ADX) ==========
+        adx_15m = MarketAnalyzer._calculate_adx(df_15m, 14)
+        current_adx = adx_15m.iloc[-1] if not adx_15m.empty else 20
+        
+        # ========== 3. حساب التقلبات ==========
+        volatility = df_5m['Close'].pct_change().rolling(20).std().iloc[-1]
+        avg_volatility = df_15m['Close'].pct_change().rolling(50).std().iloc[-1] if len(df_15m) >= 50 else volatility
+        vol_ratio = volatility / avg_volatility if avg_volatility > 0 else 1.0
+        
+        # ========== 4. تحديد سرعة السوق ==========
+        if atr_ratio > 1.5 and current_adx > 25:
+            market_speed = "سريع"
+            base_duration = 5  # 5 دقائق للسوق السريع
+        elif atr_ratio > 1.2 or current_adx > 20:
+            market_speed = "متوسط"
+            base_duration = 8  # 8 دقائق للسوق المتوسط
+        else:
+            market_speed = "هادئ"
+            base_duration = 12  # 12 دقيقة للسوق الهادئ
+        
+        # ========== 5. تعديل المدة حسب التقلبات ==========
+        if vol_ratio > 1.5:
+            base_duration = max(3, base_duration - 2)  # تقليل المدة لو فيه تقلبات عالية
+        elif vol_ratio < 0.7:
+            base_duration = min(15, base_duration + 2)  # زيادة المدة لو السوق هادئ
+        
+        # ========== 6. تعديل حسب الزوج ==========
+        # الأزواج السريعة زي GBPUSD و EURJPY نقلل المدة
+        # الأزواج البطيئة زي USDJPY و EURGBP نزود المدة
+        
+        return {
+            'market_speed': market_speed,
+            'trade_duration': base_duration,
+            'atr_ratio': round(atr_ratio, 2),
+            'adx': round(current_adx, 1),
+            'vol_ratio': round(vol_ratio, 2)
+        }
+    
+    @staticmethod
+    def _calculate_atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
+        h, l, c = df['High'], df['Low'], df['Close']
+        tr1 = h - l
+        tr2 = abs(h - c.shift())
+        tr3 = abs(l - c.shift())
+        tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+        return tr.ewm(span=period, adjust=False).mean()
+    
+    @staticmethod
+    def _calculate_adx(df: pd.DataFrame, period: int = 14) -> pd.Series:
+        h, l, c = df['High'], df['Low'], df['Close']
+        
+        tr1 = h - l
+        tr2 = abs(h - c.shift())
+        tr3 = abs(l - c.shift())
+        tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+        atr = tr.ewm(span=period, adjust=False).mean()
+        
+        plus_dm = h.diff().clip(lower=0)
+        minus_dm = (-l.diff()).clip(lower=0)
+        
+        plus_di = 100 * (plus_dm.ewm(span=period, adjust=False).mean()) / (atr + 1e-8)
+        minus_di = 100 * (minus_dm.ewm(span=period, adjust=False).mean()) / (atr + 1e-8)
+        
+        dx = 100 * abs(plus_di - minus_di) / (plus_di + minus_di + 1e-8)
+        adx = dx.ewm(span=period, adjust=False).mean()
+        
+        return adx
 
 # ============================================================================
 # MARKET FILTER
@@ -495,11 +593,12 @@ class FalconProBot:
             trained = sum(1 for m in self.models.values() if m.is_trained)
             stats = self.db.get_stats()
             can_trade, reason = MarketFilter.can_trade()
-            text = (f"🦅 **Falcon Pro**\n"
+            text = (f"🦅 **Falcon Pro v6**\n"
                    f"✅ نماذج: {trained}/{len(self.models)}\n"
                    f"📊 صفقات: {stats['total']}\n"
                    f"📈 نجاح: {stats['win_rate']:.1%}\n"
                    f"💰 ربح: {stats['total_pnl']:.2f}%\n"
+                   f"🧠 مدة ذكية: {self.config.MIN_TRADE_DURATION}-{self.config.MAX_TRADE_DURATION} د\n"
                    f"🚦 {'✅' if can_trade else '⛔ '+reason}")
             self.tb.reply_to(msg, text, parse_mode='Markdown')
     
@@ -554,16 +653,24 @@ class FalconProBot:
             if confidence < self.config.CONFIDENCE_THRESHOLD:
                 return None
             
+            # ✅ تحليل السوق وتحديد المدة الذكية
+            market_analysis = MarketAnalyzer.analyze(df_5m, df_15m)
+            trade_duration = market_analysis['trade_duration']
+            market_speed = market_analysis['market_speed']
+            
             entry_price = float(df_5m['Close'].iloc[-1])
             
-            self.logger.info(f"🎯 {symbol}: {dir_5m} | ثقة={confidence:.1%}")
+            self.logger.info(f"🎯 {symbol}: {dir_5m} | ثقة={confidence:.1%} | "
+                           f"مدة={trade_duration}د | سوق={market_speed}")
             
             return {
                 'symbol': symbol,
                 'direction': dir_5m,
                 'entry_price': entry_price,
                 'confidence': confidence,
-                'expiry_time': (datetime.now() + timedelta(minutes=self.config.TRADE_DURATION_MINUTES)).strftime('%Y-%m-%d %H:%M:%S')
+                'trade_duration': trade_duration,
+                'market_speed': market_speed,
+                'expiry_time': (datetime.now() + timedelta(minutes=trade_duration)).strftime('%Y-%m-%d %H:%M:%S')
             }
             
         except:
@@ -574,20 +681,20 @@ class FalconProBot:
             emoji = "🟢" if signal['direction'] == 'BUY' else "🔴"
             direction = "شراء ▲" if signal['direction'] == 'BUY' else "بيع ▼"
             
-            # ✅ الصيغة الجديدة البسيطة
+            # ✅ المدة الذكية في الرسالة
             msg = (f"{emoji} **{signal['symbol']}** - {direction}\n\n"
                    f"💰 {signal['entry_price']:.5f}\n"
-                   f"⏳ {self.config.TRADE_DURATION_MINUTES} د\n"
+                   f"⏳ {signal['trade_duration']} د\n"
                    f"💪 {signal['confidence']:.1%}\n\n"
                    f"🤖 Falcon Pro")
             
             self.tb.send_message(self.config.TELEGRAM_CHAT_ID, msg, parse_mode='Markdown')
-            self.logger.info(f"✅ إشارة: {signal['symbol']} {signal['direction']}")
+            self.logger.info(f"✅ إشارة: {signal['symbol']} {signal['direction']} | {signal['trade_duration']}د")
         except Exception as e:
             self.logger.error(f"Send error: {e}")
     
     def check_trades(self):
-        for trade in self.db.get_pending_trades():
+        for trade in self.db.get_expired_trades():
             try:
                 df = self.fetch_data(trade['symbol'], '5m', '1d')
                 if df is None:
@@ -605,6 +712,10 @@ class FalconProBot:
                     result = 'WIN' if current < entry else 'LOSS'
                 
                 self.db.update_result(trade['id'], current, result, pnl)
+                
+                emoji = "✅" if result == 'WIN' else "❌"
+                self.logger.info(f"{emoji} {trade['symbol']}: {result} | {pnl:+.2f}% | مدة={trade.get('trade_duration', '?')}د")
+                
             except:
                 pass
     
@@ -648,8 +759,8 @@ class FalconProBot:
         self.running = True
         
         self.logger.info("=" * 50)
-        self.logger.info("🦅 Falcon AI Pro v5.4")
-        self.logger.info(f"🔄 فحص كل {self.config.SCAN_INTERVAL_SECONDS} ثانية")
+        self.logger.info("🦅 Falcon AI Pro v6.0 - Smart Duration")
+        self.logger.info(f"🧠 مدة ذكية: {self.config.MIN_TRADE_DURATION}-{self.config.MAX_TRADE_DURATION} دقيقة")
         self.logger.info("=" * 50)
         
         self.tg.start_polling()
@@ -663,7 +774,7 @@ class FalconProBot:
         try:
             trained = sum(1 for m in self.models.values() if m.is_trained)
             self.tb.send_message(self.config.TELEGRAM_CHAT_ID,
-                f"🦅 **Falcon Pro**\n✅ {trained}/{len(self.config.SYMBOLS)}\n⚡️ يعمل...",
+                f"🦅 **Falcon Pro v6**\n✅ {trained}/{len(self.config.SYMBOLS)}\n🧠 مدة ذكية\n⚡️ يعمل...",
                 parse_mode='Markdown')
         except:
             pass
