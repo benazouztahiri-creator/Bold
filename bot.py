@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-Falcon AI Pro v4.0 - No LightGBM
-=================================
-XGBoost + CatBoost + RandomForest + GradientBoosting
+Falcon AI Pro v4.0 - Fixed Webhook
+===================================
+Auto-removes webhook on startup.
 """
 
 import os
@@ -69,8 +69,6 @@ class Config:
     MIN_TRAINING_SAMPLES: int = 500
     
     CONFIDENCE_THRESHOLD: float = 0.60
-    DYNAMIC_THRESHOLD_MIN: float = 0.55
-    DYNAMIC_THRESHOLD_MAX: float = 0.75
     
     RETRAINING_INTERVAL_HOURS: int = 24
     MAX_FEATURES: int = 60
@@ -114,20 +112,21 @@ class Database:
     
     def _init(self):
         with sqlite3.connect(self.db_path) as conn:
-            conn.executescript('''
+            conn.execute('''
                 CREATE TABLE IF NOT EXISTS signals (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     symbol TEXT, direction TEXT, entry_price REAL,
-                    confidence REAL, regime TEXT, entry_time DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    confidence REAL, entry_time DATETIME DEFAULT CURRENT_TIMESTAMP,
                     expiry_time DATETIME, result TEXT DEFAULT 'PENDING',
-                    pnl_percent REAL, meta_proba REAL, signal_hash TEXT UNIQUE
-                );
+                    pnl_percent REAL, signal_hash TEXT UNIQUE
+                )
+            ''')
+            conn.execute('''
                 CREATE TABLE IF NOT EXISTS performance (
                     symbol TEXT PRIMARY KEY,
                     last_50_wins INTEGER DEFAULT 0,
-                    last_50_total INTEGER DEFAULT 0,
-                    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
-                );
+                    last_50_total INTEGER DEFAULT 0
+                )
             ''')
             conn.commit()
     
@@ -138,11 +137,10 @@ class Database:
             with sqlite3.connect(self.db_path) as conn:
                 conn.execute('''
                     INSERT OR IGNORE INTO signals 
-                    (symbol, direction, entry_price, confidence, regime, expiry_time, meta_proba, signal_hash)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    (symbol, direction, entry_price, confidence, expiry_time, signal_hash)
+                    VALUES (?, ?, ?, ?, ?, ?)
                 ''', (data['symbol'], data['direction'], data['entry_price'],
-                      data['confidence'], data.get('regime', ''), data['expiry_time'],
-                      data.get('meta_proba', 0), signal_hash))
+                      data['confidence'], data['expiry_time'], signal_hash))
                 conn.commit()
                 return conn.execute('SELECT last_insert_rowid()').fetchone()[0]
         except:
@@ -206,60 +204,22 @@ class Database:
                     'win_rate': wins/total if total > 0 else 0}
 
 # ============================================================================
-# MARKET REGIME
-# ============================================================================
-
-class MarketRegime:
-    @staticmethod
-    def detect(df: pd.DataFrame) -> Dict:
-        if len(df) < 50:
-            return {'regime': 'UNKNOWN', 'adx': 0, 'is_trend': False}
-        
-        c, h, l = df['Close'], df['High'], df['Low']
-        
-        tr1 = h - l
-        tr2 = abs(h - c.shift())
-        tr3 = abs(l - c.shift())
-        tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
-        atr = tr.ewm(span=14).mean()
-        
-        plus_dm = h.diff().clip(lower=0)
-        minus_dm = (-l.diff()).clip(lower=0)
-        plus_di = 100 * (plus_dm.ewm(span=14).mean()) / (atr + 1e-8)
-        minus_di = 100 * (minus_dm.ewm(span=14).mean()) / (atr + 1e-8)
-        dx = 100 * abs(plus_di - minus_di) / (plus_di + minus_di + 1e-8)
-        adx = float(dx.ewm(span=14).mean().iloc[-1])
-        
-        current_vol = c.pct_change().rolling(20).std().iloc[-1]
-        historical_vol = c.pct_change().rolling(100).std().iloc[-1] if len(c) >= 100 else current_vol
-        vol_ratio = current_vol / (historical_vol + 1e-8)
-        
-        if adx > 25:
-            regime = 'TREND_HIGH_VOL' if vol_ratio > 1.3 else 'TREND_LOW_VOL'
-        else:
-            regime = 'RANGE_HIGH_VOL' if vol_ratio > 1.3 else 'RANGE_LOW_VOL'
-        
-        return {'regime': regime, 'adx': round(adx, 1), 'is_trend': adx > 25}
-
-# ============================================================================
-# FEATURES (60+)
+# FEATURES
 # ============================================================================
 
 def calculate_features(df: pd.DataFrame) -> pd.DataFrame:
     f = pd.DataFrame(index=df.index)
     c, h, l, o = df['Close'], df['High'], df['Low'], df['Open']
-    v = df.get('Volume', pd.Series(1, index=df.index))
     
     for p in [1, 3, 5, 10, 20]:
         f[f'ret_{p}'] = c.pct_change(p)
     
-    for p in [5, 10, 20, 50, 100, 200]:
-        if len(df) >= p:
-            f[f'sma_{p}'] = c.rolling(p).mean()
-            f[f'ema_{p}'] = c.ewm(span=p, adjust=False).mean()
-            f[f'dist_sma_{p}'] = (c - f[f'sma_{p}']) / (f[f'sma_{p}'] + 1e-8)
+    for p in [5, 10, 20, 50]:
+        f[f'sma_{p}'] = c.rolling(p).mean()
+        f[f'ema_{p}'] = c.ewm(span=p, adjust=False).mean()
+        f[f'dist_sma_{p}'] = (c - f[f'sma_{p}']) / (f[f'sma_{p}'] + 1e-8)
     
-    for p in [7, 14, 21]:
+    for p in [7, 14]:
         delta = c.diff()
         gain = delta.where(delta > 0, 0.0).rolling(p).mean()
         loss = (-delta.where(delta < 0, 0.0)).rolling(p).mean()
@@ -286,16 +246,17 @@ def calculate_features(df: pd.DataFrame) -> pd.DataFrame:
     low14 = l.rolling(14).min()
     high14 = h.rolling(14).max()
     f['stoch_k'] = 100 * (c - low14) / (high14 - low14 + 1e-8)
-    f['stoch_d'] = f['stoch_k'].rolling(3).mean()
     
     tp = (h + l + c) / 3
     sma_tp = tp.rolling(20).mean()
     mad = tp.rolling(20).apply(lambda x: np.abs(x - x.mean()).mean())
     f['cci'] = (tp - sma_tp) / (0.015 * mad + 1e-8)
     
-    hh14 = h.rolling(14).max()
-    ll14 = l.rolling(14).min()
-    f['williams_r'] = -100 * (hh14 - c) / (hh14 - ll14 + 1e-8)
+    for p in [5, 10]:
+        f[f'roc_{p}'] = (c - c.shift(p)) / (c.shift(p) + 1e-8) * 100
+    
+    for p in [5, 10, 20]:
+        f[f'vol_{p}'] = c.pct_change().rolling(p).std()
     
     plus_dm = h.diff().clip(lower=0)
     minus_dm = (-l.diff()).clip(lower=0)
@@ -304,19 +265,6 @@ def calculate_features(df: pd.DataFrame) -> pd.DataFrame:
     minus_di = 100 * (minus_dm.ewm(span=14).mean()) / (atr14 + 1e-8)
     dx = 100 * abs(plus_di - minus_di) / (plus_di + minus_di + 1e-8)
     f['adx'] = dx.ewm(span=14).mean()
-    f['di_plus'] = plus_di
-    f['di_minus'] = minus_di
-    
-    for p in [5, 10, 20]:
-        f[f'roc_{p}'] = (c - c.shift(p)) / (c.shift(p) + 1e-8) * 100
-        f[f'mom_{p}'] = c - c.shift(p)
-    
-    for p in [5, 10, 20]:
-        f[f'vol_{p}'] = c.pct_change().rolling(p).std()
-    
-    f['dc_upper'] = h.rolling(20).max()
-    f['dc_lower'] = l.rolling(20).min()
-    f['dc_pos'] = (c - f['dc_lower']) / (f['dc_upper'] - f['dc_lower'] + 1e-8)
     
     f['body_size'] = abs(c - o) / (h - l + 1e-8)
     f['upper_wick'] = (h - np.maximum(c, o)) / (h - l + 1e-8)
@@ -324,13 +272,10 @@ def calculate_features(df: pd.DataFrame) -> pd.DataFrame:
     
     f['trend_str'] = c.rolling(20).apply(lambda x: np.polyfit(range(len(x)), x, 1)[0] if len(x) > 1 else 0)
     
-    f['vol_ratio'] = v / (v.rolling(20).mean() + 1e-8)
-    f['vol_trend'] = v.rolling(5).mean() / (v.rolling(20).mean() + 1e-8)
-    
     return f.replace([np.inf, -np.inf], np.nan).ffill().bfill().fillna(0)
 
 # ============================================================================
-# SMART TARGET
+# TARGET
 # ============================================================================
 
 def create_target(df: pd.DataFrame, periods: int) -> pd.Series:
@@ -345,7 +290,7 @@ def create_target(df: pd.DataFrame, periods: int) -> pd.Series:
     return target
 
 # ============================================================================
-# ENSEMBLE MODEL (3 models + Meta)
+# MODEL
 # ============================================================================
 
 class EnsembleModel:
@@ -361,7 +306,6 @@ class EnsembleModel:
         self.selected_features = []
         self.is_trained = False
         self.version = None
-        self.wf_score = 0
     
     def _init_models(self):
         self.base_models = {
@@ -372,35 +316,6 @@ class EnsembleModel:
             'randomforest': RandomForestClassifier(n_estimators=200, max_depth=10, random_state=42, n_jobs=2),
             'gradient_boost': GradientBoostingClassifier(n_estimators=200, learning_rate=0.03, max_depth=5, random_state=42)
         }
-    
-    def _walk_forward_train(self, X: pd.DataFrame, y: pd.Series) -> float:
-        tscv = TimeSeriesSplit(n_splits=self.config.WALK_FORWARD_WINDOWS)
-        scores = []
-        
-        for train_idx, val_idx in tscv.split(X):
-            X_train, X_val = X.iloc[train_idx], X.iloc[val_idx]
-            y_train, y_val = y.iloc[train_idx], y.iloc[val_idx]
-            
-            X_train_s = self.scaler.fit_transform(X_train)
-            X_val_s = self.scaler.transform(X_val)
-            
-            base_preds = np.zeros((len(X_val), len(self.base_models)))
-            
-            for i, (name, model) in enumerate(self.base_models.items()):
-                try:
-                    if name == 'catboost':
-                        model.fit(X_train_s, y_train, verbose=False)
-                    else:
-                        model.fit(X_train_s, y_train)
-                    base_preds[:, i] = model.predict_proba(X_val_s)[:, 1]
-                except:
-                    base_preds[:, i] = 0.5
-            
-            meta = LogisticRegression()
-            meta.fit(base_preds, y_val)
-            scores.append(accuracy_score(y_val, meta.predict(base_preds)))
-        
-        return np.mean(scores)
     
     def train(self, df: pd.DataFrame) -> bool:
         try:
@@ -426,34 +341,34 @@ class EnsembleModel:
             
             self._init_models()
             
-            # Walk-Forward
-            self.wf_score = self._walk_forward_train(X, y)
-            self.logger.info(f"📈 {self.symbol}: WF Score = {self.wf_score:.3f}")
-            
-            # Final train
             X_s = self.scaler.fit_transform(X)
-            base_preds_all = np.zeros((len(X), len(self.base_models)))
+            
+            split_idx = int(len(X) * 0.8)
+            X_train, X_val = X_s[:split_idx], X_s[split_idx:]
+            y_train, y_val = y[:split_idx], y[split_idx:]
+            
+            base_preds = np.zeros((len(X_val), len(self.base_models)))
             
             for i, (name, model) in enumerate(self.base_models.items()):
                 try:
                     if name == 'catboost':
-                        model.fit(X_s, y, verbose=False)
+                        model.fit(X_train, y_train, verbose=False)
                     else:
-                        model.fit(X_s, y)
-                    base_preds_all[:, i] = model.predict_proba(X_s)[:, 1]
+                        model.fit(X_train, y_train)
+                    base_preds[:, i] = model.predict_proba(X_val)[:, 1]
                     
                     self.calibrators[name] = CalibratedClassifierCV(model, cv=3, method='isotonic')
-                    self.calibrators[name].fit(X_s, y)
+                    self.calibrators[name].fit(X_train, y_train)
                 except:
-                    pass
+                    base_preds[:, i] = 0.5
             
             self.meta_model = LogisticRegression()
-            self.meta_model.fit(base_preds_all, y)
+            self.meta_model.fit(base_preds, y_val)
             
             self.is_trained = True
             self.version = datetime.now().strftime('v%Y%m%d_%H%M%S')
             
-            acc = accuracy_score(y, self.meta_model.predict(base_preds_all))
+            acc = accuracy_score(y_val, self.meta_model.predict(base_preds))
             self.logger.info(f"✅ {self.symbol}: دقة={acc:.1%}, ميزات={len(self.selected_features)}")
             return True
             
@@ -461,16 +376,16 @@ class EnsembleModel:
             self.logger.error(f"❌ {self.symbol}: {e}")
             return False
     
-    def predict(self, df: pd.DataFrame, threshold: float = 0.65) -> Tuple[str, float, Dict]:
+    def predict(self, df: pd.DataFrame, threshold: float = 0.65) -> Tuple[str, float, float]:
         if not self.is_trained:
-            return "NEUTRAL", 0.0, {}
+            return "NEUTRAL", 0.0, 0.0
         
         try:
             features = calculate_features(df).iloc[[-1]]
             available = [f for f in self.selected_features if f in features.columns]
             
             if len(available) < 10:
-                return "NEUTRAL", 0.0, {}
+                return "NEUTRAL", 0.0, 0.0
             
             X = features[available].fillna(0)
             X_s = self.scaler.transform(X)
@@ -485,13 +400,13 @@ class EnsembleModel:
             meta_proba = float(self.meta_model.predict_proba(np.array([base_probas]))[0, 1])
             
             if meta_proba > threshold:
-                return "BUY", meta_proba, {'meta_proba': meta_proba}
+                return "BUY", meta_proba, meta_proba
             elif meta_proba < (1 - threshold):
-                return "SELL", 1 - meta_proba, {'meta_proba': meta_proba}
-            return "NEUTRAL", max(meta_proba, 1 - meta_proba), {'meta_proba': meta_proba}
+                return "SELL", 1 - meta_proba, meta_proba
+            return "NEUTRAL", max(meta_proba, 1 - meta_proba), meta_proba
             
         except:
-            return "NEUTRAL", 0.0, {}
+            return "NEUTRAL", 0.0, 0.0
     
     def save(self):
         path = os.path.join(self.config.MODELS_DIR, self.symbol)
@@ -502,8 +417,7 @@ class EnsembleModel:
             'calibrators': self.calibrators,
             'scaler': self.scaler,
             'features': self.selected_features,
-            'version': self.version,
-            'wf_score': self.wf_score
+            'version': self.version
         }, os.path.join(path, 'pro_model.pkl'))
     
     def load(self) -> bool:
@@ -517,7 +431,6 @@ class EnsembleModel:
         self.scaler = data['scaler']
         self.selected_features = data['features']
         self.version = data['version']
-        self.wf_score = data.get('wf_score', 0)
         self.is_trained = True
         return True
 
@@ -533,7 +446,12 @@ class FalconProBot:
         self.models = {}
         self.executor = ThreadPoolExecutor(max_workers=config.MAX_WORKERS)
         
+        # ✅ Initialize Telegram bot
         self.tb = telebot.TeleBot(config.TELEGRAM_TOKEN)
+        
+        # ✅ Remove webhook first!
+        self._remove_webhook()
+        
         self._setup_commands()
         
         for symbol in config.SYMBOLS:
@@ -544,6 +462,15 @@ class FalconProBot:
         
         self.running = False
         self.last_retrain = None
+    
+    def _remove_webhook(self):
+        """✅ Remove any existing webhook to avoid 409 conflict."""
+        try:
+            self.tb.remove_webhook()
+            self.logger.info("✅ Webhook removed successfully")
+            time.sleep(1)
+        except Exception as e:
+            self.logger.warning(f"⚠️ Webhook removal: {e}")
     
     def _setup_commands(self):
         @self.tb.message_handler(commands=['start', 'status'])
@@ -594,15 +521,10 @@ class FalconProBot:
             
             threshold = self.db.get_dynamic_threshold(symbol)
             
-            dir_5m, conf_5m, info_5m = model.predict(df_5m, threshold)
-            dir_15m, conf_15m, info_15m = model.predict(df_15m, threshold)
+            dir_5m, conf_5m, _ = model.predict(df_5m, threshold)
+            dir_15m, conf_15m, _ = model.predict(df_15m, threshold)
             
             if dir_5m != dir_15m or dir_5m == "NEUTRAL":
-                return None
-            
-            regime = MarketRegime.detect(df_15m)
-            
-            if not regime['is_trend'] and conf_5m < 0.70:
                 return None
             
             confidence = (conf_5m + conf_15m) / 2
@@ -610,15 +532,13 @@ class FalconProBot:
             if confidence < threshold:
                 return None
             
-            self.logger.info(f"🎯 {symbol}: {dir_5m} | Meta={info_5m.get('meta_proba', 0):.2%} | {regime['regime']}")
+            self.logger.info(f"🎯 {symbol}: {dir_5m} | ثقة={confidence:.1%}")
             
             return {
                 'symbol': symbol,
                 'direction': dir_5m,
                 'entry_price': float(df_5m['Close'].iloc[-1]),
                 'confidence': confidence,
-                'regime': regime['regime'],
-                'meta_proba': info_5m.get('meta_proba', 0),
                 'expiry_time': (datetime.now() + timedelta(minutes=self.config.TRADE_DURATION_MINUTES)).strftime('%Y-%m-%d %H:%M:%S')
             }
             
@@ -631,7 +551,7 @@ class FalconProBot:
             emoji = "🟢" if signal['direction'] == 'BUY' else "🔴"
             direction = "شراء ▲" if signal['direction'] == 'BUY' else "بيع ▼"
             
-            msg = f"{emoji} **{signal['symbol']}** - {direction}\n\n💰 {signal['entry_price']:.5f}\n⏳ {self.config.TRADE_DURATION_MINUTES} د\n💪 {signal['confidence']:.1%}\n📊 {signal['regime']}\n\n🤖 Falcon Pro"
+            msg = f"{emoji} **{signal['symbol']}** - {direction}\n\n💰 {signal['entry_price']:.5f}\n⏳ {self.config.TRADE_DURATION_MINUTES} د\n💪 {signal['confidence']:.1%}\n\n🤖 Falcon Pro"
             
             self.tb.send_message(self.config.TELEGRAM_CHAT_ID, msg, parse_mode='Markdown')
             self.logger.info(f"✅ إشارة: {signal['symbol']} {signal['direction']}")
@@ -706,13 +626,18 @@ class FalconProBot:
             pass
     
     def start_telegram(self):
+        """✅ Start Telegram with webhook already removed."""
         def poll():
+            self.logger.info("📡 بدء Telegram polling...")
             while True:
                 try:
                     self.tb.infinity_polling(timeout=10, long_polling_timeout=5)
-                except:
+                except Exception as e:
+                    self.logger.error(f"Polling error: {e}")
                     time.sleep(10)
+        
         threading.Thread(target=poll, daemon=True).start()
+        self.logger.info("✅ Telegram polling started")
     
     def run(self):
         self.running = True
@@ -734,7 +659,7 @@ class FalconProBot:
         try:
             trained = sum(1 for m in self.models.values() if m.is_trained)
             self.tb.send_message(self.config.TELEGRAM_CHAT_ID,
-                f"🦅 **Falcon Pro**\n✅ {trained}/{len(self.config.SYMBOLS)}\n⚡️ Scanning...",
+                f"🦅 **Falcon Pro**\n✅ {trained}/{len(self.config.SYMBOLS)}\n🧠 Meta + Calibration\n⚡️ Scanning...",
                 parse_mode='Markdown')
         except:
             pass
