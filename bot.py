@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-Falcon AI Ultimate v2.3 - Fixed Syntax
+Falcon AI Ultimate v2.3 - Forex Only
 ========================================
-Guaranteed to run without syntax errors.
+8 Forex pairs. XGBoost. Ready to run.
 """
 
 import os
@@ -61,8 +61,10 @@ class Config:
     TRADE_DURATION_MINUTES: int = 10
     SCAN_INTERVAL_MINUTES: int = 3
     
+    # ✅ فوركس فقط
     SYMBOLS: List[str] = field(default_factory=lambda: [
-        'EURUSD=X', 'GBPUSD=X', 'BTC-USD', 'ETH-USD', 'GC=F'
+        'EURUSD=X', 'GBPUSD=X', 'USDJPY=X', 'AUDUSD=X',
+        'USDCAD=X', 'NZDUSD=X', 'EURGBP=X', 'EURJPY=X'
     ])
     
     CONFIDENCE_THRESHOLD: float = 0.55
@@ -419,7 +421,7 @@ class FalconBot:
                 return
             trained = sum(1 for m in self.models.values() if m.is_trained)
             stats = self.db.get_stats()
-            text = f"🦅 Falcon AI\n✅ Models: {trained}/{len(self.models)}\n📊 Signals: {stats['total']}\n📈 Win Rate: {stats['win_rate']:.1%}"
+            text = f"🦅 Falcon AI Forex\n✅ Models: {trained}/{len(self.models)}\n📊 Signals: {stats['total']}\n📈 Win Rate: {stats['win_rate']:.1%}"
             self.tb.reply_to(msg, text)
         
         @self.tb.message_handler(commands=['stats'])
@@ -508,7 +510,7 @@ class FalconBot:
             emoji = "🟢" if signal['direction'] == 'BUY' else "🔴"
             direction = "شراء" if signal['direction'] == 'BUY' else "بيع"
             
-            msg = f"{emoji} **{signal['symbol']}** - {direction}\n\n💰 السعر: {signal['entry_price']:.5f}\n⏳ المدة: {self.config.TRADE_DURATION_MINUTES} دقائق\n💪 الثقة: {signal['confidence']:.1%}\n\n🤖 Falcon AI"
+            msg = f"{emoji} **{signal['symbol']}** - {direction}\n\n💰 السعر: {signal['entry_price']:.5f}\n⏳ المدة: {self.config.TRADE_DURATION_MINUTES} دقائق\n💪 الثقة: {signal['confidence']:.1%}\n\n🤖 Falcon AI Forex"
             
             self.tb.send_message(self.config.TELEGRAM_CHAT_ID, msg, parse_mode='Markdown')
             self.logger.info(f"SENT: {signal['symbol']} {signal['direction']}")
@@ -596,7 +598,7 @@ class FalconBot:
         self.running = True
         
         self.logger.info("=" * 40)
-        self.logger.info("Falcon AI Starting...")
+        self.logger.info("Falcon AI Forex Starting...")
         self.logger.info("=" * 40)
         
         self.start_telegram()
@@ -612,7 +614,7 @@ class FalconBot:
             trained = sum(1 for m in self.models.values() if m.is_trained)
             self.tb.send_message(
                 self.config.TELEGRAM_CHAT_ID,
-                f"🦅 Falcon AI Started\n✅ Models: {trained}/{len(self.models)}\n⚡️ Scanning...",
+                f"🦅 Falcon AI Forex Started\n✅ Models: {trained}/{len(self.models)}\n⚡️ Scanning...",
                 parse_mode='Markdown'
             )
         except:
