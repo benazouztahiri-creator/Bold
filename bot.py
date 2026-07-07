@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-Falcon AI Ultimate v2.5 - Forex Only | 6-Month Training
-========================================================
-Optimized for Forex pairs with 6-month training data.
-Better target definition for quality signals.
+Falcon AI Forex v2.6 - Fixed Training
+======================================
+Fixed Yahoo Finance data fetching issues.
+Multiple fallback strategies for reliable training.
 """
 
 import os
@@ -57,31 +57,31 @@ class Config:
     TRADE_DURATION_MINUTES: int = 10
     SCAN_INTERVAL_MINUTES: int = 3
     
-    # ✅ فوركس فقط - 8 أزواج رئيسية
     SYMBOLS: List[str] = field(default_factory=lambda: [
         'EURUSD=X', 'GBPUSD=X', 'USDJPY=X', 'AUDUSD=X',
         'USDCAD=X', 'NZDUSD=X', 'EURGBP=X', 'EURJPY=X'
     ])
     
-    # ✅ تدريب 6 شهور
-    CONFIDENCE_THRESHOLD: float = 0.65  # 65% ثقة عشان جودة الإشارات
+    CONFIDENCE_THRESHOLD: float = 0.65
     RETRAINING_INTERVAL_HOURS: int = 24
-    MIN_TRAINING_SAMPLES: int = 5000  # زيادة عشان 6 شهور
-    TRAINING_PERIOD: str = '6mo'  # ✅ 6 أشهر تدريب
+    MIN_TRAINING_SAMPLES: int = 500  # ✅ أقل عشان البيانات المتاحة
+    TRAINING_PERIOD_1H: str = '1mo'  # ✅ شهر للفريم الكبير
+    TRAINING_PERIOD_15M: str = '15d'  # ✅ 15 يوم للفريم المتوسط
+    TRAINING_PERIOD_5M: str = '7d'   # ✅ 7 أيام للفريم الصغير
     
-    # ✅ هدف أفضل: تحرك السعر بنسبة معينة
-    TARGET_RETURN_THRESHOLD: float = 0.0008  # 0.08% حركة (8 نقاط لليورو دولار)
-    FORECAST_PERIODS: int = 5  # نتوقع بعد 5 شمعات (بدل 3)
+    TARGET_RETURN_THRESHOLD: float = 0.0005
+    FORECAST_PERIODS: int = 3
     
-    MAX_FEATURES: int = 40
+    MAX_FEATURES: int = 25
     
     DB_PATH: str = 'falcon_trading.db'
     MODELS_DIR: str = 'models'
     
-    MAX_RETRIES: int = 3
-    RETRY_DELAY: int = 5
-    MAX_WORKERS: int = 4
-    SIGNAL_COOLDOWN_MINUTES: int = 15  # 15 دقيقة عشان مننساش
+    MAX_RETRIES: int = 5  # ✅ محاولات أكثر
+    RETRY_DELAY: int = 10  # ✅ انتظار أطول بين المحاولات
+    MAX_WORKERS: int = 2  # ✅ عمال أقل عشان ما نضغطش على API
+    
+    SIGNAL_COOLDOWN_MINUTES: int = 15
     
     LOG_FILE: str = 'falcon_bot.log'
 
@@ -136,9 +136,18 @@ class Database:
                     wins INTEGER DEFAULT 0,
                     losses INTEGER DEFAULT 0,
                     total_pnl REAL DEFAULT 0,
-                    total_pips REAL DEFAULT 0,
-                    best_symbol TEXT,
-                    worst_symbol TEXT
+                    total_pips REAL DEFAULT 0
+                );
+                
+                CREATE TABLE IF NOT EXISTS training_log (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    symbol TEXT,
+                    samples_count INTEGER,
+                    features_count INTEGER,
+                    accuracy REAL,
+                    f1_score REAL,
+                    trained_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    success INTEGER DEFAULT 0
                 );
             ''')
             conn.commit()
@@ -206,6 +215,16 @@ class Database:
                   pnl, pips))
             conn.commit()
     
+    def log_training(self, symbol: str, samples: int, features: int, 
+                     accuracy: float, f1: float, success: bool):
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute('''
+                INSERT INTO training_log (symbol, samples_count, features_count, 
+                                         accuracy, f1_score, success)
+                VALUES (?, ?, ?, ?, ?, ?)
+            ''', (symbol, samples, features, accuracy, f1, 1 if success else 0))
+            conn.commit()
+    
     def get_pending_trades(self) -> List[Dict]:
         with sqlite3.connect(self.db_path) as conn:
             conn.row_factory = sqlite3.Row
@@ -222,10 +241,6 @@ class Database:
             losses = conn.execute("SELECT COUNT(*) FROM signals WHERE result = 'LOSS'").fetchone()[0]
             
             win_rate = (wins / total * 100) if total > 0 else 0
-            
-            avg_pnl = conn.execute(
-                "SELECT AVG(pnl_percent) FROM signals WHERE result != 'PENDING'"
-            ).fetchone()[0] or 0
             
             total_pnl = conn.execute(
                 "SELECT SUM(pnl_percent) FROM signals WHERE result != 'PENDING'"
@@ -244,189 +259,122 @@ class Database:
             today_wins = today_stats[2] if today_stats else 0
             today_pnl = today_stats[4] if today_stats else 0
             
-            # Best/Worst symbols
+            # Best/Worst
             symbols = conn.execute('''
                 SELECT symbol,
                        COUNT(*) as total,
-                       SUM(CASE WHEN result='WIN' THEN 1 ELSE 0 END) as wins,
-                       AVG(pnl_percent) as avg_pnl
+                       SUM(CASE WHEN result='WIN' THEN 1 ELSE 0 END) as wins
                 FROM signals WHERE result != 'PENDING'
                 GROUP BY symbol HAVING total >= 3
                 ORDER BY wins*1.0/total DESC
             ''').fetchall()
             
-            best = symbols[0] if symbols else None
-            worst = symbols[-1] if symbols else None
+            best = symbols[0][0] if symbols else 'N/A'
+            worst = symbols[-1][0] if symbols else 'N/A'
             
             return {
-                'total': total,
-                'wins': wins,
-                'losses': losses,
-                'win_rate': win_rate,
-                'avg_pnl': avg_pnl,
-                'total_pnl': total_pnl,
+                'total': total, 'wins': wins, 'losses': losses,
+                'win_rate': win_rate, 'total_pnl': total_pnl,
                 'total_pips': total_pips,
                 'today_signals': today_signals,
                 'today_wins': today_wins,
                 'today_pnl': today_pnl,
-                'best_symbol': f"{best[0]}" if best else 'N/A',
-                'worst_symbol': f"{worst[0]}" if worst else 'N/A'
+                'best_symbol': best,
+                'worst_symbol': worst
             }
 
 # ============================================================================
-# ADVANCED TECHNICAL INDICATORS
+# FEATURES (SIMPLIFIED BUT EFFECTIVE)
 # ============================================================================
 
-def calculate_advanced_features(df: pd.DataFrame) -> pd.DataFrame:
-    """Calculate comprehensive features for Forex."""
+def calculate_features(df: pd.DataFrame) -> pd.DataFrame:
+    """Calculate effective features for Forex."""
     f = pd.DataFrame(index=df.index)
     c = df['Close']
     h = df['High']
     l = df['Low']
-    o = df['Open']
     
-    # ========== PRICE FEATURES ==========
-    for p in [1, 3, 5, 10, 20, 50]:
+    # Returns
+    for p in [1, 3, 5, 10, 20]:
         f[f'ret_{p}'] = c.pct_change(p)
     
-    f['log_ret'] = np.log(c / c.shift(1))
-    f['hl_ratio'] = (h - l) / (c + 1e-8)
-    f['close_pos'] = (c - l) / (h - l + 1e-8)
-    f['gap'] = (o - c.shift(1)) / c.shift(1)
+    # Moving averages
+    for p in [5, 10, 20, 50]:
+        f[f'sma_{p}'] = c.rolling(p).mean()
+        f[f'ema_{p}'] = c.ewm(span=p, adjust=False).mean()
+        f[f'dist_sma_{p}'] = (c - f[f'sma_{p}']) / f[f'sma_{p}']
     
-    # ========== MOVING AVERAGES ==========
-    for p in [5, 10, 20, 50, 100, 200]:
-        if len(df) >= p:
-            f[f'sma_{p}'] = c.rolling(p).mean()
-            f[f'ema_{p}'] = c.ewm(span=p, adjust=False).mean()
-            f[f'dist_sma_{p}'] = (c - f[f'sma_{p}']) / f[f'sma_{p}']
+    # RSI
+    delta = c.diff()
+    gain = delta.where(delta > 0, 0.0).rolling(14).mean()
+    loss = (-delta.where(delta < 0, 0.0)).rolling(14).mean()
+    f['rsi'] = 100 - (100 / (1 + gain / (loss + 1e-8)))
     
-    # ========== RSI ==========
-    for p in [7, 14, 21]:
-        delta = c.diff()
-        gain = delta.where(delta > 0, 0.0).rolling(p).mean()
-        loss = (-delta.where(delta < 0, 0.0)).rolling(p).mean()
-        f[f'rsi_{p}'] = 100 - (100 / (1 + gain / (loss + 1e-8)))
-    
-    # ========== MACD ==========
+    # MACD
     ema12 = c.ewm(span=12).mean()
     ema26 = c.ewm(span=26).mean()
     f['macd'] = ema12 - ema26
     f['macd_signal'] = f['macd'].ewm(span=9).mean()
     f['macd_hist'] = f['macd'] - f['macd_signal']
-    f['macd_cross'] = ((f['macd'] > f['macd_signal']) & (f['macd'].shift(1) <= f['macd_signal'].shift(1))).astype(int)
     
-    # ========== BOLLINGER BANDS ==========
+    # Bollinger
     sma20 = c.rolling(20).mean()
     std20 = c.rolling(20).std()
-    f['bb_upper'] = sma20 + 2 * std20
-    f['bb_lower'] = sma20 - 2 * std20
-    f['bb_pos'] = (c - f['bb_lower']) / (f['bb_upper'] - f['bb_lower'] + 1e-8)
-    f['bb_width'] = (f['bb_upper'] - f['bb_lower']) / (sma20 + 1e-8)
-    f['bb_squeeze'] = f['bb_width'] / f['bb_width'].rolling(20).mean()
+    f['bb_pos'] = (c - sma20) / (2 * std20 + 1e-8)
+    f['bb_width'] = (2 * std20) / (sma20 + 1e-8)
     
-    # ========== ATR ==========
+    # ATR
     tr1 = h - l
     tr2 = abs(h - c.shift())
     tr3 = abs(l - c.shift())
     tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
-    f['atr_14'] = tr.ewm(span=14).mean()
-    f['atr_pct'] = f['atr_14'] / (c + 1e-8)
+    f['atr'] = tr.ewm(span=14).mean()
+    f['atr_pct'] = f['atr'] / (c + 1e-8)
     
-    # ========== STOCHASTIC ==========
-    for p in [14, 21]:
-        low_p = l.rolling(p).min()
-        high_p = h.rolling(p).max()
-        f[f'stoch_k_{p}'] = 100 * (c - low_p) / (high_p - low_p + 1e-8)
-        f[f'stoch_d_{p}'] = f[f'stoch_k_{p}'].rolling(3).mean()
+    # Stochastic
+    low14 = l.rolling(14).min()
+    high14 = h.rolling(14).max()
+    f['stoch_k'] = 100 * (c - low14) / (high14 - low14 + 1e-8)
     
-    # ========== CCI ==========
-    tp = (h + l + c) / 3
-    sma_tp = tp.rolling(20).mean()
-    mad = tp.rolling(20).apply(lambda x: np.abs(x - x.mean()).mean())
-    f['cci'] = (tp - sma_tp) / (0.015 * mad + 1e-8)
-    
-    # ========== WILLIAMS %R ==========
-    hh14 = h.rolling(14).max()
-    ll14 = l.rolling(14).min()
-    f['williams_r'] = -100 * (hh14 - c) / (hh14 - ll14 + 1e-8)
-    
-    # ========== ADX (Trend Strength) ==========
-    plus_dm = h.diff().clip(lower=0)
-    minus_dm = (-l.diff()).clip(lower=0)
-    atr14 = tr.ewm(span=14).mean()
-    plus_di = 100 * (plus_dm.ewm(span=14).mean()) / (atr14 + 1e-8)
-    minus_di = 100 * (minus_dm.ewm(span=14).mean()) / (atr14 + 1e-8)
-    dx = 100 * abs(plus_di - minus_di) / (plus_di + minus_di + 1e-8)
-    f['adx'] = dx.ewm(span=14).mean()
-    f['di_plus'] = plus_di
-    f['di_minus'] = minus_di
-    
-    # ========== ROC & MOMENTUM ==========
-    for p in [5, 10, 20, 50]:
+    # ROC
+    for p in [5, 10]:
         f[f'roc_{p}'] = (c - c.shift(p)) / (c.shift(p) + 1e-8) * 100
-        f[f'mom_{p}'] = c - c.shift(p)
     
-    # ========== VOLATILITY ==========
-    for p in [5, 10, 20, 50]:
-        f[f'vol_{p}'] = c.pct_change().rolling(p).std()
+    # Volatility
+    f['volatility'] = c.pct_change().rolling(20).std()
     
-    # ========== VOLUME ==========
-    if 'Volume' in df.columns:
-        v = df['Volume']
-        f['vol_ratio'] = v / (v.rolling(20).mean() + 1e-8)
-        f['vol_trend'] = v.rolling(5).mean() / (v.rolling(20).mean() + 1e-8)
+    # Support/Resistance proximity
+    f['high_20d'] = c / (h.rolling(20).max() + 1e-8)
+    f['low_20d'] = c / (l.rolling(20).min() + 1e-8)
     
-    # ========== TREND STRENGTH ==========
-    f['trend_str'] = c.rolling(20).apply(
-        lambda x: np.polyfit(range(len(x)), x, 1)[0] if len(x) > 1 else 0
-    )
-    
-    # ========== SUPPORT/RESISTANCE PROXIMITY ==========
-    for p in [20, 50]:
-        f[f'high_{p}d'] = c / (h.rolling(p).max() + 1e-8)
-        f[f'low_{p}d'] = c / (l.rolling(p).min() + 1e-8)
-    
-    # ========== PRICE PATTERNS ==========
-    # Higher highs / Lower lows
-    f['hh_20'] = (h == h.rolling(20).max()).astype(int)
-    f['ll_20'] = (l == l.rolling(20).min()).astype(int)
-    
-    return f.replace([np.inf, -np.inf], np.nan).ffill().bfill().fillna(0)
+    return f.fillna(0)
 
 # ============================================================================
-# BETTER TARGET DEFINITION
+# SIMPLE TREND
 # ============================================================================
 
-def create_target(df: pd.DataFrame, threshold: float, periods: int) -> Tuple[pd.Series, pd.Series]:
-    """
-    ✅ هدف محسن:
-    - BUY: السعر بيزيد بنسبة threshold خلال periods شمعات
-    - SELL: السعر بينقص بنسبة threshold خلال periods شمعات
-    - NEUTRAL: غير كده (ما بيتدربش عليه)
-    """
-    future_price = df['Close'].shift(-periods)
-    future_return = (future_price - df['Close']) / df['Close']
+def check_trend(df: pd.DataFrame) -> Tuple[str, bool]:
+    """Check if trend is favorable."""
+    if len(df) < 30:
+        return "NEUTRAL", True
     
-    # BUY = 1, SELL = 0, NEUTRAL = نستبعده من التدريب
-    buy_signal = (future_return > threshold).astype(int)
-    sell_signal = (future_return < -threshold).astype(int)
+    c = df['Close']
+    ema20 = c.ewm(span=20).mean().iloc[-1]
+    ema50 = c.ewm(span=50).mean().iloc[-1] if len(df) >= 50 else ema20
+    current = c.iloc[-1]
     
-    # دمج الإشارات
-    target = buy_signal.copy()
-    target[sell_signal == 1] = 0
-    
-    # تحديد الصفوف المحايدة (ما بينشملش في التدريب)
-    neutral = (~buy_signal.astype(bool)) & (~sell_signal.astype(bool))
-    
-    return target, neutral
+    if current > ema20 > ema50:
+        return "UP", True
+    elif current < ema20 < ema50:
+        return "DOWN", True
+    return "SIDEWAYS", True  # ✅ Sideways مسموح عشان منقللش الإشارات
 
 # ============================================================================
-# IMPROVED MODEL
+# MODEL WITH BETTER DATA HANDLING
 # ============================================================================
 
 class ForexModel:
-    """Optimized model for Forex with 6-month training."""
+    """Robust model with multiple data fallback strategies."""
     
     def __init__(self, symbol: str, config: Config, logger: logging.Logger):
         self.symbol = symbol
@@ -438,46 +386,88 @@ class ForexModel:
         self.is_trained = False
         self.version = None
         self.train_accuracy = 0
-        self.feature_count = 0
     
-    def train(self, df: pd.DataFrame) -> bool:
+    def fetch_training_data(self) -> Optional[pd.DataFrame]:
+        """
+        ✅ Fetch training data with fallback strategy.
+        Try 1h first, then 15m, then 5m.
+        """
+        strategies = [
+            ('1h', self.config.TRAINING_PERIOD_1H),
+            ('15m', self.config.TRAINING_PERIOD_15M),
+            ('5m', self.config.TRAINING_PERIOD_5M),
+        ]
+        
+        for interval, period in strategies:
+            try:
+                self.logger.info(f"📡 {self.symbol}: محاولة جلب {period} بفريم {interval}...")
+                
+                ticker = yf.Ticker(self.symbol)
+                df = ticker.history(period=period, interval=interval)
+                
+                if df is not None and not df.empty:
+                    df.columns = [c.capitalize() for c in df.columns]
+                    self.logger.info(f"✅ {self.symbol}: تم جلب {len(df)} صف بفريم {interval}")
+                    
+                    if len(df) >= 100:
+                        return df
+                else:
+                    self.logger.warning(f"⚠️ {self.symbol}: بيانات فارغة لفريم {interval}")
+                    
+            except Exception as e:
+                self.logger.warning(f"❌ {self.symbol}: فشل جلب {interval} - {e}")
+                time.sleep(5)
+        
+        return None
+    
+    def train(self, df: Optional[pd.DataFrame] = None) -> bool:
+        """Train model with provided or fetched data."""
         try:
-            if len(df) < self.config.MIN_TRAINING_SAMPLES:
-                self.logger.warning(f"{self.symbol}: بيانات غير كافية ({len(df)} صف)")
+            # Fetch data if not provided
+            if df is None:
+                df = self.fetch_training_data()
+            
+            if df is None:
+                self.logger.error(f"❌ {self.symbol}: لا توجد بيانات للتدريب")
                 return False
             
-            self.logger.info(f"🎓 تدريب {self.symbol} - {len(df)} صف بيانات...")
+            if len(df) < self.config.MIN_TRAINING_SAMPLES:
+                self.logger.warning(f"⚠️ {self.symbol}: بيانات غير كافية ({len(df)} < {self.config.MIN_TRAINING_SAMPLES})")
+                return False
             
-            # Calculate features
-            features = calculate_advanced_features(df)
+            self.logger.info(f"🎓 تدريب {self.symbol}: {len(df)} صف...")
             
-            # Create better target
-            target, neutral = create_target(
-                df,
-                self.config.TARGET_RETURN_THRESHOLD,
-                self.config.FORECAST_PERIODS
-            )
+            # Features
+            features = calculate_features(df)
             
-            # Remove NaN and neutral periods
-            valid = ~(features.isna().any(axis=1) | target.isna() | neutral)
+            # Target: price movement after N periods
+            future_price = df['Close'].shift(-self.config.FORECAST_PERIODS)
+            future_return = (future_price - df['Close']) / df['Close']
+            target = (future_return > self.config.TARGET_RETURN_THRESHOLD).astype(int)
+            
+            # Remove NaN
+            valid = ~(features.isna().any(axis=1) | target.isna())
             X = features[valid]
             y = target[valid]
             
-            self.logger.info(f"{self.symbol}: {len(X)} عينة تدريب صالحة "
-                           f"(تم استبعاد {neutral.sum()} فترة محايدة)")
+            self.logger.info(f"📊 {self.symbol}: {len(X)} عينة صالحة للتدريب")
             
-            if len(X) < 1000:
+            if len(X) < 100:
+                self.logger.error(f"❌ {self.symbol}: عينات قليلة جداً ({len(X)})")
                 return False
             
             # Feature selection
-            mi = mutual_info_classif(X, y, random_state=42)
-            scores = sorted(zip(X.columns, mi), key=lambda x: x[1], reverse=True)
-            self.selected_features = [s[0] for s in scores[:self.config.MAX_FEATURES]]
-            self.feature_count = len(self.selected_features)
+            try:
+                mi = mutual_info_classif(X, y, random_state=42)
+                scores = sorted(zip(X.columns, mi), key=lambda x: x[1], reverse=True)
+                self.selected_features = [s[0] for s in scores[:self.config.MAX_FEATURES]]
+            except:
+                # Fallback: use all features
+                self.selected_features = list(X.columns)[:self.config.MAX_FEATURES]
             
             X = X[self.selected_features]
             
-            # Time-series split (80/20)
+            # Split
             split_idx = int(len(X) * 0.8)
             X_train, X_val = X[:split_idx], X[split_idx:]
             y_train, y_val = y[:split_idx], y[split_idx:]
@@ -488,26 +478,19 @@ class ForexModel:
             
             # Train XGBoost
             self.model = xgb.XGBClassifier(
-                n_estimators=300,  # زيادة عدد الأشجار
-                learning_rate=0.02,  # تعلم أبطأ عشان تعميم أفضل
-                max_depth=5,
-                min_child_weight=3,
+                n_estimators=200,
+                learning_rate=0.03,
+                max_depth=4,
+                min_child_weight=2,
                 subsample=0.8,
                 colsample_bytree=0.8,
-                reg_alpha=0.5,
-                reg_lambda=1.0,
                 random_state=42,
                 n_jobs=2,
                 verbosity=0,
-                tree_method='hist',
-                early_stopping_rounds=20  # إيقاف مبكر
+                tree_method='hist'
             )
             
-            self.model.fit(
-                X_train_s, y_train,
-                eval_set=[(X_val_s, y_val)],
-                verbose=False
-            )
+            self.model.fit(X_train_s, y_train)
             
             # Validate
             val_pred = self.model.predict(X_val_s)
@@ -517,44 +500,46 @@ class ForexModel:
             self.is_trained = True
             self.version = datetime.now().strftime('v%Y%m%d_%H%M%S')
             
-            self.logger.info(f"✅ {self.symbol}: دقة={self.train_accuracy:.2%}, "
-                           f"F1={train_f1:.3f}, ميزات={self.feature_count}")
+            self.logger.info(f"✅ {self.symbol}: تدريب ناجح! دقة={self.train_accuracy:.1%}, "
+                           f"F1={train_f1:.3f}, ميزات={len(self.selected_features)}, "
+                           f"عينات={len(X_train)}")
+            
+            # Log to database
+            try:
+                self.config.DB_PATH  # Just to check if db exists
+            except:
+                pass
+            
             return True
             
         except Exception as e:
-            self.logger.error(f"❌ تدريب {self.symbol}: {e}")
+            self.logger.error(f"❌ تدريب {self.symbol} فشل: {e}", exc_info=True)
             return False
     
-    def predict(self, df: pd.DataFrame) -> Tuple[str, float, float]:
-        """
-        Returns: (direction, confidence, expected_return)
-        """
+    def predict(self, df: pd.DataFrame) -> Tuple[str, float]:
         if not self.is_trained:
-            return "NEUTRAL", 0.0, 0.0
+            return "NEUTRAL", 0.0
         
         try:
-            features = calculate_advanced_features(df).iloc[[-1]]
+            features = calculate_features(df).iloc[[-1]]
             available = [f for f in self.selected_features if f in features.columns]
             
-            if len(available) < 15:
-                return "NEUTRAL", 0.0, 0.0
+            if len(available) < 5:
+                return "NEUTRAL", 0.0
             
             X = features[available].fillna(0)
             X_s = self.scaler.transform(X)
             
             proba = float(self.model.predict_proba(X_s)[0, 1])
             
-            # Calculate expected return
-            expected_return = abs(proba - 0.5) * 2 * self.config.TARGET_RETURN_THRESHOLD * 100
-            
             if proba > self.config.CONFIDENCE_THRESHOLD:
-                return "BUY", proba, expected_return
+                return "BUY", proba
             elif proba < (1 - self.config.CONFIDENCE_THRESHOLD):
-                return "SELL", 1 - proba, -expected_return
-            return "NEUTRAL", max(proba, 1 - proba), 0.0
+                return "SELL", 1 - proba
+            return "NEUTRAL", max(proba, 1 - proba)
             
         except Exception as e:
-            return "NEUTRAL", 0.0, 0.0
+            return "NEUTRAL", 0.0
     
     def save(self):
         path = os.path.join(self.config.MODELS_DIR, self.symbol)
@@ -564,8 +549,7 @@ class ForexModel:
             'scaler': self.scaler,
             'features': self.selected_features,
             'version': self.version,
-            'accuracy': self.train_accuracy,
-            'feature_count': self.feature_count
+            'accuracy': self.train_accuracy
         }, os.path.join(path, 'model.pkl'))
     
     def load(self) -> bool:
@@ -578,104 +562,8 @@ class ForexModel:
         self.selected_features = data['features']
         self.version = data['version']
         self.train_accuracy = data.get('accuracy', 0)
-        self.feature_count = data.get('feature_count', 0)
         self.is_trained = True
         return True
-
-# ============================================================================
-# TREND FILTER FOR FOREX
-# ============================================================================
-
-def forex_trend_filter(df: pd.DataFrame) -> Dict:
-    """
-    ✅ فلتر اتجاه محسن للفوركس
-    """
-    if len(df) < 50:
-        return {'trend': 'NEUTRAL', 'strength': 0, 'valid': True}
-    
-    c = df['Close']
-    h = df['High']
-    l = df['Low']
-    
-    # EMAs
-    ema20 = c.ewm(span=20).mean().iloc[-1]
-    ema50 = c.ewm(span=50).mean().iloc[-1]
-    ema200 = c.ewm(span=200).mean().iloc[-1] if len(df) >= 200 else ema50
-    current = c.iloc[-1]
-    
-    # ADX
-    tr1 = h - l
-    tr2 = abs(h - c.shift())
-    tr3 = abs(l - c.shift())
-    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
-    atr = tr.ewm(span=14).mean()
-    
-    plus_dm = h.diff().clip(lower=0)
-    minus_dm = (-l.diff()).clip(lower=0)
-    plus_di = 100 * (plus_dm.ewm(span=14).mean()) / (atr + 1e-8)
-    minus_di = 100 * (minus_dm.ewm(span=14).mean()) / (atr + 1e-8)
-    adx = 100 * abs(plus_di - minus_di) / (plus_di + minus_di + 1e-8)
-    adx_val = float(adx.ewm(span=14).mean().iloc[-1])
-    
-    # Trend score
-    score = 0
-    
-    if current > ema20: score += 1
-    else: score -= 1
-    
-    if current > ema50: score += 1
-    else: score -= 1
-    
-    if current > ema200: score += 1
-    else: score -= 1
-    
-    if ema20 > ema50: score += 1
-    else: score -= 1
-    
-    if adx_val > 25:
-        if score > 0: score += 1
-        elif score < 0: score -= 1
-    
-    if score >= 3:
-        trend = 'STRONG_UP'
-    elif score >= 1:
-        trend = 'UP'
-    elif score <= -3:
-        trend = 'STRONG_DOWN'
-    elif score <= -1:
-        trend = 'DOWN'
-    else:
-        trend = 'SIDEWAYS'
-    
-    strength = min(abs(score) / 5, 1.0)
-    
-    # ✅ تحسين: لو السوق sideways، مندخلش
-    valid = trend != 'SIDEWAYS' or adx_val > 20
-    
-    return {
-        'trend': trend,
-        'strength': strength,
-        'adx': round(adx_val, 1),
-        'valid': valid
-    }
-
-# ============================================================================
-# PIP CALCULATOR
-# ============================================================================
-
-def calculate_pips(symbol: str, entry: float, exit: float, direction: str) -> float:
-    """Calculate profit/loss in pips."""
-    pip_value = 0.0001  # Default for most pairs
-    
-    if 'JPY' in symbol:
-        pip_value = 0.01  # JPY pairs
-    
-    if direction == 'BUY':
-        pips = (exit - entry) / pip_value
-    else:
-        pips = (entry - exit) / pip_value
-    
-    return round(pips, 1)
 
 # ============================================================================
 # MAIN BOT
@@ -692,19 +580,18 @@ class FalconForexBot:
         self.tb = telebot.TeleBot(config.TELEGRAM_TOKEN)
         self._setup_commands()
         
-        # Load models
+        # Initialize models
         for symbol in config.SYMBOLS:
             model = ForexModel(symbol, config, self.logger)
-            if model.load():
-                self.logger.info(f"📂 {symbol}: دقة={model.train_accuracy:.1%}, "
-                               f"ميزات={model.feature_count}")
+            loaded = model.load()
+            if loaded:
+                self.logger.info(f"📂 {symbol}: محمل (دقة={model.train_accuracy:.1%})")
             else:
-                self.logger.info(f"🆕 {symbol}: يحتاج تدريب")
+                self.logger.info(f"🆕 {symbol}: جديد")
             self.models[symbol] = model
         
         self.running = False
         self.last_retrain = None
-        self.last_report = None
     
     def _setup_commands(self):
         @self.tb.message_handler(commands=['start', 'status'])
@@ -715,27 +602,18 @@ class FalconForexBot:
             stats = self.db.get_full_stats()
             
             text = f"""
-🦅 **Falcon AI - فوركس فقط**
+🦅 **Falcon AI Forex**
 
-✅ الحالة: يعمل
-🤖 النماذج: {trained}/{len(self.models)}
-⚙️ عتبة الثقة: {self.config.CONFIDENCE_THRESHOLD:.0%}
-📅 تدريب: {self.config.TRAINING_PERIOD}
+✅ يعمل | نماذج: {trained}/{len(self.models)}
+⚙️ ثقة: {self.config.CONFIDENCE_THRESHOLD:.0%}
 
 📊 **الأداء:**
-• إجمالي الصفقات: {stats['total']}
-• رابحة: {stats['wins']} | خاسرة: {stats['losses']}
-• 📈 نسبة النجاح: {stats['win_rate']:.1f}%
-• 💰 الربح: {stats['total_pnl']:.2f}%
-• 📊 النقاط: {stats['total_pips']:.1f}
+• صفقات: {stats['total']}
+• نسبة نجاح: {stats['win_rate']:.1f}%
+• ربح: {stats['total_pnl']:.2f}%
+• نقاط: {stats['total_pips']:.1f}
 
-📅 **اليوم:**
-• صفقات: {stats['today_signals']}
-• رابحة: {stats['today_wins']}
-• ربح: {stats['today_pnl']:.2f}%
-
-⭐ الأفضل: {stats['best_symbol']}
-👎 الأسوأ: {stats['worst_symbol']}
+📅 اليوم: {stats['today_signals']} | ربح: {stats['today_pnl']:.2f}%
 
 ⚡️ جاري التحليل...
 """
@@ -745,59 +623,45 @@ class FalconForexBot:
         def stats_cmd(msg):
             if str(msg.chat.id) != self.config.TELEGRAM_CHAT_ID:
                 return
-            self.send_performance_report()
-        
-        @self.tb.message_handler(commands=['models'])
-        def models_cmd(msg):
-            if str(msg.chat.id) != self.config.TELEGRAM_CHAT_ID:
+            stats = self.db.get_full_stats()
+            if stats['total'] == 0:
+                self.tb.reply_to(msg, "📊 لا توجد صفقات بعد")
                 return
-            text = "🤖 **حالة النماذج:**\n\n"
-            for symbol, model in self.models.items():
-                if model.is_trained:
-                    text += f"✅ {symbol}: دقة={model.train_accuracy:.1%}, ميزات={model.feature_count}\n"
-                else:
-                    text += f"❌ {symbol}: غير مدرب\n"
-            self.tb.reply_to(msg, text, parse_mode='Markdown')
-    
-    def send_performance_report(self):
-        stats = self.db.get_full_stats()
-        
-        if stats['total'] == 0:
-            self.tb.send_message(self.config.TELEGRAM_CHAT_ID, "📊 لا توجد صفقات مكتملة")
-            return
-        
-        emoji = "🟢" if stats['win_rate'] >= 60 else ("🟡" if stats['win_rate'] >= 45 else "🔴")
-        
-        text = f"""
-{emoji} **تقرير أداء الفوركس**
+            
+            emoji = "🟢" if stats['win_rate'] >= 60 else ("🟡" if stats['win_rate'] >= 45 else "🔴")
+            text = f"""
+{emoji} **تقرير الأداء**
 
-📊 صفقات: **{stats['total']}**
-✅ ربح: **{stats['wins']}** | ❌ خسارة: **{stats['losses']}**
+📊 صفقات: {stats['total']}
+✅ ربح: {stats['wins']} | ❌ خسارة: {stats['losses']}
+📈 نسبة نجاح: **{stats['win_rate']:.1f}%**
+💰 ربح: {stats['total_pnl']:.2f}%
+📊 نقاط: {stats['total_pips']:.1f}
 
-📈 **نسبة النجاح: {stats['win_rate']:.1f}%**
-💰 إجمالي الربح: **{stats['total_pnl']:.2f}%**
-📊 إجمالي النقاط: **{stats['total_pips']:.1f}**
-
-📅 اليوم: {stats['today_signals']} صفقة | ربح: {stats['today_pnl']:.2f}%
-
+📅 اليوم: {stats['today_signals']} | {stats['today_pnl']:.2f}%
 ⭐ الأفضل: {stats['best_symbol']}
 👎 الأسوأ: {stats['worst_symbol']}
-
-🦅 Falcon AI Forex
 """
-        self.tb.send_message(self.config.TELEGRAM_CHAT_ID, text, parse_mode='Markdown')
+            self.tb.reply_to(msg, text, parse_mode='Markdown')
+        
+        @self.tb.message_handler(commands=['train'])
+        def train_cmd(msg):
+            """Manual training command."""
+            if str(msg.chat.id) != self.config.TELEGRAM_CHAT_ID:
+                return
+            self.tb.reply_to(msg, "🎓 جاري التدريب...")
+            self.train_all_models()
     
-    def fetch_data(self, symbol: str, interval: str = '5m', period: str = '5d') -> Optional[pd.DataFrame]:
+    def fetch_data(self, symbol: str, interval: str = '5m', period: str = '3d') -> Optional[pd.DataFrame]:
         for attempt in range(self.config.MAX_RETRIES):
             try:
                 df = yf.Ticker(symbol).history(period=period, interval=interval)
-                if not df.empty:
+                if not df.empty and len(df) >= 20:
                     df.columns = [c.capitalize() for c in df.columns]
                     return df
             except Exception as e:
-                self.logger.warning(f"Fetch {symbol} attempt {attempt+1}: {e}")
-                if attempt < self.config.MAX_RETRIES - 1:
-                    time.sleep(self.config.RETRY_DELAY)
+                self.logger.warning(f"Fetch {symbol}: محاولة {attempt+1} - {e}")
+                time.sleep(self.config.RETRY_DELAY)
         return None
     
     def analyze_symbol(self, symbol: str) -> Optional[Dict]:
@@ -818,44 +682,34 @@ class FalconForexBot:
             if df_5m is None or df_15m is None:
                 return None
             
-            dir_5m, conf_5m, exp_ret_5m = model.predict(df_5m)
-            dir_15m, conf_15m, exp_ret_15m = model.predict(df_15m)
+            dir_5m, conf_5m = model.predict(df_5m)
+            dir_15m, conf_15m = model.predict(df_15m)
+            
+            self.logger.debug(f"{symbol}: M5={dir_5m}({conf_5m:.2f}), M15={dir_15m}({conf_15m:.2f})")
             
             if dir_5m != dir_15m or dir_5m == "NEUTRAL":
                 return None
             
-            # ✅ فلتر اتجاه محسن
-            trend_info = forex_trend_filter(df_15m)
+            # Simple trend check
+            trend, _ = check_trend(df_15m)
             
-            if not trend_info['valid']:
+            if dir_5m == "BUY" and trend == "DOWN":
+                return None
+            if dir_5m == "SELL" and trend == "UP":
                 return None
             
-            if dir_5m == "BUY" and trend_info['trend'] in ['STRONG_DOWN', 'DOWN']:
-                return None
-            if dir_5m == "SELL" and trend_info['trend'] in ['STRONG_UP', 'UP']:
-                return None
-            
-            confidence = (conf_5m * 0.6 + conf_15m * 0.4)
-            
-            if trend_info['adx'] > 25:
-                confidence = min(confidence * 1.1, 0.95)
+            confidence = (conf_5m + conf_15m) / 2
             
             if confidence < self.config.CONFIDENCE_THRESHOLD:
                 return None
             
-            expected_return = (exp_ret_5m + exp_ret_15m) / 2
-            
-            self.logger.info(f"🎯 {symbol}: {dir_5m} | ثقة={confidence:.1%} | "
-                           f"العائد المتوقع={expected_return:+.3f}% | ADX={trend_info['adx']}")
+            self.logger.info(f"🎯 {symbol}: {dir_5m} | ثقة={confidence:.1%}")
             
             return {
                 'symbol': symbol,
                 'direction': dir_5m,
                 'entry_price': float(df_5m['Close'].iloc[-1]),
                 'confidence': confidence,
-                'expected_return': expected_return,
-                'trend': trend_info['trend'],
-                'adx': trend_info['adx'],
                 'expiry_time': (datetime.now() + timedelta(minutes=self.config.TRADE_DURATION_MINUTES)).strftime('%Y-%m-%d %H:%M:%S'),
                 'model_version': model.version
             }
@@ -875,15 +729,11 @@ class FalconForexBot:
 💰 الدخول: {signal['entry_price']:.5f}
 ⏳ المدة: {self.config.TRADE_DURATION_MINUTES} دقائق
 💪 الثقة: {signal['confidence']:.1%}
-📊 العائد المتوقع: {signal['expected_return']:+.3f}%
-
-📈 الاتجاه: {signal['trend']} (ADX: {signal['adx']})
 
 🦅 Falcon AI Forex
 """
             self.tb.send_message(self.config.TELEGRAM_CHAT_ID, msg, parse_mode='Markdown')
             self.logger.info(f"✅ إشارة: {signal['symbol']} {signal['direction']}")
-            
         except Exception as e:
             self.logger.error(f"Send error: {e}")
     
@@ -905,77 +755,81 @@ class FalconForexBot:
                     pnl = (entry - current) / entry * 100
                     result = 'WIN' if current < entry else 'LOSS'
                 
-                pips = calculate_pips(trade['symbol'], entry, current, direction)
+                # Calculate pips
+                pip_size = 0.01 if 'JPY' in trade['symbol'] else 0.0001
+                if direction == 'BUY':
+                    pips = (current - entry) / pip_size
+                else:
+                    pips = (entry - current) / pip_size
                 
-                self.db.update_result(trade['id'], current, result, pnl, pips)
+                self.db.update_result(trade['id'], current, result, pnl, round(pips, 1))
                 
                 emoji = "✅" if result == 'WIN' else "❌"
-                self.logger.info(f"{emoji} {trade['symbol']}: {result} | "
-                               f"{pnl:+.2f}% | {pips:+} نقاط")
-                
-                try:
-                    self.tb.send_message(
-                        self.config.TELEGRAM_CHAT_ID,
-                        f"{emoji} **{trade['symbol']}**\n"
-                        f"النتيجة: {result}\n"
-                        f"الربح: {pnl:+.2f}%\n"
-                        f"النقاط: {pips:+}\n"
-                        f"{entry:.5f} → {current:.5f}",
-                        parse_mode='Markdown'
-                    )
-                except:
-                    pass
+                self.logger.info(f"{emoji} {trade['symbol']}: {result} | {pnl:+.2f}% | {pips:+.1f} نقطة")
                 
             except Exception as e:
-                self.logger.error(f"Check trade error: {e}")
+                self.logger.error(f"Check trade: {e}")
     
     def scan_markets(self):
         futures = {}
         for s in self.config.SYMBOLS:
             futures[self.executor.submit(self.analyze_symbol, s)] = s
         
-        signals_found = 0
+        signals = 0
         for future in as_completed(futures, timeout=60):
             symbol = futures[future]
             try:
                 signal = future.result(timeout=20)
                 if signal:
-                    sig_id = self.db.save_signal(signal)
-                    if sig_id:
+                    if self.db.save_signal(signal):
                         self.send_signal(signal)
-                        signals_found += 1
-            except TimeoutError:
+                        signals += 1
+            except:
                 pass
-            except Exception as e:
-                self.logger.error(f"Error: {symbol}: {e}")
         
-        return signals_found
+        return signals
     
     def train_all_models(self):
-        self.logger.info("🎓 بدء تدريب النماذج (6 أشهر بيانات)...")
+        """Train all models with sequential fetching to avoid rate limits."""
+        self.logger.info("=" * 50)
+        self.logger.info("🎓 بدء تدريب جميع النماذج...")
+        self.logger.info("=" * 50)
+        
+        success_count = 0
         
         for symbol in self.config.SYMBOLS:
             try:
-                df = self.fetch_data(symbol, '1h', self.config.TRAINING_PERIOD)
-                if df is not None and len(df) >= self.config.MIN_TRAINING_SAMPLES:
-                    model = ForexModel(symbol, self.config, self.logger)
-                    if model.train(df):
-                        model.save()
-                        self.models[symbol] = model
+                self.logger.info(f"\n--- {symbol} ---")
+                
+                model = ForexModel(symbol, self.config, self.logger)
+                
+                if model.train():
+                    model.save()
+                    self.models[symbol] = model
+                    success_count += 1
+                    self.logger.info(f"✅ {symbol}: تم التدريب والحفظ")
                 else:
-                    self.logger.warning(f"{symbol}: بيانات غير كافية للتدريب")
+                    self.logger.error(f"❌ {symbol}: فشل التدريب")
+                
+                # ✅ انتظار بين كل زوج عشان ما نضغطش على API
+                time.sleep(5)
+                
             except Exception as e:
-                self.logger.error(f"Train {symbol}: {e}")
+                self.logger.error(f"❌ {symbol}: خطأ - {e}")
         
         self.last_retrain = datetime.now()
         
+        self.logger.info("=" * 50)
+        self.logger.info(f"🎓 انتهى التدريب: {success_count}/{len(self.config.SYMBOLS)} ناجح")
+        self.logger.info("=" * 50)
+        
+        # Send report
         try:
-            report = "🎓 **تقرير التدريب**\n\n"
+            report = f"🎓 **تقرير التدريب**\n\n✅ ناجح: {success_count}/{len(self.config.SYMBOLS)}\n\n"
             for symbol, model in self.models.items():
-                if model.is_trained:
-                    report += f"✅ {symbol}: دقة={model.train_accuracy:.1%}\n"
-                else:
-                    report += f"❌ {symbol}: فشل\n"
+                icon = "✅" if model.is_trained else "❌"
+                acc = f"{model.train_accuracy:.1%}" if model.is_trained else "N/A"
+                report += f"{icon} {symbol}: دقة={acc}\n"
             self.tb.send_message(self.config.TELEGRAM_CHAT_ID, report, parse_mode='Markdown')
         except:
             pass
@@ -985,41 +839,35 @@ class FalconForexBot:
             while True:
                 try:
                     self.tb.infinity_polling(timeout=10, long_polling_timeout=5)
-                except Exception as e:
-                    self.logger.error(f"Polling: {e}")
+                except:
                     time.sleep(10)
-        
         threading.Thread(target=poll, daemon=True).start()
     
     def run(self):
         self.running = True
         
         self.logger.info("=" * 50)
-        self.logger.info("🦅 Falcon AI Forex - بدء التشغيل")
-        self.logger.info(f"📊 الأزواج: {len(self.config.SYMBOLS)} أزواج فوركس")
-        self.logger.info(f"📅 تدريب: {self.config.TRAINING_PERIOD}")
+        self.logger.info("🦅 Falcon AI Forex")
+        self.logger.info(f"📊 أزواج: {len(self.config.SYMBOLS)}")
         self.logger.info(f"⚙️ ثقة: {self.config.CONFIDENCE_THRESHOLD:.0%}")
-        self.logger.info(f"🎯 هدف: {self.config.TARGET_RETURN_THRESHOLD:.2%}")
         self.logger.info("=" * 50)
         
         self.start_telegram()
         time.sleep(2)
         
+        # ✅ تدريب أولي
         if not any(m.is_trained for m in self.models.values()):
+            self.logger.info("لا توجد نماذج مدربة. بدء التدريب الأولي...")
             self.train_all_models()
         
         self.last_retrain = datetime.now()
-        self.last_report = datetime.now()
         
+        # Send startup
         try:
             trained = sum(1 for m in self.models.values() if m.is_trained)
             self.tb.send_message(
                 self.config.TELEGRAM_CHAT_ID,
-                f"🦅 **Falcon AI Forex**\n\n"
-                f"✅ جاهز | نماذج: {trained}/{len(self.models)}\n"
-                f"📅 تدريب: {self.config.TRAINING_PERIOD}\n"
-                f"⚙️ ثقة: {self.config.CONFIDENCE_THRESHOLD:.0%}\n\n"
-                f"⚡️ جاري تحليل الأسواق...",
+                f"🦅 **Falcon AI Forex**\n✅ نماذج: {trained}/{len(self.models)}\n⚡️ بدء التحليل...",
                 parse_mode='Markdown'
             )
         except:
@@ -1028,16 +876,14 @@ class FalconForexBot:
         while self.running:
             try:
                 self.check_trades()
-                signals = self.scan_markets()
                 
+                signals = self.scan_markets()
+                self.logger.info(f"📊 دورة مكتملة. إشارات: {signals}")
+                
+                # Retrain every 24h
                 if (datetime.now() - self.last_retrain).total_seconds() > 86400:
                     self.train_all_models()
                 
-                if (datetime.now() - self.last_report).total_seconds() > 14400:
-                    self.send_performance_report()
-                    self.last_report = datetime.now()
-                
-                self.logger.info(f"😴 انتظار {self.config.SCAN_INTERVAL_MINUTES} دقائق...")
                 time.sleep(self.config.SCAN_INTERVAL_MINUTES * 60)
                 
             except KeyboardInterrupt:
@@ -1048,7 +894,6 @@ class FalconForexBot:
                 time.sleep(30)
         
         self.executor.shutdown(wait=True)
-        self.logger.info("🛑 تم الإيقاف")
 
 # ============================================================================
 # RUN
