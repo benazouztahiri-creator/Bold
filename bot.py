@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-Falcon AI Pro v6.0 - Smart Trade Duration
-===========================================
-AI calculates optimal trade duration based on market conditions.
+Falcon AI Pro v6.1 - Scientific Trade Timing
+==============================================
+Duration based on: Momentum, Cycles, Reversal Points, Volume
 """
 
 import os
@@ -26,6 +26,8 @@ import numpy as np
 import pandas as pd
 import yfinance as yf
 import requests
+from scipy import stats
+from scipy.signal import find_peaks
 
 import matplotlib
 matplotlib.use('Agg')
@@ -59,9 +61,9 @@ class Config:
     
     SCAN_INTERVAL_SECONDS: int = 30
     
-    # ✅ مدة الصفقة الذكية (بيحددها البوت تلقائياً)
-    MIN_TRADE_DURATION: int = 3   # أقل مدة
-    MAX_TRADE_DURATION: int = 15  # أقصى مدة
+    # ✅ المدة بقت ذكية بالكامل
+    MIN_TRADE_DURATION: int = 2
+    MAX_TRADE_DURATION: int = 20
     
     SYMBOLS: List[str] = field(default_factory=lambda: [
         'EURUSD=X', 'GBPUSD=X', 'USDJPY=X', 'AUDUSD=X',
@@ -127,14 +129,12 @@ class TelegramManager:
     
     def start_polling(self):
         bot = self.get_bot()
-        
         def poll_worker():
             while True:
                 try:
                     bot.infinity_polling(timeout=10, long_polling_timeout=5)
                 except:
                     time.sleep(5)
-        
         threading.Thread(target=poll_worker, daemon=True).start()
 
 # ============================================================================
@@ -154,7 +154,7 @@ class Database:
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     symbol TEXT, direction TEXT, entry_price REAL,
                     confidence REAL, trade_duration INTEGER,
-                    market_speed TEXT, entry_time DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    duration_reason TEXT, entry_time DATETIME DEFAULT CURRENT_TIMESTAMP,
                     expiry_time DATETIME, result TEXT DEFAULT 'PENDING',
                     pnl_percent REAL, signal_hash TEXT UNIQUE
                 )
@@ -169,11 +169,11 @@ class Database:
                 conn.execute('''
                     INSERT OR IGNORE INTO signals 
                     (symbol, direction, entry_price, confidence, trade_duration,
-                     market_speed, expiry_time, signal_hash)
+                     duration_reason, expiry_time, signal_hash)
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 ''', (data['symbol'], data['direction'], data['entry_price'],
                       data['confidence'], data['trade_duration'],
-                      data.get('market_speed', ''), data['expiry_time'], signal_hash))
+                      data.get('duration_reason', ''), data['expiry_time'], signal_hash))
                 conn.commit()
                 return conn.execute('SELECT last_insert_rowid()').fetchone()[0]
         except:
@@ -224,97 +224,229 @@ class Database:
             }
 
 # ============================================================================
-# MARKET ANALYZER - أهم جزء!
+# SCIENTIFIC DURATION CALCULATOR
 # ============================================================================
 
-class MarketAnalyzer:
+class ScientificDuration:
     """
-    ✅ يحلل السوق ويحدد:
-    1. سرعة الحركة (سريع/متوسط/هادئ)
-    2. مدة الصفقة المثالية
+    ✅ حساب المدة المثالية للصفقة بناءً على:
+    1. زخم السعر (Momentum) - متى بينتهي الزخم؟
+    2. دورات السوق (Cycles) - فين الدورة الحالية؟
+    3. نقاط الانعكاس (Reversal Points) - أقرب دعم/مقاومة
+    4. حجم التداول (Volume) - تأكيد الحركة
     """
     
     @staticmethod
-    def analyze(df_5m: pd.DataFrame, df_15m: pd.DataFrame) -> Dict:
+    def calculate(df_5m: pd.DataFrame, df_15m: pd.DataFrame, direction: str) -> Tuple[int, str]:
         """
-        تحليل شامل للسوق وتحديد مدة الصفقة
+        ✅ حساب المدة المثالية علمياً
+        
+        Returns:
+            (المدة بالدقائق, سبب المدة)
         """
-        # ========== 1. حساب سرعة الحركة (ATR) ==========
-        atr_5m = MarketAnalyzer._calculate_atr(df_5m, 14)
-        atr_15m = MarketAnalyzer._calculate_atr(df_15m, 14)
+        reasons = []
+        durations = []
         
-        current_atr = atr_5m.iloc[-1]
-        avg_atr = atr_15m.rolling(50).mean().iloc[-1] if len(atr_15m) >= 50 else current_atr
+        # ========== 1. تحليل الزخم ==========
+        momentum_duration, momentum_reason = ScientificDuration._momentum_analysis(df_5m, direction)
+        durations.append(momentum_duration)
+        reasons.append(momentum_reason)
         
-        atr_ratio = current_atr / avg_atr if avg_atr > 0 else 1.0
+        # ========== 2. تحليل الدورات ==========
+        cycle_duration, cycle_reason = ScientificDuration._cycle_analysis(df_15m)
+        durations.append(cycle_duration)
+        reasons.append(cycle_reason)
         
-        # ========== 2. حساب قوة الترند (ADX) ==========
-        adx_15m = MarketAnalyzer._calculate_adx(df_15m, 14)
-        current_adx = adx_15m.iloc[-1] if not adx_15m.empty else 20
+        # ========== 3. تحليل نقاط الانعكاس ==========
+        reversal_duration, reversal_reason = ScientificDuration._reversal_analysis(df_15m, direction)
+        durations.append(reversal_duration)
+        reasons.append(reversal_reason)
         
-        # ========== 3. حساب التقلبات ==========
-        volatility = df_5m['Close'].pct_change().rolling(20).std().iloc[-1]
-        avg_volatility = df_15m['Close'].pct_change().rolling(50).std().iloc[-1] if len(df_15m) >= 50 else volatility
-        vol_ratio = volatility / avg_volatility if avg_volatility > 0 else 1.0
+        # ========== 4. تحليل حجم التداول ==========
+        volume_duration, volume_reason = ScientificDuration._volume_analysis(df_5m)
+        durations.append(volume_duration)
+        reasons.append(volume_reason)
         
-        # ========== 4. تحديد سرعة السوق ==========
-        if atr_ratio > 1.5 and current_adx > 25:
-            market_speed = "سريع"
-            base_duration = 5  # 5 دقائق للسوق السريع
-        elif atr_ratio > 1.2 or current_adx > 20:
-            market_speed = "متوسط"
-            base_duration = 8  # 8 دقائق للسوق المتوسط
+        # ========== 5. المتوسط المرجح ==========
+        # الزخم له وزن أكبر لأنه الأهم
+        weights = [0.35, 0.25, 0.25, 0.15]
+        final_duration = sum(d * w for d, w in zip(durations, weights))
+        
+        # تقريب لأقرب دقيقة
+        final_duration = max(2, min(20, round(final_duration)))
+        
+        # سبب واحد مختصر
+        main_reason = reasons[0]  # الزخم هو السبب الرئيسي
+        
+        return final_duration, main_reason
+    
+    @staticmethod
+    def _momentum_analysis(df: pd.DataFrame, direction: str) -> Tuple[int, str]:
+        """
+        ✅ تحليل الزخم: متى بينتهي الزخم الحالي؟
+        """
+        closes = df['Close'].values
+        
+        if len(closes) < 20:
+            return 8, "زخم غير واضح"
+        
+        # حساب معدل التغير (ROC) لفترات مختلفة
+        roc_3 = (closes[-1] - closes[-4]) / closes[-4] * 100
+        roc_5 = (closes[-1] - closes[-6]) / closes[-6] * 100
+        roc_10 = (closes[-1] - closes[-11]) / closes[-11] * 100
+        
+        # حساب تسارع الزخم (هل الزخم بيزيد ولا بيقل؟)
+        momentum_acceleration = roc_3 - roc_10
+        
+        # حساب RSI للزخم
+        delta = np.diff(closes)
+        gain = np.where(delta > 0, delta, 0)
+        loss = np.where(delta < 0, -delta, 0)
+        
+        avg_gain = np.mean(gain[-14:]) if len(gain) >= 14 else np.mean(gain)
+        avg_loss = np.mean(loss[-14:]) if len(loss) >= 14 else np.mean(loss)
+        
+        rs = avg_gain / (avg_loss + 1e-8)
+        rsi = 100 - (100 / (1 + rs))
+        
+        # تحديد المدة حسب الزخم
+        if abs(roc_3) > 0.15 and abs(momentum_acceleration) > 0.05:
+            # زخم قوي ومتسارع
+            if direction == 'BUY' and roc_3 > 0:
+                return 4, "زخم قوي متسارع"
+            elif direction == 'SELL' and roc_3 < 0:
+                return 4, "زخم قوي متسارع"
+            else:
+                return 6, "زخم عكسي"
+        
+        elif abs(roc_5) > 0.1:
+            # زخم متوسط
+            if rsi > 70 or rsi < 30:
+                return 3, "زخم متوسط + تشبع"
+            else:
+                return 7, "زخم متوسط"
+        
         else:
-            market_speed = "هادئ"
-            base_duration = 12  # 12 دقيقة للسوق الهادئ
-        
-        # ========== 5. تعديل المدة حسب التقلبات ==========
-        if vol_ratio > 1.5:
-            base_duration = max(3, base_duration - 2)  # تقليل المدة لو فيه تقلبات عالية
-        elif vol_ratio < 0.7:
-            base_duration = min(15, base_duration + 2)  # زيادة المدة لو السوق هادئ
-        
-        # ========== 6. تعديل حسب الزوج ==========
-        # الأزواج السريعة زي GBPUSD و EURJPY نقلل المدة
-        # الأزواج البطيئة زي USDJPY و EURGBP نزود المدة
-        
-        return {
-            'market_speed': market_speed,
-            'trade_duration': base_duration,
-            'atr_ratio': round(atr_ratio, 2),
-            'adx': round(current_adx, 1),
-            'vol_ratio': round(vol_ratio, 2)
-        }
+            # زخم ضعيف
+            return 10, "زخم ضعيف"
     
     @staticmethod
-    def _calculate_atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
-        h, l, c = df['High'], df['Low'], df['Close']
-        tr1 = h - l
-        tr2 = abs(h - c.shift())
-        tr3 = abs(l - c.shift())
-        tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
-        return tr.ewm(span=period, adjust=False).mean()
+    def _cycle_analysis(df: pd.DataFrame) -> Tuple[int, str]:
+        """
+        ✅ تحليل دورات السوق: فين احنا في الدورة؟
+        """
+        closes = df['Close'].values
+        
+        if len(closes) < 50:
+            return 8, "دورة غير واضحة"
+        
+        # استخدام autocorrelation لاكتشاف الدورة
+        try:
+            # تبسيط: حساب المسافة بين القمم المحلية
+            peaks, _ = find_peaks(closes[-50:], distance=5)
+            
+            if len(peaks) >= 2:
+                # متوسط المسافة بين القمم
+                avg_cycle = np.mean(np.diff(peaks))
+                
+                # تحديد موقعنا في الدورة
+                last_peak_idx = peaks[-1] if len(peaks) > 0 else 0
+                position_in_cycle = len(closes[-50:]) - last_peak_idx
+                
+                if position_in_cycle < avg_cycle * 0.3:
+                    return 5, "بداية دورة"
+                elif position_in_cycle < avg_cycle * 0.7:
+                    return 8, "وسط دورة"
+                else:
+                    return 4, "نهاية دورة"
+            
+        except:
+            pass
+        
+        return 7, "دورة طبيعية"
     
     @staticmethod
-    def _calculate_adx(df: pd.DataFrame, period: int = 14) -> pd.Series:
-        h, l, c = df['High'], df['Low'], df['Close']
+    def _reversal_analysis(df: pd.DataFrame, direction: str) -> Tuple[int, str]:
+        """
+        ✅ تحليل نقاط الانعكاس: أقرب دعم/مقاومة
+        """
+        closes = df['Close'].values
+        highs = df['High'].values
+        lows = df['Low'].values
         
-        tr1 = h - l
-        tr2 = abs(h - c.shift())
-        tr3 = abs(l - c.shift())
-        tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
-        atr = tr.ewm(span=period, adjust=False).mean()
+        if len(closes) < 20:
+            return 8, "مستويات غير واضحة"
         
-        plus_dm = h.diff().clip(lower=0)
-        minus_dm = (-l.diff()).clip(lower=0)
+        current_price = closes[-1]
         
-        plus_di = 100 * (plus_dm.ewm(span=period, adjust=False).mean()) / (atr + 1e-8)
-        minus_di = 100 * (minus_dm.ewm(span=period, adjust=False).mean()) / (atr + 1e-8)
+        # حساب أقرب مقاومة (للشراء) أو دعم (للبيع)
+        if direction == 'BUY':
+            # البحث عن أقرب مقاومة
+            recent_highs = highs[-20:]
+            resistance_levels = []
+            
+            for i in range(len(recent_highs) - 1):
+                if recent_highs[i] > current_price:
+                    resistance_levels.append(recent_highs[i])
+            
+            if resistance_levels:
+                nearest_resistance = min(resistance_levels)
+                distance_pct = (nearest_resistance - current_price) / current_price * 100
+                
+                if distance_pct < 0.05:
+                    return 3, "مقاومة قريبة جداً"
+                elif distance_pct < 0.1:
+                    return 6, "مقاومة قريبة"
+                else:
+                    return 10, "مقاومة بعيدة"
+        else:
+            # البحث عن أقرب دعم
+            recent_lows = lows[-20:]
+            support_levels = []
+            
+            for i in range(len(recent_lows) - 1):
+                if recent_lows[i] < current_price:
+                    support_levels.append(recent_lows[i])
+            
+            if support_levels:
+                nearest_support = max(support_levels)
+                distance_pct = (current_price - nearest_support) / current_price * 100
+                
+                if distance_pct < 0.05:
+                    return 3, "دعم قريب جداً"
+                elif distance_pct < 0.1:
+                    return 6, "دعم قريب"
+                else:
+                    return 10, "دعم بعيد"
         
-        dx = 100 * abs(plus_di - minus_di) / (plus_di + minus_di + 1e-8)
-        adx = dx.ewm(span=period, adjust=False).mean()
+        return 8, "بدون مستويات قريبة"
+    
+    @staticmethod
+    def _volume_analysis(df: pd.DataFrame) -> Tuple[int, str]:
+        """
+        ✅ تحليل حجم التداول: تأكيد الحركة
+        """
+        if 'Volume' not in df.columns or df['Volume'].sum() == 0:
+            return 8, "حجم تداول غير متاح"
         
-        return adx
+        volumes = df['Volume'].values
+        
+        if len(volumes) < 20:
+            return 8, "حجم غير كافي"
+        
+        current_vol = volumes[-1]
+        avg_vol = np.mean(volumes[-20:])
+        
+        vol_ratio = current_vol / (avg_vol + 1e-8)
+        
+        if vol_ratio > 2.0:
+            return 5, "حجم تداول عالي جداً"
+        elif vol_ratio > 1.5:
+            return 7, "حجم تداول عالي"
+        elif vol_ratio > 1.0:
+            return 9, "حجم تداول طبيعي"
+        else:
+            return 12, "حجم تداول منخفض"
 
 # ============================================================================
 # MARKET FILTER
@@ -593,12 +725,12 @@ class FalconProBot:
             trained = sum(1 for m in self.models.values() if m.is_trained)
             stats = self.db.get_stats()
             can_trade, reason = MarketFilter.can_trade()
-            text = (f"🦅 **Falcon Pro v6**\n"
+            text = (f"🦅 **Falcon Pro v6.1**\n"
                    f"✅ نماذج: {trained}/{len(self.models)}\n"
                    f"📊 صفقات: {stats['total']}\n"
                    f"📈 نجاح: {stats['win_rate']:.1%}\n"
                    f"💰 ربح: {stats['total_pnl']:.2f}%\n"
-                   f"🧠 مدة ذكية: {self.config.MIN_TRADE_DURATION}-{self.config.MAX_TRADE_DURATION} د\n"
+                   f"🧠 مدة علمية\n"
                    f"🚦 {'✅' if can_trade else '⛔ '+reason}")
             self.tb.reply_to(msg, text, parse_mode='Markdown')
     
@@ -624,12 +756,6 @@ class FalconProBot:
             if not model or not model.is_trained:
                 return None
             
-            last_scan = self.last_scan_time.get(symbol)
-            if last_scan and (datetime.now() - last_scan).total_seconds() < 25:
-                return None
-            
-            self.last_scan_time[symbol] = datetime.now()
-            
             if self.db.check_active_signal(symbol):
                 return None
             
@@ -653,15 +779,12 @@ class FalconProBot:
             if confidence < self.config.CONFIDENCE_THRESHOLD:
                 return None
             
-            # ✅ تحليل السوق وتحديد المدة الذكية
-            market_analysis = MarketAnalyzer.analyze(df_5m, df_15m)
-            trade_duration = market_analysis['trade_duration']
-            market_speed = market_analysis['market_speed']
+            # ✅ حساب المدة العلمية
+            trade_duration, duration_reason = ScientificDuration.calculate(df_5m, df_15m, dir_5m)
             
             entry_price = float(df_5m['Close'].iloc[-1])
             
-            self.logger.info(f"🎯 {symbol}: {dir_5m} | ثقة={confidence:.1%} | "
-                           f"مدة={trade_duration}د | سوق={market_speed}")
+            self.logger.info(f"🎯 {symbol}: {dir_5m} | {confidence:.1%} | {trade_duration}د | {duration_reason}")
             
             return {
                 'symbol': symbol,
@@ -669,7 +792,7 @@ class FalconProBot:
                 'entry_price': entry_price,
                 'confidence': confidence,
                 'trade_duration': trade_duration,
-                'market_speed': market_speed,
+                'duration_reason': duration_reason,
                 'expiry_time': (datetime.now() + timedelta(minutes=trade_duration)).strftime('%Y-%m-%d %H:%M:%S')
             }
             
@@ -681,7 +804,6 @@ class FalconProBot:
             emoji = "🟢" if signal['direction'] == 'BUY' else "🔴"
             direction = "شراء ▲" if signal['direction'] == 'BUY' else "بيع ▼"
             
-            # ✅ المدة الذكية في الرسالة
             msg = (f"{emoji} **{signal['symbol']}** - {direction}\n\n"
                    f"💰 {signal['entry_price']:.5f}\n"
                    f"⏳ {signal['trade_duration']} د\n"
@@ -689,9 +811,9 @@ class FalconProBot:
                    f"🤖 Falcon Pro")
             
             self.tb.send_message(self.config.TELEGRAM_CHAT_ID, msg, parse_mode='Markdown')
-            self.logger.info(f"✅ إشارة: {signal['symbol']} {signal['direction']} | {signal['trade_duration']}د")
-        except Exception as e:
-            self.logger.error(f"Send error: {e}")
+            self.logger.info(f"✅ {signal['symbol']} {signal['direction']} | {signal['trade_duration']}د | {signal.get('duration_reason', '')}")
+        except:
+            pass
     
     def check_trades(self):
         for trade in self.db.get_expired_trades():
@@ -712,10 +834,6 @@ class FalconProBot:
                     result = 'WIN' if current < entry else 'LOSS'
                 
                 self.db.update_result(trade['id'], current, result, pnl)
-                
-                emoji = "✅" if result == 'WIN' else "❌"
-                self.logger.info(f"{emoji} {trade['symbol']}: {result} | {pnl:+.2f}% | مدة={trade.get('trade_duration', '?')}د")
-                
             except:
                 pass
     
@@ -758,10 +876,7 @@ class FalconProBot:
     def run(self):
         self.running = True
         
-        self.logger.info("=" * 50)
-        self.logger.info("🦅 Falcon AI Pro v6.0 - Smart Duration")
-        self.logger.info(f"🧠 مدة ذكية: {self.config.MIN_TRADE_DURATION}-{self.config.MAX_TRADE_DURATION} دقيقة")
-        self.logger.info("=" * 50)
+        self.logger.info("🦅 Falcon Pro v6.1 - Scientific Timing")
         
         self.tg.start_polling()
         time.sleep(1)
@@ -774,7 +889,7 @@ class FalconProBot:
         try:
             trained = sum(1 for m in self.models.values() if m.is_trained)
             self.tb.send_message(self.config.TELEGRAM_CHAT_ID,
-                f"🦅 **Falcon Pro v6**\n✅ {trained}/{len(self.config.SYMBOLS)}\n🧠 مدة ذكية\n⚡️ يعمل...",
+                f"🦅 **Falcon Pro v6.1**\n✅ {trained}/{len(self.config.SYMBOLS)}\n🧠 توقيت علمي\n⚡️ يعمل...",
                 parse_mode='Markdown')
         except:
             pass
@@ -787,23 +902,14 @@ class FalconProBot:
                 if (datetime.now() - self.last_retrain).total_seconds() > 86400:
                     self.train_all_models()
                 
-                if signals > 0:
-                    self.logger.info(f"✅ إشارات: {signals}")
-                
                 time.sleep(self.config.SCAN_INTERVAL_SECONDS)
                 
             except KeyboardInterrupt:
                 break
-            except Exception as e:
-                self.logger.error(f"خطأ: {e}")
+            except:
                 time.sleep(5)
         
         self.executor.shutdown(wait=True)
-        self.logger.info("🛑 توقف")
-
-# ============================================================================
-# MAIN
-# ============================================================================
 
 def main():
     config = Config()
@@ -815,10 +921,7 @@ def main():
             bot.run()
         except KeyboardInterrupt:
             break
-        except Exception as e:
-            print(f"❌ خطأ: {e}")
-            traceback.print_exc()
-            print("🔄 إعادة التشغيل...")
+        except:
             time.sleep(5)
 
 if __name__ == "__main__":
