@@ -1,66 +1,37 @@
-# =========================
-# Core
-# =========================
-numpy>=2.0.0
-pandas>=2.2.2
-scipy>=1.13.0
+numpy
+pandas
+scipy
 
-# =========================
-# Machine Learning
-# =========================
-scikit-learn>=1.5.0
-xgboost>=2.1.0
-lightgbm>=4.5.0
-catboost>=1.2.7
-joblib>=1.4.2
+scikit-learn
+xgboost
+lightgbm
+catboost
+joblib
+imbalanced-learn
+optuna
+shap
 
-# =========================
-# Financial Data
-# =========================
-yfinance>=0.2.65
+yfinance
+ta
 
-# =========================
-# Technical Indicators
-# =========================
-ta>=0.11.0
+matplotlib
+mplfinance
+plotly
 
-# =========================
-# Charts
-# =========================
-matplotlib>=3.9.0
-mplfinance>=0.12.10b0
+pyTelegramBotAPI
 
-# =========================
-# Telegram
-# =========================
-pyTelegramBotAPI>=4.23.0
+requests
+urllib3
 
-# =========================
-# Scheduling
-# =========================
-schedule>=1.2.2
+schedule
 
-# =========================
-# Environment Variables
-# =========================
-python-dotenv>=1.0.1
+python-dotenv
 
-# =========================
-# HTTP Requests
-# =========================
-requests>=2.32.3
+tqdm
 
-# =========================
-# Progress Bars
-# =========================
-tqdm>=4.67.1
+python-dateutil
 
-# =========================
-# Date & Time
-# =========================
-python-dateutil>=2.9.0
+numba
+psutil
 
-# =========================
-# Optional Performance
-# =========================
-numba>=0.60.0
+statsmodels
