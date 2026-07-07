@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
 """
-Falcon AI Ultimate v2.1 - Full Features + Server Optimized
-===========================================================
-All features included, optimized for cloud deployment.
+Falcon AI Ultimate v2.2 - Production Ready (No LightGBM)
+=========================================================
+Full-featured trading bot with 3 ensemble models.
+Optimized for cloud deployment (Railway, Koyeb, Render).
+
+Ensemble: XGBoost + CatBoost + GradientBoosting
 """
 
 import os
@@ -26,13 +29,12 @@ import yfinance as yf
 from scipy import stats
 from scipy.signal import argrelextrema
 
-# Matplotlib - memory optimized
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 plt.rcParams['figure.max_open_warning'] = 0
-plt.rcParams['figure.dpi'] = 72  # Lower DPI for server
+plt.rcParams['figure.dpi'] = 72
 
 from sklearn.model_selection import train_test_split, TimeSeriesSplit
 from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
@@ -43,7 +45,6 @@ from sklearn.metrics import (
 )
 from sklearn.calibration import CalibratedClassifierCV, calibration_curve
 import xgboost as xgb
-import lightgbm as lgb
 from catboost import CatBoostClassifier
 
 import telebot
@@ -51,7 +52,9 @@ from telebot import types
 import joblib
 import shutil
 
-# Reduce warnings and optimize memory
+# ============================================================================
+# SUPPRESS WARNINGS & OPTIMIZE
+# ============================================================================
 warnings.filterwarnings('ignore')
 os.environ['OMP_NUM_THREADS'] = '2'
 os.environ['MKL_NUM_THREADS'] = '2'
@@ -65,13 +68,13 @@ os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
 class Config:
     """Central configuration with environment variable support."""
     
-    # Telegram - Use env vars for security
+    # Telegram
     TELEGRAM_TOKEN: str = os.environ.get(
-        'TELEGRAM_TOKEN', 
+        'TELEGRAM_TOKEN',
         '8773849578:AAH9a6-8hU5YFYTad2EA5jQyfffIoeL8npk'
     )
     TELEGRAM_CHAT_ID: str = os.environ.get(
-        'TELEGRAM_CHAT_ID', 
+        'TELEGRAM_CHAT_ID',
         '7553333305'
     )
     
@@ -80,23 +83,18 @@ class Config:
     TIMEFRAMES: List[str] = field(default_factory=lambda: ['5m', '15m'])
     SCAN_INTERVAL_MINUTES: int = int(os.environ.get('SCAN_INTERVAL', '5'))
     
-    # Symbols - Reduced for faster scanning
+    # Symbols
     SYMBOLS: List[str] = field(default_factory=lambda: [
         'EURUSD=X', 'GBPUSD=X', 'USDJPY=X', 'AUDUSD=X', 'USDCAD=X',
         'BTC-USD', 'ETH-USD', 'SOL-USD', 'GC=F', 'XAUUSD=X'
     ])
     
-    # ML Settings - Adjusted for server
+    # ML Settings
     CONFIDENCE_THRESHOLD: float = 0.65
     RETRAINING_INTERVAL_HOURS: int = 24
     MIN_TRAINING_SAMPLES: int = 500
     TRAINING_PERIOD: str = '3mo'
-    
-    # Feature Selection
     MAX_FEATURES: int = 40
-    FEATURE_SELECTION_METHOD: str = 'mutual_info'
-    
-    # Model Parameters - Optimized for speed
     CV_FOLDS: int = 3
     VALIDATION_SIZE: float = 0.2
     TEST_SIZE: float = 0.15
@@ -106,7 +104,7 @@ class Config:
     MODELS_DIR: str = 'models'
     BACKUP_DIR: str = 'backups'
     
-    # Charts - Lower quality for server
+    # Charts
     CHART_CANDLES: int = 40
     CHART_DPI: int = 72
     CHART_FIGSIZE: Tuple[int, int] = (12, 8)
@@ -114,9 +112,7 @@ class Config:
     # Performance
     MAX_RETRIES: int = 3
     RETRY_DELAY: int = 5
-    MAX_WORKERS: int = 4  # Reduced for server
-    
-    # Signal Cooldown
+    MAX_WORKERS: int = 4
     SIGNAL_COOLDOWN_MINUTES: int = 15
     
     # Paths
@@ -154,7 +150,7 @@ class MemoryManager:
 # ============================================================================
 
 def setup_logging(config: Config) -> logging.Logger:
-    """Simple but effective logging."""
+    """Professional logging setup."""
     logging.basicConfig(
         level=logging.INFO,
         format='%(asctime)s | %(levelname)-7s | %(message)s',
@@ -171,74 +167,81 @@ def setup_logging(config: Config) -> logging.Logger:
 # ============================================================================
 
 class Database:
-    """Optimized database with all needed features."""
+    """SQLite database with all needed tables."""
     
-    def __init__(self, db_path: str):
+    def __init__(self, db_path: str, logger: logging.Logger):
         self.db_path = db_path
+        self.logger = logger
         self._init()
     
     def _init(self):
-        with sqlite3.connect(self.db_path) as conn:
-            conn.executescript('''
-                CREATE TABLE IF NOT EXISTS signals (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    symbol TEXT NOT NULL,
-                    direction TEXT NOT NULL,
-                    entry_price REAL NOT NULL,
-                    exit_price REAL,
-                    confidence REAL NOT NULL,
-                    m5_analysis TEXT,
-                    m15_analysis TEXT,
-                    trend_filter TEXT,
-                    patterns_detected TEXT,
-                    models_agreement TEXT,
-                    entry_time DATETIME DEFAULT CURRENT_TIMESTAMP,
-                    expiry_time DATETIME,
-                    exit_time DATETIME,
-                    result TEXT DEFAULT 'PENDING',
-                    pnl_percent REAL,
-                    model_version TEXT,
-                    signal_hash TEXT UNIQUE
-                );
-                
-                CREATE TABLE IF NOT EXISTS model_registry (
-                    symbol TEXT PRIMARY KEY,
-                    model_version TEXT,
-                    features_count INTEGER,
-                    training_samples INTEGER,
-                    accuracy REAL,
-                    precision_score REAL,
-                    recall_score REAL,
-                    f1_score REAL,
-                    brier_score REAL,
-                    calibration_error REAL,
-                    selected_features TEXT,
-                    feature_importance TEXT,
-                    model_weights TEXT,
-                    trained_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-                    training_duration_seconds REAL,
-                    is_active INTEGER DEFAULT 1
-                );
-                
-                CREATE TABLE IF NOT EXISTS performance (
-                    period TEXT PRIMARY KEY,
-                    total_signals INTEGER DEFAULT 0,
-                    wins INTEGER DEFAULT 0,
-                    losses INTEGER DEFAULT 0,
-                    win_rate REAL DEFAULT 0.0,
-                    avg_confidence REAL DEFAULT 0.0,
-                    avg_pnl REAL DEFAULT 0.0,
-                    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
-                );
-                
-                CREATE INDEX IF NOT EXISTS idx_signals_symbol ON signals(symbol);
-                CREATE INDEX IF NOT EXISTS idx_signals_result ON signals(result);
-                CREATE INDEX IF NOT EXISTS idx_signals_time ON signals(entry_time);
-            ''')
-            conn.commit()
+        """Initialize database tables."""
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                conn.executescript('''
+                    CREATE TABLE IF NOT EXISTS signals (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        symbol TEXT NOT NULL,
+                        direction TEXT NOT NULL,
+                        entry_price REAL NOT NULL,
+                        exit_price REAL,
+                        confidence REAL NOT NULL,
+                        m5_analysis TEXT,
+                        m15_analysis TEXT,
+                        trend_filter TEXT,
+                        patterns_detected TEXT,
+                        models_agreement TEXT,
+                        entry_time DATETIME DEFAULT CURRENT_TIMESTAMP,
+                        expiry_time DATETIME,
+                        exit_time DATETIME,
+                        result TEXT DEFAULT 'PENDING',
+                        pnl_percent REAL,
+                        model_version TEXT,
+                        signal_hash TEXT UNIQUE
+                    );
+                    
+                    CREATE TABLE IF NOT EXISTS model_registry (
+                        symbol TEXT PRIMARY KEY,
+                        model_version TEXT,
+                        features_count INTEGER,
+                        training_samples INTEGER,
+                        accuracy REAL,
+                        precision_score REAL,
+                        recall_score REAL,
+                        f1_score REAL,
+                        brier_score REAL,
+                        calibration_error REAL,
+                        selected_features TEXT,
+                        feature_importance TEXT,
+                        model_weights TEXT,
+                        trained_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                        training_duration_seconds REAL,
+                        is_active INTEGER DEFAULT 1
+                    );
+                    
+                    CREATE TABLE IF NOT EXISTS performance (
+                        period TEXT PRIMARY KEY,
+                        total_signals INTEGER DEFAULT 0,
+                        wins INTEGER DEFAULT 0,
+                        losses INTEGER DEFAULT 0,
+                        win_rate REAL DEFAULT 0.0,
+                        avg_confidence REAL DEFAULT 0.0,
+                        avg_pnl REAL DEFAULT 0.0,
+                        updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+                    );
+                    
+                    CREATE INDEX IF NOT EXISTS idx_signals_symbol ON signals(symbol);
+                    CREATE INDEX IF NOT EXISTS idx_signals_result ON signals(result);
+                    CREATE INDEX IF NOT EXISTS idx_signals_time ON signals(entry_time);
+                ''')
+                conn.commit()
+            self.logger.info("Database initialized successfully")
+        except Exception as e:
+            self.logger.error(f"Database init failed: {e}")
+            raise
     
     def save_signal(self, data: Dict) -> Optional[int]:
-        """Save signal with duplicate check."""
+        """Save signal with duplicate prevention."""
         try:
             hash_str = f"{data['symbol']}_{data['direction']}_{datetime.now().timestamp()}"
             signal_hash = hashlib.md5(hash_str.encode()).hexdigest()
@@ -259,123 +262,147 @@ class Database:
                 ))
                 conn.commit()
                 return conn.execute('SELECT last_insert_rowid()').fetchone()[0]
-        except:
+        except Exception as e:
+            self.logger.error(f"Save signal error: {e}")
             return None
     
     def check_active_signal(self, symbol: str) -> bool:
-        """Check if symbol has active trade."""
-        with sqlite3.connect(self.db_path) as conn:
-            count = conn.execute('''
-                SELECT COUNT(*) FROM signals 
-                WHERE symbol = ? AND result = 'PENDING' 
-                AND expiry_time > datetime('now', 'localtime')
-            ''', (symbol,)).fetchone()[0]
-            return count > 0
+        """Check if symbol has an active trade."""
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                count = conn.execute('''
+                    SELECT COUNT(*) FROM signals 
+                    WHERE symbol = ? AND result = 'PENDING' 
+                    AND expiry_time > datetime('now', 'localtime')
+                ''', (symbol,)).fetchone()[0]
+                return count > 0
+        except Exception as e:
+            self.logger.error(f"Check active error: {e}")
+            return True
     
     def check_recent_signal(self, symbol: str, minutes: int) -> bool:
         """Check cooldown period."""
-        cutoff = (datetime.now() - timedelta(minutes=minutes)).strftime('%Y-%m-%d %H:%M:%S')
-        with sqlite3.connect(self.db_path) as conn:
-            count = conn.execute('''
-                SELECT COUNT(*) FROM signals 
-                WHERE symbol = ? AND entry_time > ?
-            ''', (symbol, cutoff)).fetchone()[0]
-            return count > 0
+        try:
+            cutoff = (datetime.now() - timedelta(minutes=minutes)).strftime('%Y-%m-%d %H:%M:%S')
+            with sqlite3.connect(self.db_path) as conn:
+                count = conn.execute('''
+                    SELECT COUNT(*) FROM signals 
+                    WHERE symbol = ? AND entry_time > ?
+                ''', (symbol, cutoff)).fetchone()[0]
+                return count > 0
+        except Exception as e:
+            self.logger.error(f"Check recent error: {e}")
+            return True
     
     def update_result(self, signal_id: int, exit_price: float, result: str, pnl: float):
-        """Update trade result."""
-        with sqlite3.connect(self.db_path) as conn:
-            conn.execute('''
-                UPDATE signals SET 
-                exit_price = ?, result = ?, pnl_percent = ?, 
-                exit_time = datetime('now', 'localtime')
-                WHERE id = ?
-            ''', (exit_price, result, pnl, signal_id))
-            
-            # Update performance
-            today = datetime.now().strftime('%Y-%m-%d')
-            conn.execute('''
-                INSERT INTO performance (period, total_signals, wins, losses)
-                VALUES (?, 1, ?, ?)
-                ON CONFLICT(period) DO UPDATE SET
-                total_signals = total_signals + 1,
-                wins = wins + ?,
-                losses = losses + ?,
-                updated_at = datetime('now', 'localtime')
-            ''', (today, 
-                  1 if result == 'WIN' else 0,
-                  1 if result == 'LOSS' else 0,
-                  1 if result == 'WIN' else 0,
-                  1 if result == 'LOSS' else 0))
-            conn.commit()
+        """Update trade result and performance."""
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                conn.execute('''
+                    UPDATE signals SET 
+                    exit_price = ?, result = ?, pnl_percent = ?, 
+                    exit_time = datetime('now', 'localtime')
+                    WHERE id = ?
+                ''', (exit_price, result, pnl, signal_id))
+                
+                today = datetime.now().strftime('%Y-%m-%d')
+                conn.execute('''
+                    INSERT INTO performance (period, total_signals, wins, losses)
+                    VALUES (?, 1, ?, ?)
+                    ON CONFLICT(period) DO UPDATE SET
+                    total_signals = total_signals + 1,
+                    wins = wins + ?,
+                    losses = losses + ?,
+                    updated_at = datetime('now', 'localtime')
+                ''', (today,
+                      1 if result == 'WIN' else 0,
+                      1 if result == 'LOSS' else 0,
+                      1 if result == 'WIN' else 0,
+                      1 if result == 'LOSS' else 0))
+                conn.commit()
+            self.logger.info(f"Trade {signal_id}: {result} ({pnl:.2f}%)")
+        except Exception as e:
+            self.logger.error(f"Update result error: {e}")
     
     def get_pending_trades(self) -> List[Dict]:
         """Get expired pending trades."""
-        with sqlite3.connect(self.db_path) as conn:
-            conn.row_factory = sqlite3.Row
-            rows = conn.execute('''
-                SELECT * FROM signals 
-                WHERE result = 'PENDING' 
-                AND expiry_time <= datetime('now', 'localtime')
-            ''').fetchall()
-            return [dict(r) for r in rows]
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                conn.row_factory = sqlite3.Row
+                rows = conn.execute('''
+                    SELECT * FROM signals 
+                    WHERE result = 'PENDING' 
+                    AND expiry_time <= datetime('now', 'localtime')
+                ''').fetchall()
+                return [dict(r) for r in rows]
+        except Exception as e:
+            self.logger.error(f"Get pending error: {e}")
+            return []
     
     def get_stats(self) -> Dict:
         """Get performance statistics."""
-        with sqlite3.connect(self.db_path) as conn:
-            total = conn.execute(
-                "SELECT COUNT(*) FROM signals WHERE result != 'PENDING'"
-            ).fetchone()[0]
-            wins = conn.execute(
-                "SELECT COUNT(*) FROM signals WHERE result = 'WIN'"
-            ).fetchone()[0]
-            
-            # Per symbol stats
-            symbols = conn.execute('''
-                SELECT symbol, COUNT(*) as cnt,
-                       SUM(CASE WHEN result='WIN' THEN 1 ELSE 0 END) as w
-                FROM signals WHERE result != 'PENDING'
-                GROUP BY symbol HAVING cnt >= 3
-                ORDER BY w*1.0/cnt DESC
-            ''').fetchall()
-            
-            return {
-                'total': total,
-                'wins': wins,
-                'losses': total - wins,
-                'win_rate': wins / total if total > 0 else 0,
-                'best_symbol': symbols[0][0] if symbols else 'N/A',
-                'worst_symbol': symbols[-1][0] if symbols else 'N/A'
-            }
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                total = conn.execute(
+                    "SELECT COUNT(*) FROM signals WHERE result != 'PENDING'"
+                ).fetchone()[0]
+                wins = conn.execute(
+                    "SELECT COUNT(*) FROM signals WHERE result = 'WIN'"
+                ).fetchone()[0]
+                losses = total - wins
+                
+                symbols = conn.execute('''
+                    SELECT symbol, COUNT(*) as cnt,
+                           SUM(CASE WHEN result='WIN' THEN 1 ELSE 0 END) as w
+                    FROM signals WHERE result != 'PENDING'
+                    GROUP BY symbol HAVING cnt >= 3
+                    ORDER BY w*1.0/cnt DESC
+                ''').fetchall()
+                
+                return {
+                    'total': total,
+                    'wins': wins,
+                    'losses': losses,
+                    'win_rate': wins / total if total > 0 else 0,
+                    'best_symbol': symbols[0][0] if symbols else 'N/A',
+                    'worst_symbol': symbols[-1][0] if symbols else 'N/A'
+                }
+        except Exception as e:
+            self.logger.error(f"Get stats error: {e}")
+            return {'total': 0, 'wins': 0, 'losses': 0, 'win_rate': 0, 'best_symbol': 'N/A', 'worst_symbol': 'N/A'}
     
     def save_model_metrics(self, symbol: str, metrics: Dict):
         """Save model training metrics."""
-        with sqlite3.connect(self.db_path) as conn:
-            conn.execute('''
-                INSERT OR REPLACE INTO model_registry 
-                (symbol, model_version, features_count, training_samples,
-                 accuracy, precision_score, recall_score, f1_score,
-                 brier_score, calibration_error, selected_features,
-                 feature_importance, model_weights, trained_at,
-                 training_duration_seconds, is_active)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now', 'localtime'), ?, 1)
-            ''', (
-                symbol,
-                metrics.get('model_version'),
-                metrics.get('features_count'),
-                metrics.get('training_samples'),
-                metrics.get('accuracy'),
-                metrics.get('precision'),
-                metrics.get('recall'),
-                metrics.get('f1_score'),
-                metrics.get('brier_score'),
-                metrics.get('calibration_error'),
-                json.dumps(metrics.get('selected_features', [])),
-                json.dumps(metrics.get('feature_importance', {})),
-                json.dumps(metrics.get('model_weights', {})),
-                metrics.get('training_duration', 0)
-            ))
-            conn.commit()
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                conn.execute('''
+                    INSERT OR REPLACE INTO model_registry 
+                    (symbol, model_version, features_count, training_samples,
+                     accuracy, precision_score, recall_score, f1_score,
+                     brier_score, calibration_error, selected_features,
+                     feature_importance, model_weights, trained_at,
+                     training_duration_seconds, is_active)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now', 'localtime'), ?, 1)
+                ''', (
+                    symbol,
+                    metrics.get('model_version', 'v1.0'),
+                    metrics.get('features_count', 0),
+                    metrics.get('training_samples', 0),
+                    metrics.get('accuracy', 0),
+                    metrics.get('precision', 0),
+                    metrics.get('recall', 0),
+                    metrics.get('f1_score', 0),
+                    metrics.get('brier_score', 0),
+                    metrics.get('calibration_error', 0),
+                    json.dumps(metrics.get('selected_features', [])),
+                    json.dumps(metrics.get('feature_importance', {})),
+                    json.dumps(metrics.get('model_weights', {})),
+                    metrics.get('training_duration', 0)
+                ))
+                conn.commit()
+            self.logger.info(f"Model metrics saved for {symbol}")
+        except Exception as e:
+            self.logger.error(f"Save metrics error: {e}")
     
     def backup(self):
         """Create database backup."""
@@ -383,15 +410,16 @@ class Database:
             os.makedirs('backups', exist_ok=True)
             backup_path = f"backups/falcon_backup_{datetime.now().strftime('%Y%m%d')}.db"
             shutil.copy2(self.db_path, backup_path)
-        except:
-            pass
+            self.logger.info(f"Database backed up: {backup_path}")
+        except Exception as e:
+            self.logger.error(f"Backup error: {e}")
 
 # ============================================================================
-# TECHNICAL ANALYZER - FULL FEATURES
+# TECHNICAL ANALYZER
 # ============================================================================
 
 class TechnicalAnalyzer:
-    """Complete technical analysis with all indicators and patterns."""
+    """Complete technical analysis with all indicators."""
     
     @staticmethod
     def calculate_all_indicators(df: pd.DataFrame) -> pd.DataFrame:
@@ -404,7 +432,7 @@ class TechnicalAnalyzer:
         for p in [1, 3, 5, 10, 20]:
             f[f'ret_{p}'] = c.pct_change(p)
         f['log_ret'] = np.log(c / c.shift(1))
-        f['hl_ratio'] = (h - l) / c
+        f['hl_ratio'] = (h - l) / (c + 1e-8)
         f['close_pos'] = (c - l) / (h - l + 1e-8)
         
         # Moving Averages
@@ -435,7 +463,7 @@ class TechnicalAnalyzer:
         f['bb_upper'] = sma20 + 2 * std20
         f['bb_lower'] = sma20 - 2 * std20
         f['bb_pos'] = (c - f['bb_lower']) / (f['bb_upper'] - f['bb_lower'] + 1e-8)
-        f['bb_width'] = (f['bb_upper'] - f['bb_lower']) / sma20
+        f['bb_width'] = (f['bb_upper'] - f['bb_lower']) / (sma20 + 1e-8)
         
         # Stochastic
         low14 = l.rolling(14).min()
@@ -449,7 +477,7 @@ class TechnicalAnalyzer:
         tr3 = abs(l - c.shift())
         tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
         f['atr'] = tr.ewm(span=14).mean()
-        f['atr_pct'] = f['atr'] / c
+        f['atr_pct'] = f['atr'] / (c + 1e-8)
         
         # CCI
         tp = (h + l + c) / 3
@@ -464,7 +492,7 @@ class TechnicalAnalyzer:
         
         # ROC
         for p in [5, 10, 20]:
-            f[f'roc_{p}'] = (c - c.shift(p)) / c.shift(p) * 100
+            f[f'roc_{p}'] = (c - c.shift(p)) / (c.shift(p) + 1e-8) * 100
         
         # Momentum
         for p in [5, 10, 20]:
@@ -477,8 +505,8 @@ class TechnicalAnalyzer:
         # Volume indicators
         if v.sum() > 0:
             f['vol_change'] = v.pct_change()
-            f['vol_ratio'] = v / v.rolling(20).mean()
-            f['vol_trend'] = v.rolling(5).mean() / v.rolling(20).mean()
+            f['vol_ratio'] = v / (v.rolling(20).mean() + 1e-8)
+            f['vol_trend'] = (v.rolling(5).mean()) / (v.rolling(20).mean() + 1e-8)
         
         # Trend strength
         f['trend_str'] = c.rolling(20).apply(
@@ -502,10 +530,10 @@ class TechnicalAnalyzer:
         body1 = abs(c1['Close'] - c1['Open'])
         body2 = abs(c2['Close'] - c2['Open'])
         body3 = abs(c3['Close'] - c3['Open'])
+        total1 = c1['High'] - c1['Low']
         
         upper1 = c1['High'] - max(c1['Close'], c1['Open'])
         lower1 = min(c1['Close'], c1['Open']) - c1['Low']
-        total1 = c1['High'] - c1['Low']
         
         # Pin Bars
         if body1 > 0 and total1 > 0:
@@ -524,7 +552,7 @@ class TechnicalAnalyzer:
                     patterns.append({'pattern': 'Bearish Engulfing', 'strength': 'strong', 'direction': 'SELL'})
         
         # Doji
-        if body1 < total1 * 0.1:
+        if total1 > 0 and body1 < total1 * 0.1:
             if abs(upper1 - lower1) < body1:
                 patterns.append({'pattern': 'Doji', 'strength': 'moderate', 'direction': 'NEUTRAL'})
             elif upper1 > lower1 * 2:
@@ -533,7 +561,7 @@ class TechnicalAnalyzer:
                 patterns.append({'pattern': 'Dragonfly Doji', 'strength': 'moderate', 'direction': 'BUY'})
         
         # Stars
-        if body2 < body3 * 0.3:
+        if body3 > 0 and body2 < body3 * 0.3:
             if c3['Close'] < c3['Open'] and c1['Close'] > c1['Open']:
                 if c1['Close'] > (c3['Open'] + c3['Close']) / 2:
                     patterns.append({'pattern': 'Morning Star', 'strength': 'strong', 'direction': 'BUY'})
@@ -568,16 +596,15 @@ class TechnicalAnalyzer:
     def calculate_trend_filter(df: pd.DataFrame) -> Dict:
         """Calculate trend direction and strength."""
         if len(df) < 50:
-            return {'trend': 'NEUTRAL', 'strength': 0}
+            return {'trend': 'NEUTRAL', 'strength': 0, 'adx': 0}
         
-        c = df['Close']
+        c, h, l = df['Close'], df['High'], df['Low']
         current = c.iloc[-1]
         ema20 = c.ewm(span=20).mean().iloc[-1]
         ema50 = c.ewm(span=50).mean().iloc[-1]
         ema200 = c.ewm(span=200).mean().iloc[-1] if len(df) >= 200 else ema50
         
-        # ADX calculation
-        h, l = df['High'], df['Low']
+        # ADX
         tr1 = h - l
         tr2 = abs(h - c.shift())
         tr3 = abs(l - c.shift())
@@ -586,10 +613,10 @@ class TechnicalAnalyzer:
         
         plus_dm = h.diff().clip(lower=0)
         minus_dm = (-l.diff()).clip(lower=0)
-        plus_di = 100 * (plus_dm.ewm(span=14).mean() / atr)
-        minus_di = 100 * (minus_dm.ewm(span=14).mean() / atr)
+        plus_di = 100 * (plus_dm.ewm(span=14).mean()) / (atr + 1e-8)
+        minus_di = 100 * (minus_dm.ewm(span=14).mean()) / (atr + 1e-8)
         adx = 100 * abs(plus_di - minus_di) / (plus_di + minus_di + 1e-8)
-        adx_val = adx.ewm(span=14).mean().iloc[-1]
+        adx_val = float(adx.ewm(span=14).mean().iloc[-1])
         
         # Score
         score = 0
@@ -627,15 +654,23 @@ class TechnicalAnalyzer:
             trend = 'NEUTRAL'
             strength = 0
         
-        return {'trend': trend, 'strength': strength, 'score': score, 
-                'adx': round(adx_val, 2), 'reasons': reasons}
+        return {
+            'trend': trend,
+            'strength': strength,
+            'score': score,
+            'adx': round(adx_val, 2),
+            'reasons': reasons
+        }
 
 # ============================================================================
-# PER-ASSET MODEL - FULL FEATURES
+# PER-ASSET MODEL (3 MODELS - NO LIGHTGBM)
 # ============================================================================
 
 class PerAssetModel:
-    """Complete ensemble model per symbol with all features."""
+    """
+    Ensemble model per symbol.
+    Uses 3 models: XGBoost + CatBoost + GradientBoosting
+    """
     
     def __init__(self, symbol: str, config: Config, logger: logging.Logger):
         self.symbol = symbol
@@ -648,8 +683,9 @@ class PerAssetModel:
         self.selected_features = []
         self.feature_importance = {}
         self.model_weights = {
-            'xgboost': 0.30, 'lightgbm': 0.25,
-            'catboost': 0.25, 'gradient_boost': 0.20
+            'xgboost': 0.35,
+            'catboost': 0.35,
+            'gradient_boost': 0.30
         }
         self.is_trained = False
         self.model_version = None
@@ -657,41 +693,52 @@ class PerAssetModel:
         self._init_models()
     
     def _init_models(self):
-        """Initialize models with server-optimized parameters."""
+        """Initialize 3 ensemble models."""
         self.models = {
             'xgboost': xgb.XGBClassifier(
-                n_estimators=200, learning_rate=0.03, max_depth=5,
-                min_child_weight=3, subsample=0.8, colsample_bytree=0.8,
-                reg_alpha=0.5, reg_lambda=1.0, random_state=42,
-                n_jobs=2, verbosity=0, tree_method='hist'
-            ),
-            'lightgbm': lgb.LGBMClassifier(
-                n_estimators=200, learning_rate=0.03, max_depth=5,
-                num_leaves=31, min_child_samples=20, subsample=0.8,
-                colsample_bytree=0.8, reg_alpha=0.5, reg_lambda=1.0,
-                random_state=42, n_jobs=2, verbose=-1
+                n_estimators=250,
+                learning_rate=0.03,
+                max_depth=5,
+                min_child_weight=3,
+                subsample=0.8,
+                colsample_bytree=0.8,
+                reg_alpha=0.5,
+                reg_lambda=1.0,
+                random_state=42,
+                n_jobs=2,
+                verbosity=0,
+                tree_method='hist'
             ),
             'catboost': CatBoostClassifier(
-                iterations=200, learning_rate=0.03, depth=5,
-                l2_leaf_reg=3, random_seed=42, verbose=False,
-                thread_count=2, allow_writing_files=False
+                iterations=250,
+                learning_rate=0.03,
+                depth=5,
+                l2_leaf_reg=3,
+                random_seed=42,
+                verbose=False,
+                thread_count=2,
+                allow_writing_files=False
             ),
             'gradient_boost': GradientBoostingClassifier(
-                n_estimators=150, learning_rate=0.03, max_depth=4,
-                min_samples_split=10, min_samples_leaf=5,
-                subsample=0.8, random_state=42
+                n_estimators=200,
+                learning_rate=0.03,
+                max_depth=4,
+                min_samples_split=10,
+                min_samples_leaf=5,
+                subsample=0.8,
+                random_state=42
             )
         }
     
     def select_features(self, X: pd.DataFrame, y: pd.Series) -> List[str]:
-        """Automated feature selection."""
+        """Automated feature selection using mutual information."""
         self.logger.info(f"Feature selection for {self.symbol}: {len(X.columns)} features")
         
-        # Remove constant/low variance
+        # Remove constant features
         constant = [c for c in X.columns if X[c].std() < 1e-8]
         X = X.drop(columns=constant)
         
-        # Remove highly correlated
+        # Remove highly correlated (>0.95)
         corr = X.corr().abs()
         upper = corr.where(np.triu(np.ones(corr.shape), k=1).astype(bool))
         high_corr = [c for c in upper.columns if any(upper[c] > 0.95)]
@@ -711,11 +758,13 @@ class PerAssetModel:
         """Train model with all metrics."""
         try:
             if len(df) < self.config.MIN_TRAINING_SAMPLES:
+                self.logger.warning(f"Insufficient data: {len(df)} samples")
                 return None
             
             self.logger.info(f"Training {self.symbol}: {len(df)} samples")
             start = time.time()
             
+            # Prepare features
             features = TechnicalAnalyzer.calculate_all_indicators(df)
             future_ret = df['Close'].shift(-3) / df['Close'] - 1
             target = (future_ret > 0.001).astype(int)
@@ -730,12 +779,12 @@ class PerAssetModel:
             self.select_features(X, y)
             X = X[self.selected_features]
             
-            # Split
+            # Split data
             X_train, X_test, y_train, y_test = train_test_split(
                 X, y, test_size=self.config.TEST_SIZE, shuffle=False
             )
             X_train, X_val, y_train, y_val = train_test_split(
-                X_train, y_train, 
+                X_train, y_train,
                 test_size=self.config.VALIDATION_SIZE / (1 - self.config.TEST_SIZE),
                 shuffle=False
             )
@@ -745,19 +794,23 @@ class PerAssetModel:
             X_val_s = self.scaler.transform(X_val)
             X_test_s = self.scaler.transform(X_test)
             
-            # Train models
+            # Train each model
             predictions, probas = {}, {}
             
             for name, model in self.models.items():
                 try:
+                    self.logger.debug(f"Training {name}...")
                     model.fit(X_train_s, y_train)
                     
-                    cal = CalibratedClassifierCV(model, cv=3, method='isotonic')
+                    cal = CalibratedClassifierCV(
+                        model, cv=min(3, self.config.CV_FOLDS), method='isotonic'
+                    )
                     cal.fit(X_train_s, y_train)
                     self.calibrators[name] = cal
                     
                     probas[name] = cal.predict_proba(X_val_s)[:, 1]
                     predictions[name] = cal.predict(X_val_s)
+                    
                 except Exception as e:
                     self.logger.error(f"Train {name} error: {e}")
             
@@ -776,7 +829,13 @@ class PerAssetModel:
             rec = recall_score(y_val, ensemble_pred, zero_division=0)
             f1 = f1_score(y_val, ensemble_pred, zero_division=0)
             brier = brier_score_loss(y_val, ensemble_prob)
-            cal_err = self._calc_calibration_error(y_val, ensemble_prob)
+            
+            # Calibration error
+            try:
+                prob_true, prob_pred = calibration_curve(y_val, ensemble_prob, n_bins=10)
+                cal_err = np.mean(np.abs(prob_true - prob_pred))
+            except:
+                cal_err = 1.0
             
             # Update weights
             scores = {}
@@ -787,7 +846,7 @@ class PerAssetModel:
                 for name in self.model_weights:
                     self.model_weights[name] = scores.get(name, 0) / total
             
-            # Feature importance
+            # Feature importance (from XGBoost)
             if 'xgboost' in self.models:
                 self.feature_importance = dict(
                     zip(self.selected_features, self.models['xgboost'].feature_importances_)
@@ -801,8 +860,11 @@ class PerAssetModel:
                 'model_version': self.model_version,
                 'features_count': len(self.selected_features),
                 'training_samples': len(X_train),
-                'accuracy': acc, 'precision': prec, 'recall': rec,
-                'f1_score': f1, 'brier_score': brier,
+                'accuracy': acc,
+                'precision': prec,
+                'recall': rec,
+                'f1_score': f1,
+                'brier_score': brier,
                 'calibration_error': cal_err,
                 'selected_features': self.selected_features,
                 'feature_importance': self.feature_importance,
@@ -858,45 +920,47 @@ class PerAssetModel:
             self.logger.error(f"Predict {self.symbol}: {e}")
             return "NEUTRAL", 0.0, {}
     
-    def _calc_calibration_error(self, y_true, y_prob):
-        try:
-            prob_true, prob_pred = calibration_curve(y_true, y_prob, n_bins=10)
-            return np.mean(np.abs(prob_true - prob_pred))
-        except:
-            return 1.0
-    
     def save(self):
         """Save model to disk."""
-        path = os.path.join(self.config.MODELS_DIR, self.symbol)
-        os.makedirs(path, exist_ok=True)
-        
-        data = {
-            'models': self.models,
-            'calibrators': self.calibrators,
-            'scaler': self.scaler,
-            'features': self.selected_features,
-            'importance': self.feature_importance,
-            'weights': self.model_weights,
-            'version': self.model_version
-        }
-        joblib.dump(data, os.path.join(path, 'model.pkl'))
+        try:
+            path = os.path.join(self.config.MODELS_DIR, self.symbol)
+            os.makedirs(path, exist_ok=True)
+            
+            data = {
+                'models': self.models,
+                'calibrators': self.calibrators,
+                'scaler': self.scaler,
+                'features': self.selected_features,
+                'importance': self.feature_importance,
+                'weights': self.model_weights,
+                'version': self.model_version
+            }
+            joblib.dump(data, os.path.join(path, 'model.pkl'))
+            self.logger.info(f"Model saved: {self.symbol}")
+        except Exception as e:
+            self.logger.error(f"Save model error: {e}")
     
     def load(self) -> bool:
         """Load model from disk."""
-        path = os.path.join(self.config.MODELS_DIR, self.symbol, 'model.pkl')
-        if not os.path.exists(path):
+        try:
+            path = os.path.join(self.config.MODELS_DIR, self.symbol, 'model.pkl')
+            if not os.path.exists(path):
+                return False
+            
+            data = joblib.load(path)
+            self.models = data['models']
+            self.calibrators = data['calibrators']
+            self.scaler = data['scaler']
+            self.selected_features = data['features']
+            self.feature_importance = data['importance']
+            self.model_weights = data['weights']
+            self.model_version = data['version']
+            self.is_trained = True
+            self.logger.info(f"Model loaded: {self.symbol}")
+            return True
+        except Exception as e:
+            self.logger.error(f"Load model error: {e}")
             return False
-        
-        data = joblib.load(path)
-        self.models = data['models']
-        self.calibrators = data['calibrators']
-        self.scaler = data['scaler']
-        self.selected_features = data['features']
-        self.feature_importance = data['importance']
-        self.model_weights = data['weights']
-        self.model_version = data['version']
-        self.is_trained = True
-        return True
 
 # ============================================================================
 # CHART GENERATOR
@@ -912,37 +976,39 @@ class ChartGenerator:
             chart_df = df.tail(40)
             
             fig, (ax1, ax2, ax3) = plt.subplots(
-                3, 1, figsize=(12, 8), 
+                3, 1, figsize=(12, 8),
                 gridspec_kw={'height_ratios': [3, 1, 1]}
             )
             fig.patch.set_facecolor('#1a1a2e')
             
-            # Price chart
             dates = chart_df.index
             closes = chart_df['Close'].values
+            opens = chart_df['Open'].values
             
-            colors = ['#00ff88' if closes[i] >= closes[i-1] else '#ff4444' 
+            # Candles
+            colors = ['#00ff88' if closes[i] >= closes[i-1] else '#ff4444'
                      for i in range(1, len(closes))]
             colors.insert(0, colors[0])
             
-            ax1.bar(range(len(dates)), closes - chart_df['Open'].values,
-                   bottom=chart_df['Open'].values, color=colors, width=0.8)
+            ax1.bar(range(len(dates)), closes - opens,
+                   bottom=opens, color=colors, width=0.8)
             
             # EMAs
             ema20 = chart_df['Close'].ewm(span=20).mean()
             ema50 = chart_df['Close'].ewm(span=50).mean()
-            ax1.plot(range(len(dates)), ema20, '#00bfff', linewidth=1, alpha=0.7)
-            ax1.plot(range(len(dates)), ema50, '#ff6347', linewidth=1, alpha=0.7)
+            ax1.plot(range(len(dates)), ema20, '#00bfff', linewidth=1, alpha=0.7, label='EMA20')
+            ax1.plot(range(len(dates)), ema50, '#ff6347', linewidth=1, alpha=0.7, label='EMA50')
             
             # Entry point
-            ax1.scatter(len(dates)-1, signal['entry_price'], 
+            ax1.scatter(len(dates)-1, signal['entry_price'],
                        color='yellow', s=150, marker='*', zorder=5)
             
-            ax1.set_title(f'{symbol} - {signal["direction"]} Signal\nConfidence: {signal["confidence"]:.1%}',
+            ax1.set_title(f'{symbol} - {signal["direction"]} Signal | Confidence: {signal["confidence"]:.1%}',
                          color='white', fontweight='bold')
             ax1.set_facecolor('#1a1a2e')
             ax1.tick_params(colors='white')
             ax1.grid(True, alpha=0.2)
+            ax1.legend(loc='upper left', fontsize=8)
             
             # RSI
             delta = chart_df['Close'].diff()
@@ -951,12 +1017,13 @@ class ChartGenerator:
             rs = gain / (loss + 1e-8)
             rsi = 100 - (100 / (1 + rs))
             
-            ax2.plot(range(len(dates)), rsi, '#9370db', linewidth=1.5)
+            ax2.plot(range(len(dates)), rsi, '#9370db', linewidth=1.5, label='RSI 14')
             ax2.axhline(y=70, color='red', linestyle='--', alpha=0.5)
             ax2.axhline(y=30, color='green', linestyle='--', alpha=0.5)
             ax2.set_facecolor('#1a1a2e')
             ax2.tick_params(colors='white')
             ax2.grid(True, alpha=0.2)
+            ax2.set_ylabel('RSI', color='white')
             
             # MACD
             ema12 = chart_df['Close'].ewm(span=12).mean()
@@ -965,14 +1032,16 @@ class ChartGenerator:
             signal_line = macd.ewm(span=9).mean()
             hist = macd - signal_line
             
-            ax3.bar(range(len(dates)), hist, 
-                   color=['#00ff88' if x > 0 else '#ff4444' for x in hist], 
-                   alpha=0.7, width=0.8)
-            ax3.plot(range(len(dates)), macd, '#00bfff', linewidth=1.5)
-            ax3.plot(range(len(dates)), signal_line, '#ff6347', linewidth=1.5)
+            ax3.bar(range(len(dates)), hist,
+                   color=['#00ff88' if x > 0 else '#ff4444' for x in hist],
+                   alpha=0.7, width=0.8, label='Histogram')
+            ax3.plot(range(len(dates)), macd, '#00bfff', linewidth=1.5, label='MACD')
+            ax3.plot(range(len(dates)), signal_line, '#ff6347', linewidth=1.5, label='Signal')
             ax3.set_facecolor('#1a1a2e')
             ax3.tick_params(colors='white')
             ax3.grid(True, alpha=0.2)
+            ax3.set_ylabel('MACD', color='white')
+            ax3.legend(loc='upper left', fontsize=8)
             
             plt.tight_layout()
             
@@ -983,7 +1052,7 @@ class ChartGenerator:
             
             return chart_path
             
-        except Exception as e:
+        except Exception:
             plt.close('all')
             gc.collect()
             return None
@@ -998,67 +1067,86 @@ class FalconBot:
     def __init__(self, config: Config):
         self.config = config
         self.logger = setup_logging(config)
-        self.db = Database(config.DB_PATH)
+        self.db = Database(config.DB_PATH, self.logger)
         self.models: Dict[str, PerAssetModel] = {}
         self.executor = ThreadPoolExecutor(max_workers=config.MAX_WORKERS)
         self.chart_gen = ChartGenerator()
         
-        # Initialize Telegram
+        # Telegram
         self.tb = telebot.TeleBot(config.TELEGRAM_TOKEN)
         self._setup_commands()
         
-        # Load models
+        # Load/init models
         for symbol in config.SYMBOLS:
             model = PerAssetModel(symbol, config, self.logger)
             if model.load():
-                self.logger.info(f"Loaded model: {symbol}")
+                self.logger.info(f"Loaded: {symbol}")
             else:
-                self.logger.info(f"New model: {symbol} (needs training)")
+                self.logger.info(f"New: {symbol} (needs training)")
             self.models[symbol] = model
         
         self.running = False
         self.last_retrain = None
     
     def _setup_commands(self):
+        """Setup Telegram bot commands."""
+        
         @self.tb.message_handler(commands=['start', 'status'])
-        def handle(msg):
+        def handle_status(msg):
             if str(msg.chat.id) != self.config.TELEGRAM_CHAT_ID:
                 return
             trained = sum(1 for m in self.models.values() if m.is_trained)
             stats = self.db.get_stats()
             
             text = f"""
-🦅 **Falcon AI Ultimate**
+🦅 **Falcon AI Ultimate v2.2**
 
 ✅ الحالة: يعمل
-🤖 النماذج: {trained}/{len(self.models)}
-📊 الإشارات: {stats.get('total', 0)}
+🤖 النماذج المدربة: {trained}/{len(self.models)}
+📊 إجمالي الإشارات: {stats.get('total', 0)}
+✅ الرابحة: {stats.get('wins', 0)}
+❌ الخاسرة: {stats.get('losses', 0)}
 📈 نسبة النجاح: {stats.get('win_rate', 0):.1%}
 ⭐ أفضل أصل: {stats.get('best_symbol', 'N/A')}
+👎 أسوأ أصل: {stats.get('worst_symbol', 'N/A')}
 
-⚡️ جاري التحليل...
+⚡️ جاري تحليل الأسواق...
 """
             self.tb.reply_to(msg, text, parse_mode='Markdown')
         
         @self.tb.message_handler(commands=['stats'])
-        def stats_cmd(msg):
+        def handle_stats(msg):
             if str(msg.chat.id) != self.config.TELEGRAM_CHAT_ID:
                 return
-            s = self.db.get_stats()
+            stats = self.db.get_stats()
             text = f"""
 📊 **إحصائيات الأداء**
 
-📈 الإشارات: {s['total']}
-✅ رابحة: {s['wins']}
-❌ خاسرة: {s['losses']}
-📊 النسبة: {s['win_rate']:.1%}
-⭐ الأفضل: {s['best_symbol']}
-👎 الأسوأ: {s['worst_symbol']}
+📈 إجمالي الإشارات: {stats['total']}
+✅ الرابحة: {stats['wins']}
+❌ الخاسرة: {stats['losses']}
+📊 نسبة النجاح: {stats['win_rate']:.1%}
+⭐ أفضل أصل: {stats['best_symbol']}
+👎 أسوأ أصل: {stats['worst_symbol']}
+
+🤖 Falcon AI Ultimate
 """
+            self.tb.reply_to(msg, text, parse_mode='Markdown')
+        
+        @self.tb.message_handler(commands=['models'])
+        def handle_models(msg):
+            if str(msg.chat.id) != self.config.TELEGRAM_CHAT_ID:
+                return
+            text = "🤖 **حالة النماذج:**\n\n"
+            for symbol, model in self.models.items():
+                status = "✅ مدرب" if model.is_trained else "❌ يحتاج تدريب"
+                version = model.model_version or "N/A"
+                features = len(model.selected_features)
+                text += f"• **{symbol}**: {status}\n  الإصدار: {version} | الميزات: {features}\n\n"
             self.tb.reply_to(msg, text, parse_mode='Markdown')
     
     def fetch_data(self, symbol: str, interval: str = '5m', period: str = '5d') -> Optional[pd.DataFrame]:
-        """Fetch data with retry."""
+        """Fetch data with retry logic."""
         for attempt in range(self.config.MAX_RETRIES):
             try:
                 df = yf.Ticker(symbol).history(period=period, interval=interval)
@@ -1071,7 +1159,7 @@ class FalconBot:
         return None
     
     def analyze_symbol(self, symbol: str) -> Optional[Dict]:
-        """Full analysis pipeline."""
+        """Complete analysis pipeline for one symbol."""
         try:
             model = self.models.get(symbol)
             if not model or not model.is_trained:
@@ -1092,10 +1180,11 @@ class FalconBot:
             if df_5m is None or df_15m is None or len(df_5m) < 30:
                 return None
             
-            # Predictions
+            # Predict both timeframes
             dir_5m, conf_5m, probas_5m = model.predict(df_5m)
             dir_15m, conf_15m, probas_15m = model.predict(df_15m)
             
+            # Must agree
             if dir_5m != dir_15m or dir_5m == "NEUTRAL":
                 return None
             
@@ -1103,17 +1192,17 @@ class FalconBot:
             trend = TechnicalAnalyzer.calculate_trend_filter(df_15m)
             if (dir_5m == "BUY" and 'BEARISH' in trend['trend']) or \
                (dir_5m == "SELL" and 'BULLISH' in trend['trend']):
+                self.logger.debug(f"Trend filter blocked {symbol} {dir_5m}")
                 return None
             
-            # Patterns
+            # Candlestick patterns
             patterns = TechnicalAnalyzer.detect_candlestick_patterns(df_5m)
             pattern_names = [p['pattern'] for p in patterns if p['direction'] == dir_5m]
             
-            # S/R
-            sr = TechnicalAnalyzer.detect_support_resistance(df_15m)
-            
-            # Confidence adjustment
+            # Final confidence
             confidence = (conf_5m + conf_15m) / 2
+            
+            # Boost confidence with trend/patterns
             if trend['strength'] > 0.6:
                 confidence = min(confidence * 1.1, 0.95)
             if pattern_names:
@@ -1130,8 +1219,8 @@ class FalconBot:
                 'm5_analysis': dir_5m,
                 'm15_analysis': dir_15m,
                 'trend_filter': trend['trend'],
-                'patterns_detected': ','.join(pattern_names) if pattern_names else 'None',
-                'models_agreement': f"{len(probas_5m)}/4 models",
+                'patterns_detected': ','.join(pattern_names) if pattern_names else 'لا يوجد',
+                'models_agreement': f"{len(probas_5m)}/3",
                 'expiry_time': (datetime.now() + timedelta(
                     minutes=self.config.TRADE_DURATION_MINUTES
                 )).strftime('%Y-%m-%d %H:%M:%S'),
@@ -1143,7 +1232,7 @@ class FalconBot:
             return None
     
     def send_signal(self, signal: Dict):
-        """Send signal with chart."""
+        """Send signal with chart to Telegram."""
         try:
             emoji = "🟢" if signal['direction'] == 'BUY' else "🔴"
             direction = "شراء ▲" if signal['direction'] == 'BUY' else "بيع ▼"
@@ -1151,144 +1240,36 @@ class FalconBot:
             msg = f"""
 {emoji} **{signal['symbol']}** - {direction}
 
-💰 السعر: {signal['entry_price']:.5f}
-⏳ المدة: {self.config.TRADE_DURATION_MINUTES}:00 دقيقة
-💪 الثقة: {signal['confidence']:.1%}
+💰 **سعر الدخول:** {signal['entry_price']:.5f}
+⏳ **مدة الصفقة:** {self.config.TRADE_DURATION_MINUTES}:00 دقيقة
+💪 **نسبة الثقة:** {signal['confidence']:.1%}
 
-📊 التحليل:
+📊 **التحليل الفني:**
 • M5: {signal['m5_analysis']}
 • M15: {signal['m15_analysis']}
-• الاتجاه: {signal['trend_filter']}
-• الأنماط: {signal['patterns_detected']}
+• الاتجاه العام: {signal['trend_filter']}
+• أنماط الشموع: {signal['patterns_detected']}
 
-🤖 {signal['model_version']} | Falcon AI Ultimate
+🤖 **النموذج:** {signal['models_agreement']} متوافق
+📌 **الإصدار:** {signal['model_version']}
+
+⚠️ تنبيه: هذه إشارة تحليلية فقط. إدارة رأس المال مسؤوليتك.
+
+🦅 **Falcon AI Ultimate**
 """
             
             # Generate chart
             df = self.fetch_data(signal['symbol'], '5m', '3d')
-            if df is not None:
+            if df is not None and len(df) > 20:
                 chart_path = self.chart_gen.create_chart(df, signal['symbol'], signal)
                 
                 if chart_path:
                     with open(chart_path, 'rb') as photo:
                         self.tb.send_photo(
-                            self.config.TELEGRAM_CHAT_ID, photo,
-                            caption=msg, parse_mode='Markdown'
+                            self.config.TELEGRAM_CHAT_ID,
+                            photo,
+                            caption=msg,
+                            parse_mode='Markdown'
                         )
                     try:
-                        os.remove(chart_path)
-                    except:
-                        pass
-                else:
-                    self.tb.send_message(
-                        self.config.TELEGRAM_CHAT_ID, msg, parse_mode='Markdown'
-                    )
-            
-            self.logger.info(f"Signal sent: {signal['symbol']} {signal['direction']}")
-            
-        except Exception as e:
-            self.logger.error(f"Send error: {e}")
-    
-    def check_trades(self):
-        """Check and close expired trades."""
-        for trade in self.db.get_pending_trades():
-            try:
-                df = self.fetch_data(trade['symbol'], '5m', '1d')
-                if df is None:
-                    continue
-                
-                current = float(df['Close'].iloc[-1])
-                entry = trade['entry_price']
-                
-                if trade['direction'] == 'BUY':
-                    pnl = (current - entry) / entry * 100
-                    result = 'WIN' if current > entry else 'LOSS'
-                else:
-                    pnl = (entry - current) / entry * 100
-                    result = 'WIN' if current < entry else 'LOSS'
-                
-                self.db.update_result(trade['id'], current, result, pnl)
-                self.logger.info(f"Trade {trade['id']}: {result} ({pnl:.2f}%)")
-                
-            except Exception as e:
-                self.logger.error(f"Check trade {trade.get('id')}: {e}")
-    
-    def retrain_models(self):
-        """Retrain all models."""
-        self.logger.info("Starting retraining cycle...")
-        
-        for symbol in self.config.SYMBOLS:
-            try:
-                df = self.fetch_data(symbol, '1h', self.config.TRAINING_PERIOD)
-                if df is None or len(df) < self.config.MIN_TRAINING_SAMPLES:
-                    continue
-                
-                model = PerAssetModel(symbol, self.config, self.logger)
-                metrics = model.train(df)
-                
-                if metrics:
-                    model.save()
-                    self.models[symbol] = model
-                    self.db.save_model_metrics(symbol, metrics)
-                    self.logger.info(f"Retrained: {symbol} (F1: {metrics['f1_score']:.3f})")
-                    
-            except Exception as e:
-                self.logger.error(f"Retrain {symbol}: {e}")
-        
-        MemoryManager.clear_memory()
-        self.last_retrain = datetime.now()
-        
-        # Notify
-        try:
-            trained = sum(1 for m in self.models.values() if m.is_trained)
-            self.tb.send_message(
-                self.config.TELEGRAM_CHAT_ID,
-                f"🔄 **إعادة تدريب مكتملة**\n✅ النماذج: {trained}/{len(self.models)}",
-                parse_mode='Markdown'
-            )
-        except:
-            pass
-    
-    def start_telegram(self):
-        """Start Telegram polling in thread."""
-        def poll():
-            self.logger.info("Telegram polling started")
-            while True:
-                try:
-                    self.tb.infinity_polling(timeout=10, long_polling_timeout=5)
-                except Exception as e:
-                    self.logger.error(f"Polling error: {e}")
-                    time.sleep(10)
-        
-        thread = threading.Thread(target=poll, daemon=True)
-        thread.start()
-    
-    def run(self):
-        """Main execution loop."""
-        self.running = True
-        
-        self.logger.info("=" * 50)
-        self.logger.info("🦅 Falcon AI Ultimate Starting...")
-        self.logger.info(f"Symbols: {len(self.config.SYMBOLS)}")
-        self.logger.info(f"Workers: {self.config.MAX_WORKERS}")
-        self.logger.info("=" * 50)
-        
-        # Start Telegram
-        self.start_telegram()
-        time.sleep(2)
-        
-        # Startup message
-        try:
-            trained = sum(1 for m in self.models.values() if m.is_trained)
-            self.tb.send_message(
-                self.config.TELEGRAM_CHAT_ID,
-                f"🦅 **Falcon AI Ultimate**\n✅ جاهز | نماذج: {trained}\n⚡️ بدء التحليل...",
-                parse_mode='Markdown'
-            )
-        except:
-            pass
-        
-        # Initial training if needed
-        if not any(m.is_trained for m in self.models.values()):
-            self.logger.info("No trained models found. Starting initial training...")
- 
+                        os.remove(c
