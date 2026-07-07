@@ -1,12 +1,8 @@
 #!/usr/bin/env python3
 """
-Falcon AI Pro v5.0 - Maximum Profit, Minimum Loss
-====================================================
-- Strict Stop Loss
-- News Filter
-- Liquidity Filter
-- Triple Confirmation
-- Fixed Risk Management
+Falcon AI Pro v5.1 - Auto Restart + Self Healing
+==================================================
+Never stops. Auto-restarts on any failure.
 """
 
 import os
@@ -19,6 +15,8 @@ import hashlib
 import warnings
 import threading
 import gc
+import signal
+import traceback
 from typing import Dict, List, Tuple, Optional, Any
 from datetime import datetime, timedelta
 from dataclasses import dataclass, field
@@ -50,7 +48,15 @@ warnings.filterwarnings('ignore')
 os.environ['OMP_NUM_THREADS'] = '2'
 
 # ============================================================================
-# CONFIG - RISK MANAGEMENT
+# AUTO-RESTART CONFIG
+# ============================================================================
+
+# ✅ ملف لتتبع حالة البوت
+HEARTBEAT_FILE = 'bot_heartbeat.txt'
+MAX_SILENCE_MINUTES = 10  # لو البوت سكت 10 دقائق، يتعاد تشغيله
+
+# ============================================================================
+# CONFIG
 # ============================================================================
 
 @dataclass
@@ -58,12 +64,9 @@ class Config:
     TELEGRAM_TOKEN: str = os.environ.get('TELEGRAM_TOKEN', '8773849578:AAH9a6-8hU5YFYTad2EA5jQyfffIoeL8npk')
     TELEGRAM_CHAT_ID: str = os.environ.get('TELEGRAM_CHAT_ID', '7553333305')
     
-    # ✅ Risk Management
-    MAX_PIPS_STOP_LOSS: int = 15  # أقصى خسارة بالنقاط
-    MAX_LOSS_PERCENT: float = 0.15  # أقصى خسارة 0.15%
-    RISK_PER_TRADE: float = 0.01  # 1% مخاطرة
-    MIN_RISK_REWARD: float = 1.5  # نسبة الربح للخسارة 1:1.5
-    
+    MAX_PIPS_STOP_LOSS: int = 15
+    MAX_LOSS_PERCENT: float = 0.15
+    MIN_RISK_REWARD: float = 1.5
     TRADE_DURATION_MINUTES: int = 10
     SCAN_INTERVAL_MINUTES: int = 3
     
@@ -75,10 +78,8 @@ class Config:
     TRAINING_PERIOD_1H: str = '6mo'
     TRAINING_PERIOD_15M: str = '1mo'
     
-    # ✅ Strict thresholds
-    CONFIDENCE_THRESHOLD: float = 0.70  # عتبة عالية
-    ENSEMBLE_AGREEMENT: int = 3  # 3 من 4 لازم يتفقوا
-    
+    CONFIDENCE_THRESHOLD: float = 0.70
+    ENSEMBLE_AGREEMENT: int = 3
     WALK_FORWARD_WINDOWS: int = 3
     MIN_TRAINING_SAMPLES: int = 500
     MAX_FEATURES: int = 60
@@ -90,74 +91,87 @@ class Config:
     MAX_RETRIES: int = 5
     RETRY_DELAY: int = 10
     MAX_WORKERS: int = 2
-    SIGNAL_COOLDOWN_MINUTES: int = 15  # تهدئة أطول
+    SIGNAL_COOLDOWN_MINUTES: int = 15
     
     LOG_FILE: str = 'falcon_bot.log'
 
 # ============================================================================
-# NEWS & LIQUIDITY FILTER
+# HEARTBEAT
+# ============================================================================
+
+def update_heartbeat():
+    """✅ تحديث نبض البوت (بيتكتب كل دقيقة)"""
+    try:
+        with open(HEARTBEAT_FILE, 'w') as f:
+            f.write(datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
+    except:
+        pass
+
+def check_heartbeat() -> bool:
+    """✅ فحص النبض - لو البوت واقف من زمان"""
+    try:
+        if not os.path.exists(HEARTBEAT_FILE):
+            return False
+        
+        with open(HEARTBEAT_FILE, 'r') as f:
+            last_beat = datetime.strptime(f.read().strip(), '%Y-%m-%d %H:%M:%S')
+        
+        silence = (datetime.now() - last_beat).total_seconds() / 60
+        return silence < MAX_SILENCE_MINUTES
+    except:
+        return False
+
+# ============================================================================
+# LOGGING
+# ============================================================================
+
+def setup_logging(config: Config) -> logging.Logger:
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s | %(levelname)-7s | %(message)s',
+        datefmt='%H:%M:%S',
+        handlers=[
+            logging.FileHandler(config.LOG_FILE, encoding='utf-8'),
+            logging.StreamHandler(sys.stdout)
+        ]
+    )
+    return logging.getLogger('FalconPro')
+
+# ============================================================================
+# MARKET FILTER
 # ============================================================================
 
 class MarketFilter:
-    """Filter bad trading times."""
-    
-    # ✅ أوقات الأخبار القوية (بتوقيت UTC)
-    HIGH_IMPACT_NEWS_TIMES = [
-        (12, 30),  # USD News 8:30 AM ET
-        (14, 0),   # FOMC 2:00 PM ET
-        (8, 30),   # UK News 8:30 AM GMT
-        (9, 30),   # UK GDP 9:30 AM GMT
-        (10, 0),   # EU News 10:00 AM GMT
-    ]
+    HIGH_IMPACT_NEWS_TIMES = [(12, 30), (14, 0), (8, 30), (9, 30), (10, 0)]
     
     @staticmethod
     def is_news_time() -> bool:
-        """✅ لو في خبر قوي خلال 15 دقيقة، ما نتاجرش"""
         now = datetime.utcnow()
-        
         for hour, minute in MarketFilter.HIGH_IMPACT_NEWS_TIMES:
             news_time = now.replace(hour=hour, minute=minute, second=0)
-            
-            # قبل الخبر بـ 15 دقيقة أو بعده بـ 15 دقيقة
-            if abs((now - news_time).total_seconds()) < 900:  # 15 minutes
+            if abs((now - news_time).total_seconds()) < 900:
                 return True
-        
         return False
     
     @staticmethod
     def is_low_liquidity() -> bool:
-        """✅ أوقات سيولة ضعيفة"""
         now = datetime.utcnow()
-        day = now.weekday()  # 0=Monday, 4=Friday, 5=Saturday, 6=Sunday
+        day = now.weekday()
         hour = now.hour
         
-        # نهاية الأسبوع
-        if day >= 5:  # Saturday-Sunday
-            return True
-        
-        # إغلاق الجمعة
-        if day == 4 and hour >= 20:
-            return True
-        
-        # افتتاح الأسبوع (أول ساعة)
-        if day == 0 and hour < 1:
-            return True
-        
-        # نهاية جلسة آسيا - بداية أوروبا (سيولة منخفضة)
-        if 6 <= hour <= 7:
-            return True
+        if day >= 5: return True
+        if day == 4 and hour >= 20: return True
+        if day == 0 and hour < 1: return True
+        if 6 <= hour <= 7: return True
         
         return False
     
     @staticmethod
     def can_trade() -> Tuple[bool, str]:
-        """✅ هل مسموح بالتداول دلوقتي؟"""
         if MarketFilter.is_low_liquidity():
             return False, "سيولة منخفضة"
-        
         if MarketFilter.is_news_time():
             return False, "قرب صدور أخبار"
-        
         return True, "مسموح"
 
 # ============================================================================
@@ -171,31 +185,21 @@ class Database:
         self._init()
     
     def _init(self):
-        with sqlite3.connect(self.db_path) as conn:
-            conn.executescript('''
-                CREATE TABLE IF NOT EXISTS signals (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    symbol TEXT, direction TEXT, entry_price REAL,
-                    stop_loss REAL, take_profit REAL,
-                    confidence REAL, proba_buy REAL, proba_sell REAL,
-                    entry_time DATETIME DEFAULT CURRENT_TIMESTAMP,
-                    expiry_time DATETIME, exit_time DATETIME,
-                    result TEXT DEFAULT 'PENDING',
-                    pnl_percent REAL, pnl_pips REAL,
-                    signal_hash TEXT UNIQUE
-                );
-                CREATE TABLE IF NOT EXISTS performance (
-                    symbol TEXT PRIMARY KEY,
-                    total_signals INTEGER DEFAULT 0,
-                    wins INTEGER DEFAULT 0,
-                    losses INTEGER DEFAULT 0,
-                    total_pnl REAL DEFAULT 0,
-                    total_pips REAL DEFAULT 0,
-                    max_drawdown REAL DEFAULT 0,
-                    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
-                );
-            ''')
-            conn.commit()
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                conn.executescript('''
+                    CREATE TABLE IF NOT EXISTS signals (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        symbol TEXT, direction TEXT, entry_price REAL,
+                        stop_loss REAL, take_profit REAL,
+                        confidence REAL, entry_time DATETIME DEFAULT CURRENT_TIMESTAMP,
+                        expiry_time DATETIME, result TEXT DEFAULT 'PENDING',
+                        pnl_percent REAL, pnl_pips REAL, signal_hash TEXT UNIQUE
+                    );
+                ''')
+                conn.commit()
+        except Exception as e:
+            self.logger.error(f"DB Init error: {e}")
     
     def save_signal(self, data: Dict) -> Optional[int]:
         try:
@@ -205,79 +209,80 @@ class Database:
                 conn.execute('''
                     INSERT OR IGNORE INTO signals 
                     (symbol, direction, entry_price, stop_loss, take_profit,
-                     confidence, proba_buy, proba_sell, expiry_time, signal_hash)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     confidence, expiry_time, signal_hash)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 ''', (data['symbol'], data['direction'], data['entry_price'],
                       data.get('stop_loss'), data.get('take_profit'),
-                      data['confidence'], data.get('proba_buy', 0), 
-                      data.get('proba_sell', 0), data['expiry_time'], signal_hash))
+                      data['confidence'], data['expiry_time'], signal_hash))
                 conn.commit()
                 return conn.execute('SELECT last_insert_rowid()').fetchone()[0]
         except:
             return None
     
-    def update_result(self, signal_id: int, exit_price: float, result: str, 
-                      pnl: float, pips: float, symbol: str):
-        with sqlite3.connect(self.db_path) as conn:
-            conn.execute('''
-                UPDATE signals SET exit_price=?, result=?, pnl_percent=?, pnl_pips=?,
-                exit_time=datetime('now', 'localtime') WHERE id=?
-            ''', (exit_price, result, pnl, pips, signal_id))
-            
-            conn.execute('''
-                INSERT INTO performance (symbol, total_signals, wins, losses, total_pnl, total_pips)
-                VALUES (?, 1, ?, ?, ?, ?)
-                ON CONFLICT(symbol) DO UPDATE SET
-                total_signals = total_signals + 1,
-                wins = wins + ?,
-                losses = losses + ?,
-                total_pnl = total_pnl + ?,
-                total_pips = total_pips + ?
-            ''', (symbol, 
-                  1 if result == 'WIN' else 0, 1 if result == 'LOSS' else 0, pnl, pips,
-                  1 if result == 'WIN' else 0, 1 if result == 'LOSS' else 0, pnl, pips))
-            conn.commit()
+    def update_result(self, signal_id: int, exit_price: float, result: str, pnl: float, pips: float):
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                conn.execute('''
+                    UPDATE signals SET exit_price=?, result=?, pnl_percent=?, pnl_pips=?,
+                    exit_time=datetime('now', 'localtime') WHERE id=?
+                ''', (exit_price, result, pnl, pips, signal_id))
+                conn.commit()
+        except:
+            pass
     
     def check_active_signal(self, symbol: str) -> bool:
-        with sqlite3.connect(self.db_path) as conn:
-            count = conn.execute('''
-                SELECT COUNT(*) FROM signals WHERE symbol=? AND result='PENDING' 
-                AND expiry_time > datetime('now', 'localtime')
-            ''', (symbol,)).fetchone()[0]
-            return count > 0
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                count = conn.execute('''
+                    SELECT COUNT(*) FROM signals WHERE symbol=? AND result='PENDING' 
+                    AND expiry_time > datetime('now', 'localtime')
+                ''', (symbol,)).fetchone()[0]
+                return count > 0
+        except:
+            return True
     
     def check_recent_signal(self, symbol: str, minutes: int) -> bool:
-        cutoff = (datetime.now() - timedelta(minutes=minutes)).strftime('%Y-%m-%d %H:%M:%S')
-        with sqlite3.connect(self.db_path) as conn:
-            count = conn.execute('''
-                SELECT COUNT(*) FROM signals WHERE symbol=? AND entry_time > ?
-            ''', (symbol, cutoff)).fetchone()[0]
-            return count > 0
+        try:
+            cutoff = (datetime.now() - timedelta(minutes=minutes)).strftime('%Y-%m-%d %H:%M:%S')
+            with sqlite3.connect(self.db_path) as conn:
+                count = conn.execute('''
+                    SELECT COUNT(*) FROM signals WHERE symbol=? AND entry_time > ?
+                ''', (symbol, cutoff)).fetchone()[0]
+                return count > 0
+        except:
+            return True
     
     def get_pending_trades(self) -> List[Dict]:
-        with sqlite3.connect(self.db_path) as conn:
-            conn.row_factory = sqlite3.Row
-            rows = conn.execute('''
-                SELECT * FROM signals WHERE result='PENDING' 
-                AND expiry_time <= datetime('now', 'localtime')
-            ''').fetchall()
-            return [dict(r) for r in rows]
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                conn.row_factory = sqlite3.Row
+                rows = conn.execute('''
+                    SELECT * FROM signals WHERE result='PENDING' 
+                    AND expiry_time <= datetime('now', 'localtime')
+                ''').fetchall()
+                return [dict(r) for r in rows]
+        except:
+            return []
     
     def get_stats(self) -> Dict:
-        with sqlite3.connect(self.db_path) as conn:
-            total = conn.execute("SELECT COUNT(*) FROM signals WHERE result!='PENDING'").fetchone()[0]
-            wins = conn.execute("SELECT COUNT(*) FROM signals WHERE result='WIN'").fetchone()[0]
-            total_pnl = conn.execute("SELECT SUM(pnl_percent) FROM signals WHERE result!='PENDING'").fetchone()[0] or 0
-            total_pips = conn.execute("SELECT SUM(pnl_pips) FROM signals WHERE result!='PENDING'").fetchone()[0] or 0
-            buys = conn.execute("SELECT COUNT(*) FROM signals WHERE result!='PENDING' AND direction='BUY'").fetchone()[0]
-            sells = conn.execute("SELECT COUNT(*) FROM signals WHERE result!='PENDING' AND direction='SELL'").fetchone()[0]
-            
-            return {
-                'total': total, 'wins': wins, 'losses': total-wins,
-                'win_rate': wins/total if total > 0 else 0,
-                'total_pnl': total_pnl, 'total_pips': total_pips,
-                'buy_count': buys, 'sell_count': sells
-            }
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                total = conn.execute("SELECT COUNT(*) FROM signals WHERE result!='PENDING'").fetchone()[0]
+                wins = conn.execute("SELECT COUNT(*) FROM signals WHERE result='WIN'").fetchone()[0]
+                total_pnl = conn.execute("SELECT SUM(pnl_percent) FROM signals WHERE result!='PENDING'").fetchone()[0] or 0
+                total_pips = conn.execute("SELECT SUM(pnl_pips) FROM signals WHERE result!='PENDING'").fetchone()[0] or 0
+                buys = conn.execute("SELECT COUNT(*) FROM signals WHERE result!='PENDING' AND direction='BUY'").fetchone()[0]
+                sells = conn.execute("SELECT COUNT(*) FROM signals WHERE result!='PENDING' AND direction='SELL'").fetchone()[0]
+                
+                return {
+                    'total': total, 'wins': wins, 'losses': total-wins,
+                    'win_rate': wins/total if total > 0 else 0,
+                    'total_pnl': total_pnl, 'total_pips': total_pips,
+                    'buy_count': buys, 'sell_count': sells
+                }
+        except:
+            return {'total': 0, 'wins': 0, 'losses': 0, 'win_rate': 0, 
+                    'total_pnl': 0, 'total_pips': 0, 'buy_count': 0, 'sell_count': 0}
 
 # ============================================================================
 # FEATURES
@@ -344,7 +349,7 @@ def calculate_features(df: pd.DataFrame) -> pd.DataFrame:
     return f.replace([np.inf, -np.inf], np.nan).ffill().bfill().fillna(0)
 
 # ============================================================================
-# BALANCED TARGET
+# TARGET
 # ============================================================================
 
 def create_balanced_target(df: pd.DataFrame, periods: int) -> pd.Series:
@@ -371,7 +376,7 @@ def create_balanced_target(df: pd.DataFrame, periods: int) -> pd.Series:
     return target
 
 # ============================================================================
-# ENSEMBLE MODEL
+# MODEL
 # ============================================================================
 
 class EnsembleModel:
@@ -406,8 +411,6 @@ class EnsembleModel:
         try:
             if len(df) < self.config.MIN_TRAINING_SAMPLES:
                 return False
-            
-            self.logger.info(f"🎓 {self.symbol}: {len(df)} عينة...")
             
             features = calculate_features(df)
             target = create_balanced_target(df, self.config.FORECAST_PERIODS)
@@ -455,29 +458,22 @@ class EnsembleModel:
             self.is_trained = True
             self.version = datetime.now().strftime('v%Y%m%d_%H%M%S')
             
-            meta_pred = self.meta_model.predict(base_preds)
-            acc = accuracy_score(y_val, meta_pred)
-            
-            self.logger.info(f"✅ {self.symbol}: دقة={acc:.1%}, BUY/SELL={buy_pct:.1%}/{1-buy_pct:.1%}")
             return True
             
         except Exception as e:
-            self.logger.error(f"❌ {self.symbol}: {e}")
+            self.logger.error(f"Train {self.symbol}: {e}")
             return False
     
-    def predict(self, df: pd.DataFrame, threshold: float = 0.70) -> Tuple[str, float, float, float, int]:
-        """
-        ✅ يرجع: (الاتجاه, الثقة, proba_buy, proba_sell, عدد النماذج الموافقة)
-        """
+    def predict(self, df: pd.DataFrame, threshold: float = 0.70) -> Tuple[str, float, int]:
         if not self.is_trained:
-            return "NEUTRAL", 0.0, 0.0, 0.0, 0
+            return "NEUTRAL", 0.0, 0
         
         try:
             features = calculate_features(df).iloc[[-1]]
             available = [f for f in self.selected_features if f in features.columns]
             
             if len(available) < 10:
-                return "NEUTRAL", 0.0, 0.0, 0.0, 0
+                return "NEUTRAL", 0.0, 0
             
             X = features[available].fillna(0)
             X_s = self.scaler.transform(X)
@@ -496,7 +492,6 @@ class EnsembleModel:
             
             proba_buy = float(self.meta_model.predict_proba(np.array([base_probas]))[0, 1])
             
-            # ✅ تعديل حسب نسبة البيانات
             if self.buy_sell_ratio > 1.3:
                 proba_buy *= 0.95
             elif self.buy_sell_ratio < 0.7:
@@ -505,19 +500,18 @@ class EnsembleModel:
             proba_buy = np.clip(proba_buy, 0.05, 0.95)
             proba_sell = 1 - proba_buy
             
-            # ✅ عدد النماذج الموافقة
             buy_votes = sum(model_votes)
             sell_votes = len(model_votes) - buy_votes
             
             if proba_buy > threshold and buy_votes >= self.config.ENSEMBLE_AGREEMENT:
-                return "BUY", proba_buy, proba_buy, proba_sell, buy_votes
+                return "BUY", proba_buy, buy_votes
             elif proba_sell > threshold and sell_votes >= self.config.ENSEMBLE_AGREEMENT:
-                return "SELL", proba_sell, proba_buy, proba_sell, sell_votes
+                return "SELL", proba_sell, sell_votes
             
-            return "NEUTRAL", max(proba_buy, proba_sell), proba_buy, proba_sell, max(buy_votes, sell_votes)
+            return "NEUTRAL", max(proba_buy, proba_sell), max(buy_votes, sell_votes)
             
         except:
-            return "NEUTRAL", 0.0, 0.0, 0.0, 0
+            return "NEUTRAL", 0.0, 0
     
     def save(self):
         path = os.path.join(self.config.MODELS_DIR, self.symbol)
@@ -548,7 +542,7 @@ class EnsembleModel:
         return True
 
 # ============================================================================
-# MAIN BOT
+# MAIN BOT WITH AUTO-RESTART
 # ============================================================================
 
 class FalconProBot:
@@ -571,6 +565,9 @@ class FalconProBot:
         
         self.running = False
         self.last_retrain = None
+        self.last_heartbeat = datetime.now()
+        self.error_count = 0
+        self.max_errors = 10  # لو زادت الأخطاء عن كده، يتعاد تشغيل البوت
     
     def _remove_webhook(self):
         try:
@@ -587,24 +584,14 @@ class FalconProBot:
             trained = sum(1 for m in self.models.values() if m.is_trained)
             can_trade, reason = MarketFilter.can_trade()
             stats = self.db.get_stats()
-            text = (f"🦅 **Falcon Pro v5**\n"
+            text = (f"🦅 **Falcon Pro v5.1**\n"
                    f"✅ نماذج: {trained}/{len(self.models)}\n"
                    f"📊 صفقات: {stats['total']}\n"
                    f"📈 نجاح: {stats['win_rate']:.1%}\n"
                    f"💰 ربح: {stats['total_pnl']:.2f}% | {stats['total_pips']:.0f} نقطة\n"
-                   f"🟢 شراء: {stats['buy_count']} | 🔴 بيع: {stats['sell_count']}\n"
-                   f"🚦 التداول: {'✅ مسموح' if can_trade else '⛔ ' + reason}")
+                   f"🚦 التداول: {'✅' if can_trade else '⛔ ' + reason}\n"
+                   f"❤️ نبض: {datetime.now().strftime('%H:%M:%S')}")
             self.tb.reply_to(msg, text, parse_mode='Markdown')
-        
-        @self.tb.message_handler(commands=['stats'])
-        def stats_cmd(msg):
-            if str(msg.chat.id) != self.config.TELEGRAM_CHAT_ID:
-                return
-            s = self.db.get_stats()
-            self.tb.reply_to(msg, 
-                f"📊 {s['total']} | ✅ {s['wins']} | 📈 {s['win_rate']:.1%}\n"
-                f"💰 {s['total_pnl']:.2f}% | 📊 {s['total_pips']:.0f} نقطة\n"
-                f"🟢 {s['buy_count']} | 🔴 {s['sell_count']}")
     
     def fetch_data(self, symbol: str, interval: str = '5m', period: str = '5d') -> Optional[pd.DataFrame]:
         for attempt in range(self.config.MAX_RETRIES):
@@ -618,8 +605,7 @@ class FalconProBot:
                     time.sleep(self.config.RETRY_DELAY)
         return None
     
-    def calculate_sl_tp(self, symbol: str, entry: float, direction: str, atr: float) -> Tuple[float, float]:
-        """✅ حساب Stop Loss و Take Profit"""
+    def calculate_sl_tp(self, symbol: str, entry: float, direction: str) -> Tuple[float, float]:
         pip_value = 0.01 if 'JPY' in symbol else 0.0001
         
         if direction == 'BUY':
@@ -633,7 +619,6 @@ class FalconProBot:
     
     def analyze_symbol(self, symbol: str) -> Optional[Dict]:
         try:
-            # ✅ فلتر السوق أول حاجة
             can_trade, reason = MarketFilter.can_trade()
             if not can_trade:
                 return None
@@ -654,11 +639,9 @@ class FalconProBot:
             if df_5m is None or df_15m is None:
                 return None
             
-            # ✅ تنبؤات مع عدد النماذج الموافقة
-            dir_5m, conf_5m, pb_5m, ps_5m, votes_5m = model.predict(df_5m, self.config.CONFIDENCE_THRESHOLD)
-            dir_15m, conf_15m, pb_15m, ps_15m, votes_15m = model.predict(df_15m, self.config.CONFIDENCE_THRESHOLD)
+            dir_5m, conf_5m, votes_5m = model.predict(df_5m, self.config.CONFIDENCE_THRESHOLD)
+            dir_15m, conf_15m, votes_15m = model.predict(df_15m, self.config.CONFIDENCE_THRESHOLD)
             
-            # ✅ Triple confirmation: M5 + M15 + Models
             if dir_5m != dir_15m or dir_5m == "NEUTRAL":
                 return None
             
@@ -666,20 +649,14 @@ class FalconProBot:
                 return None
             
             confidence = (conf_5m + conf_15m) / 2
-            proba_buy = (pb_5m + pb_15m) / 2
-            proba_sell = (ps_5m + ps_15m) / 2
             
             if confidence < self.config.CONFIDENCE_THRESHOLD:
                 return None
             
             entry_price = float(df_5m['Close'].iloc[-1])
-            atr = float(df_15m['High'].iloc[-1] - df_15m['Low'].iloc[-1])
+            stop_loss, take_profit = self.calculate_sl_tp(symbol, entry_price, dir_5m)
             
-            # ✅ حساب SL/TP
-            stop_loss, take_profit = self.calculate_sl_tp(symbol, entry_price, dir_5m, atr)
-            
-            self.logger.info(f"🎯 {symbol}: {dir_5m} | ثقة={confidence:.1%} | "
-                           f"نماذج={votes_5m}+{votes_15m} | SL={stop_loss:.5f} | TP={take_profit:.5f}")
+            self.logger.info(f"🎯 {symbol}: {dir_5m} | ثقة={confidence:.1%} | نماذج={votes_5m}+{votes_15m}")
             
             return {
                 'symbol': symbol,
@@ -688,9 +665,6 @@ class FalconProBot:
                 'stop_loss': stop_loss,
                 'take_profit': take_profit,
                 'confidence': confidence,
-                'proba_buy': proba_buy,
-                'proba_sell': proba_sell,
-                'votes': f"{votes_5m}+{votes_15m}",
                 'expiry_time': (datetime.now() + timedelta(minutes=self.config.TRADE_DURATION_MINUTES)).strftime('%Y-%m-%d %H:%M:%S')
             }
             
@@ -704,19 +678,16 @@ class FalconProBot:
             direction = "شراء ▲" if signal['direction'] == 'BUY' else "بيع ▼"
             
             msg = (f"{emoji} **{signal['symbol']}** - {direction}\n\n"
-                   f"💰 الدخول: {signal['entry_price']:.5f}\n"
-                   f"🛑 إيقاف خسارة: {signal['stop_loss']:.5f}\n"
-                   f"🎯 هدف ربح: {signal['take_profit']:.5f}\n"
-                   f"⏳ المدة: {self.config.TRADE_DURATION_MINUTES} د\n"
-                   f"💪 الثقة: {signal['confidence']:.1%}\n"
-                   f"🗳 النماذج: {signal['votes']}/8\n"
-                   f"📊 P(BUY): {signal['proba_buy']:.1%} | P(SELL): {signal['proba_sell']:.1%}\n\n"
-                   f"🤖 Falcon Pro v5")
+                   f"💰 دخول: {signal['entry_price']:.5f}\n"
+                   f"🛑 SL: {signal['stop_loss']:.5f}\n"
+                   f"🎯 TP: {signal['take_profit']:.5f}\n"
+                   f"⏳ {self.config.TRADE_DURATION_MINUTES} د | 💪 {signal['confidence']:.1%}\n\n"
+                   f"🤖 Falcon Pro v5.1")
             
             self.tb.send_message(self.config.TELEGRAM_CHAT_ID, msg, parse_mode='Markdown')
-            self.logger.info(f"✅ إشارة: {signal['symbol']} {signal['direction']} | SL={signal['stop_loss']:.5f}")
-        except:
-            pass
+            self.logger.info(f"✅ إشارة: {signal['symbol']} {signal['direction']}")
+        except Exception as e:
+            self.logger.error(f"Send error: {e}")
     
     def check_trades(self):
         for trade in self.db.get_pending_trades():
@@ -729,7 +700,6 @@ class FalconProBot:
                 entry = trade['entry_price']
                 direction = trade['direction']
                 
-                # ✅ حساب النقاط
                 pip_value = 0.01 if 'JPY' in trade['symbol'] else 0.0001
                 
                 if direction == 'BUY':
@@ -741,26 +711,11 @@ class FalconProBot:
                     pips = (entry - current) / pip_value
                     result = 'WIN' if current < entry else 'LOSS'
                 
-                self.db.update_result(trade['id'], current, result, pnl, round(pips, 1), trade['symbol'])
+                self.db.update_result(trade['id'], current, result, pnl, round(pips, 1))
+                self.logger.info(f"{'✅' if result == 'WIN' else '❌'} {trade['symbol']}: {result} | {pnl:+.2f}% | {pips:+.1f}p")
                 
-                emoji = "✅" if result == 'WIN' else "❌"
-                self.logger.info(f"{emoji} {trade['symbol']}: {result} | {pnl:+.2f}% | {pips:+.1f} نقطة")
-                
-                # ✅ إرسال إشعار بالنتيجة
-                try:
-                    self.tb.send_message(
-                        self.config.TELEGRAM_CHAT_ID,
-                        f"{emoji} **{trade['symbol']}** - {trade['direction']}\n"
-                        f"النتيجة: {result}\n"
-                        f"الربح/الخسارة: {pnl:+.2f}% | {pips:+.1f} نقطة\n"
-                        f"{entry:.5f} → {current:.5f}",
-                        parse_mode='Markdown'
-                    )
-                except:
-                    pass
-                
-            except:
-                pass
+            except Exception as e:
+                self.logger.error(f"Check trade error: {e}")
     
     def scan_markets(self):
         futures = {self.executor.submit(self.analyze_symbol, s): s for s in self.config.SYMBOLS}
@@ -777,7 +732,6 @@ class FalconProBot:
     
     def train_all_models(self):
         self.logger.info("🎓 تدريب...")
-        
         for symbol in self.config.SYMBOLS:
             try:
                 df = None
@@ -799,92 +753,193 @@ class FalconProBot:
                 self.logger.error(f"Train {symbol}: {e}")
         
         self.last_retrain = datetime.now()
-        
-        trained = sum(1 for m in self.models.values() if m.is_trained)
-        try:
-            self.tb.send_message(self.config.TELEGRAM_CHAT_ID,
-                f"🎓 **تدريب مكتمل**\n✅ {trained}/{len(self.config.SYMBOLS)}",
-                parse_mode='Markdown')
-        except:
-            pass
     
     def start_telegram(self):
         def poll():
+            self.logger.info("📡 Telegram polling started")
             while True:
                 try:
                     self.tb.infinity_polling(timeout=10, long_polling_timeout=5)
-                except:
+                except Exception as e:
+                    self.logger.error(f"Polling error: {e}")
                     time.sleep(10)
+        
         threading.Thread(target=poll, daemon=True).start()
     
+    def run_safely(self):
+        """
+        ✅ الدورة الرئيسية مع حماية من التوقف
+        """
+        cycle_count = 0
+        
+        while self.running:
+            try:
+                cycle_count += 1
+                
+                # ✅ تحديث النبض
+                update_heartbeat()
+                
+                # ✅ فحص الصفقات المنتهية
+                self.check_trades()
+                
+                # ✅ مسح الأسواق
+                signals = self.scan_markets()
+                
+                # ✅ إعادة تدريب إذا لزم
+                if (datetime.now() - self.last_retrain).total_seconds() > 86400:
+                    self.train_all_models()
+                
+                # ✅ إعادة ضبط عداد الأخطاء كل دورة ناجحة
+                self.error_count = 0
+                
+                self.logger.info(f"✅ دورة #{cycle_count} | إشارات: {signals} | نوم {self.config.SCAN_INTERVAL_MINUTES}د")
+                
+                time.sleep(self.config.SCAN_INTERVAL_MINUTES * 60)
+                
+            except KeyboardInterrupt:
+                self.logger.info("🛑 إيقاف يدوي")
+                self.running = False
+                break
+            except Exception as e:
+                self.error_count += 1
+                self.logger.error(f"❌ خطأ في الدورة #{cycle_count} (#{self.error_count}): {e}")
+                self.logger.error(traceback.format_exc())
+                
+                # ✅ لو الأخطاء كتير، نعيد تشغيل المكونات
+                if self.error_count >= self.max_errors:
+                    self.logger.warning("⚠️ أخطاء كثيرة جداً! إعادة تهيئة...")
+                    self._restart_components()
+                    self.error_count = 0
+                
+                time.sleep(30)
+    
+    def _restart_components(self):
+        """✅ إعادة تشغيل المكونات الأساسية"""
+        try:
+            self.logger.info("🔄 إعادة تشغيل المكونات...")
+            
+            # إعادة تشغيل ThreadPool
+            self.executor.shutdown(wait=False)
+            self.executor = ThreadPoolExecutor(max_workers=self.config.MAX_WORKERS)
+            
+            # إعادة تحميل النماذج
+            for symbol in self.config.SYMBOLS:
+                try:
+                    model = EnsembleModel(symbol, self.config, self.logger)
+                    if model.load():
+                        self.models[symbol] = model
+                except:
+                    pass
+            
+            # إعادة تشغيل Telegram
+            self._remove_webhook()
+            self.start_telegram()
+            
+            self.logger.info("✅ تمت إعادة التشغيل")
+            
+            # إرسال إشعار
+            try:
+                self.tb.send_message(self.config.TELEGRAM_CHAT_ID, 
+                    "🔄 **إعادة تشغيل تلقائية**\n✅ تم استعادة البوت",
+                    parse_mode='Markdown')
+            except:
+                pass
+            
+        except Exception as e:
+            self.logger.error(f"فشل إعادة التشغيل: {e}")
+    
     def run(self):
+        """
+        ✅ نقطة الدخول الرئيسية مع حماية كاملة
+        """
         self.running = True
         
         self.logger.info("=" * 50)
-        self.logger.info("🦅 Falcon AI Pro v5.0 - Risk Managed")
-        self.logger.info(f"🛑 Stop Loss: {self.config.MAX_PIPS_STOP_LOSS} pips")
-        self.logger.info(f"📊 Risk/Reward: 1:{self.config.MIN_RISK_REWARD}")
-        self.logger.info(f"🗳 Ensemble Agreement: {self.config.ENSEMBLE_AGREEMENT}/4")
-        self.logger.info(f"🚦 News & Liquidity Filters: ACTIVE")
+        self.logger.info("🦅 Falcon AI Pro v5.1 - Auto Restart")
+        self.logger.info(f"🛡️ Max Errors: {self.max_errors}")
+        self.logger.info(f"❤️ Heartbeat: {HEARTBEAT_FILE}")
         self.logger.info("=" * 50)
         
+        # ✅ بدء Telegram
         self.start_telegram()
         time.sleep(2)
         
+        # ✅ تدريب أولي
         if not any(m.is_trained for m in self.models.values()):
             self.train_all_models()
         
         self.last_retrain = datetime.now()
         
+        # ✅ إشعار بدء التشغيل
         try:
             trained = sum(1 for m in self.models.values() if m.is_trained)
             self.tb.send_message(self.config.TELEGRAM_CHAT_ID,
-                f"🦅 **Falcon Pro v5**\n✅ {trained}/{len(self.config.SYMBOLS)}\n"
-                f"🛑 SL: {self.config.MAX_PIPS_STOP_LOSS}pips\n"
-                f"🚦 Filters Active\n⚡️ Scanning...",
+                f"🦅 **Falcon Pro v5.1**\n✅ {trained}/{len(self.config.SYMBOLS)}\n🛡️ Auto-Restart Active\n⚡️ Scanning...",
                 parse_mode='Markdown')
         except:
             pass
         
-        while self.running:
-            try:
-                self.check_trades()
-                self.scan_markets()
-                
-                if (datetime.now() - self.last_retrain).total_seconds() > 86400:
-                    self.train_all_models()
-                
-                time.sleep(self.config.SCAN_INTERVAL_MINUTES * 60)
-            except KeyboardInterrupt:
-                break
-            except Exception as e:
-                self.logger.error(f"Loop: {e}")
-                time.sleep(30)
+        # ✅ تشغيل الدورة الرئيسية مع حماية
+        self.run_safely()
         
+        # ✅ تنظيف عند الخروج
         self.executor.shutdown(wait=True)
+        self.logger.info("🛑 تم إيقاف البوت")
 
 # ============================================================================
-# LOGGING
+# WATCHDOG - خارجي
 # ============================================================================
 
-def setup_logging(config: Config) -> logging.Logger:
-    logging.basicConfig(
-        level=logging.INFO,
-        format='%(asctime)s | %(levelname)-7s | %(message)s',
-        datefmt='%H:%M:%S',
-        handlers=[
-            logging.FileHandler(config.LOG_FILE, encoding='utf-8'),
-            logging.StreamHandler(sys.stdout)
-        ]
-    )
-    return logging.getLogger('FalconPro')
+def watchdog_loop(bot_instance):
+    """
+    ✅ مراقب خارجي - لو البوت وقف، يرجعه
+    """
+    while True:
+        try:
+            time.sleep(60)  # فحص كل دقيقة
+            
+            if not check_heartbeat():
+                print("⚠️ النبض مفقود! محاولة إعادة التشغيل...")
+                
+                # محاولة إعادة تشغيل البوت
+                try:
+                    bot_instance._restart_components()
+                    update_heartbeat()
+                except:
+                    pass
+                    
+        except:
+            pass
 
 # ============================================================================
-# RUN
+# MAIN
 # ============================================================================
+
+def main():
+    """✅ الدالة الرئيسية مع إعادة تشغيل لا نهائية"""
+    while True:
+        try:
+            config = Config()
+            os.makedirs(config.MODELS_DIR, exist_ok=True)
+            
+            bot = FalconProBot(config)
+            
+            # ✅ بدء المراقب الخارجي في Thread منفصل
+            watchdog_thread = threading.Thread(target=watchdog_loop, args=(bot,), daemon=True)
+            watchdog_thread.start()
+            
+            # ✅ تشغيل البوت
+            bot.run()
+            
+        except KeyboardInterrupt:
+            print("🛑 إيقاف نهائي")
+            sys.exit(0)
+        except Exception as e:
+            print(f"❌ خطأ مميت: {e}")
+            traceback.print_exc()
+            print("🔄 إعادة التشغيل خلال 10 ثواني...")
+            time.sleep(10)
+            # ✅ إعادة التشغيل تلقائياً
 
 if __name__ == "__main__":
-    os.makedirs('models', exist_ok=True)
-    config = Config()
-    bot = FalconProBot(config)
-    bot.run()
+    main()
