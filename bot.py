@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """
-Falcon AI Pro v5.3 - Continuous Monitoring
-============================================
-No sleep. Always watching. Instant signals.
+Falcon AI Pro v5.4 - Clean Signals
+====================================
+Simple, clean signal format.
+30-second continuous scanning.
 """
 
 import os
@@ -49,7 +50,7 @@ warnings.filterwarnings('ignore')
 os.environ['OMP_NUM_THREADS'] = '2'
 
 # ============================================================================
-# CONFIG - NO SLEEP MODE
+# CONFIG
 # ============================================================================
 
 @dataclass
@@ -57,13 +58,8 @@ class Config:
     TELEGRAM_TOKEN: str = os.environ.get('TELEGRAM_TOKEN', '8773849578:AAH9a6-8hU5YFYTad2EA5jQyfffIoeL8npk')
     TELEGRAM_CHAT_ID: str = os.environ.get('TELEGRAM_CHAT_ID', '7553333305')
     
-    MAX_PIPS_STOP_LOSS: int = 15
-    MIN_RISK_REWARD: float = 1.5
     TRADE_DURATION_MINUTES: int = 10
-    
-    # ✅ بدل ما ينام 3 دقائق، يفحص كل 30 ثانية
-    SCAN_INTERVAL_SECONDS: int = 30  # فحص كل 30 ثانية
-    CANDLE_CLOSE_BUFFER: int = 10  # انتظار 10 ثواني بعد إغلاق الشمعة
+    SCAN_INTERVAL_SECONDS: int = 30
     
     SYMBOLS: List[str] = field(default_factory=lambda: [
         'EURUSD=X', 'GBPUSD=X', 'USDJPY=X', 'AUDUSD=X',
@@ -73,10 +69,10 @@ class Config:
     TRAINING_PERIOD_1H: str = '6mo'
     TRAINING_PERIOD_15M: str = '1mo'
     
-    CONFIDENCE_THRESHOLD: float = 0.65  # أقل شوية عشان إشارات أكثر
-    ENSEMBLE_AGREEMENT: int = 2  # 2 من 4 بدل 3
+    CONFIDENCE_THRESHOLD: float = 0.60
+    ENSEMBLE_AGREEMENT: int = 2
     MIN_TRAINING_SAMPLES: int = 500
-    MAX_FEATURES: int = 50  # أقل عشان أسرع
+    MAX_FEATURES: int = 50
     FORECAST_PERIODS: int = 5
     
     DB_PATH: str = 'falcon_trading.db'
@@ -84,8 +80,8 @@ class Config:
     
     MAX_RETRIES: int = 3
     RETRY_DELAY: int = 3
-    MAX_WORKERS: int = 4  # عمال أكتر عشان فحص أسرع
-    SIGNAL_COOLDOWN_MINUTES: int = 8  # تهدئة أقل
+    MAX_WORKERS: int = 4
+    SIGNAL_COOLDOWN_MINUTES: int = 8
     
     LOG_FILE: str = 'falcon_bot.log'
 
@@ -155,10 +151,9 @@ class Database:
                 CREATE TABLE IF NOT EXISTS signals (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     symbol TEXT, direction TEXT, entry_price REAL,
-                    stop_loss REAL, take_profit REAL,
                     confidence REAL, entry_time DATETIME DEFAULT CURRENT_TIMESTAMP,
                     expiry_time DATETIME, result TEXT DEFAULT 'PENDING',
-                    pnl_percent REAL, pnl_pips REAL, signal_hash TEXT UNIQUE
+                    pnl_percent REAL, signal_hash TEXT UNIQUE
                 )
             ''')
             conn.commit()
@@ -170,23 +165,21 @@ class Database:
             with sqlite3.connect(self.db_path) as conn:
                 conn.execute('''
                     INSERT OR IGNORE INTO signals 
-                    (symbol, direction, entry_price, stop_loss, take_profit,
-                     confidence, expiry_time, signal_hash)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    (symbol, direction, entry_price, confidence, expiry_time, signal_hash)
+                    VALUES (?, ?, ?, ?, ?, ?)
                 ''', (data['symbol'], data['direction'], data['entry_price'],
-                      data.get('stop_loss'), data.get('take_profit'),
                       data['confidence'], data['expiry_time'], signal_hash))
                 conn.commit()
                 return conn.execute('SELECT last_insert_rowid()').fetchone()[0]
         except:
             return None
     
-    def update_result(self, signal_id: int, exit_price: float, result: str, pnl: float, pips: float):
+    def update_result(self, signal_id: int, exit_price: float, result: str, pnl: float):
         with sqlite3.connect(self.db_path) as conn:
             conn.execute('''
-                UPDATE signals SET exit_price=?, result=?, pnl_percent=?, pnl_pips=?,
+                UPDATE signals SET exit_price=?, result=?, pnl_percent=?,
                 exit_time=datetime('now', 'localtime') WHERE id=?
-            ''', (exit_price, result, pnl, pips, signal_id))
+            ''', (exit_price, result, pnl, signal_id))
             conn.commit()
     
     def check_active_signal(self, symbol: str) -> bool:
@@ -219,11 +212,10 @@ class Database:
             total = conn.execute("SELECT COUNT(*) FROM signals WHERE result!='PENDING'").fetchone()[0]
             wins = conn.execute("SELECT COUNT(*) FROM signals WHERE result='WIN'").fetchone()[0]
             total_pnl = conn.execute("SELECT SUM(pnl_percent) FROM signals WHERE result!='PENDING'").fetchone()[0] or 0
-            total_pips = conn.execute("SELECT SUM(pnl_pips) FROM signals WHERE result!='PENDING'").fetchone()[0] or 0
             return {
                 'total': total, 'wins': wins, 'losses': total-wins,
                 'win_rate': wins/total if total > 0 else 0,
-                'total_pnl': total_pnl, 'total_pips': total_pips
+                'total_pnl': total_pnl
             }
 
 # ============================================================================
@@ -245,77 +237,7 @@ class MarketFilter:
         return True, "مسموح"
 
 # ============================================================================
-# CANDLE TIMER - أهم حاجة!
-# ============================================================================
-
-class CandleTimer:
-    """
-    ✅ يتأكد إن الإشارة بتطلع فور إغلاق الشمعة
-    مش اثناء النوم ولا بعد فوات الأوان
-    """
-    
-    @staticmethod
-    def seconds_to_next_candle(interval_minutes: int = 5) -> int:
-        """كم ثانية باقية على إغلاق الشمعة القادمة"""
-        now = datetime.utcnow()
-        current_minute = now.minute
-        current_second = now.second
-        
-        # الشمعة القادمة
-        next_candle_minute = ((current_minute // interval_minutes) + 1) * interval_minutes
-        
-        if next_candle_minute >= 60:
-            next_candle_minute = 0
-        
-        # الوقت المتبقي
-        if next_candle_minute > current_minute:
-            minutes_left = next_candle_minute - current_minute - 1
-            seconds_left = 60 - current_second
-        else:
-            minutes_left = (60 - current_minute) + next_candle_minute - 1
-            seconds_left = 60 - current_second
-        
-        total_seconds = minutes_left * 60 + seconds_left
-        
-        return max(0, total_seconds)
-    
-    @staticmethod
-    def is_candle_just_closed(interval_minutes: int = 5, buffer_seconds: int = 15) -> bool:
-        """
-        ✅ هل الشمعة لسه مقفلة حالاً؟
-        لو أيوه، ده أفضل وقت للإشارة
-        """
-        now = datetime.utcnow()
-        current_minute = now.minute
-        current_second = now.second
-        
-        # لو في أول buffer_seconds بعد إغلاق الشمعة
-        if current_minute % interval_minutes == 0 and current_second <= buffer_seconds:
-            return True
-        
-        return False
-    
-    @staticmethod
-    def wait_for_candle_close(interval_minutes: int = 5):
-        """
-        ✅ يستنى لحد ما الشمعة تقفل بالضبط
-        عشان الإشارة تكون في التوقيت المثالي
-        """
-        seconds = CandleTimer.seconds_to_next_candle(interval_minutes)
-        
-        if seconds > 10:
-            # لسه في وقت - استنى لحد ما يبقى 5 ثواني على الإغلاق
-            time.sleep(max(0, seconds - 5))
-        
-        # انتظر لحد ما الثواني تبقى 0-10 (وقت الإغلاق)
-        while True:
-            now = datetime.utcnow()
-            if now.second <= 10 and now.minute % interval_minutes == 0:
-                break
-            time.sleep(0.5)
-
-# ============================================================================
-# FEATURES (FAST VERSION)
+# FEATURES
 # ============================================================================
 
 def calculate_features(df: pd.DataFrame) -> pd.DataFrame:
@@ -473,16 +395,16 @@ class EnsembleModel:
         except:
             return False
     
-    def predict(self, df: pd.DataFrame, threshold: float = 0.65) -> Tuple[str, float, int]:
+    def predict(self, df: pd.DataFrame, threshold: float = 0.60) -> Tuple[str, float]:
         if not self.is_trained:
-            return "NEUTRAL", 0.0, 0
+            return "NEUTRAL", 0.0
         
         try:
             features = calculate_features(df).iloc[[-1]]
             available = [f for f in self.selected_features if f in features.columns]
             
             if len(available) < 10:
-                return "NEUTRAL", 0.0, 0
+                return "NEUTRAL", 0.0
             
             X = features[available].fillna(0)
             X_s = self.scaler.transform(X)
@@ -502,14 +424,14 @@ class EnsembleModel:
             proba_buy = float(self.meta_model.predict_proba(np.array([base_probas]))[0, 1])
             
             if proba_buy > threshold and votes >= self.config.ENSEMBLE_AGREEMENT:
-                return "BUY", proba_buy, votes
+                return "BUY", proba_buy
             elif (1 - proba_buy) > threshold and (len(self.calibrators) - votes) >= self.config.ENSEMBLE_AGREEMENT:
-                return "SELL", 1 - proba_buy, len(self.calibrators) - votes
+                return "SELL", 1 - proba_buy
             
-            return "NEUTRAL", max(proba_buy, 1 - proba_buy), max(votes, len(self.calibrators) - votes)
+            return "NEUTRAL", max(proba_buy, 1 - proba_buy)
             
         except:
-            return "NEUTRAL", 0.0, 0
+            return "NEUTRAL", 0.0
     
     def save(self):
         path = os.path.join(self.config.MODELS_DIR, self.symbol)
@@ -538,7 +460,7 @@ class EnsembleModel:
         return True
 
 # ============================================================================
-# MAIN BOT - NO SLEEP
+# MAIN BOT
 # ============================================================================
 
 class FalconProBot:
@@ -563,7 +485,7 @@ class FalconProBot:
         
         self.running = False
         self.last_retrain = None
-        self.last_scan_time = {}  # ✅ متى آخر مرة فحصنا كل زوج
+        self.last_scan_time = {}
     
     def _setup_commands(self):
         @self.tb.message_handler(commands=['start', 'status'])
@@ -573,12 +495,11 @@ class FalconProBot:
             trained = sum(1 for m in self.models.values() if m.is_trained)
             stats = self.db.get_stats()
             can_trade, reason = MarketFilter.can_trade()
-            text = (f"🦅 **Falcon Pro v5.3**\n"
+            text = (f"🦅 **Falcon Pro**\n"
                    f"✅ نماذج: {trained}/{len(self.models)}\n"
                    f"📊 صفقات: {stats['total']}\n"
                    f"📈 نجاح: {stats['win_rate']:.1%}\n"
-                   f"💰 ربح: {stats['total_pnl']:.2f}% | {stats['total_pips']:.0f}p\n"
-                   f"🔄 فحص: كل {self.config.SCAN_INTERVAL_SECONDS}ث\n"
+                   f"💰 ربح: {stats['total_pnl']:.2f}%\n"
                    f"🚦 {'✅' if can_trade else '⛔ '+reason}")
             self.tb.reply_to(msg, text, parse_mode='Markdown')
     
@@ -594,18 +515,6 @@ class FalconProBot:
                     time.sleep(self.config.RETRY_DELAY)
         return None
     
-    def calculate_sl_tp(self, symbol: str, entry: float, direction: str) -> Tuple[float, float]:
-        pip_value = 0.01 if 'JPY' in symbol else 0.0001
-        
-        if direction == 'BUY':
-            stop_loss = entry - (self.config.MAX_PIPS_STOP_LOSS * pip_value)
-            take_profit = entry + (self.config.MAX_PIPS_STOP_LOSS * self.config.MIN_RISK_REWARD * pip_value)
-        else:
-            stop_loss = entry + (self.config.MAX_PIPS_STOP_LOSS * pip_value)
-            take_profit = entry - (self.config.MAX_PIPS_STOP_LOSS * self.config.MIN_RISK_REWARD * pip_value)
-        
-        return round(stop_loss, 5), round(take_profit, 5)
-    
     def analyze_symbol(self, symbol: str) -> Optional[Dict]:
         try:
             can_trade, _ = MarketFilter.can_trade()
@@ -616,7 +525,6 @@ class FalconProBot:
             if not model or not model.is_trained:
                 return None
             
-            # ✅ لو لسه فحصنا الزوج ده من قريب، نتخطاه
             last_scan = self.last_scan_time.get(symbol)
             if last_scan and (datetime.now() - last_scan).total_seconds() < 25:
                 return None
@@ -635,8 +543,8 @@ class FalconProBot:
             if df_5m is None or df_15m is None:
                 return None
             
-            dir_5m, conf_5m, votes_5m = model.predict(df_5m, self.config.CONFIDENCE_THRESHOLD)
-            dir_15m, conf_15m, votes_15m = model.predict(df_15m, self.config.CONFIDENCE_THRESHOLD)
+            dir_5m, conf_5m = model.predict(df_5m, self.config.CONFIDENCE_THRESHOLD)
+            dir_15m, conf_15m = model.predict(df_15m, self.config.CONFIDENCE_THRESHOLD)
             
             if dir_5m != dir_15m or dir_5m == "NEUTRAL":
                 return None
@@ -647,16 +555,13 @@ class FalconProBot:
                 return None
             
             entry_price = float(df_5m['Close'].iloc[-1])
-            stop_loss, take_profit = self.calculate_sl_tp(symbol, entry_price, dir_5m)
             
-            self.logger.info(f"🎯 {symbol}: {dir_5m} | ثقة={confidence:.1%} | صوت={votes_5m}+{votes_15m}")
+            self.logger.info(f"🎯 {symbol}: {dir_5m} | ثقة={confidence:.1%}")
             
             return {
                 'symbol': symbol,
                 'direction': dir_5m,
                 'entry_price': entry_price,
-                'stop_loss': stop_loss,
-                'take_profit': take_profit,
                 'confidence': confidence,
                 'expiry_time': (datetime.now() + timedelta(minutes=self.config.TRADE_DURATION_MINUTES)).strftime('%Y-%m-%d %H:%M:%S')
             }
@@ -669,16 +574,17 @@ class FalconProBot:
             emoji = "🟢" if signal['direction'] == 'BUY' else "🔴"
             direction = "شراء ▲" if signal['direction'] == 'BUY' else "بيع ▼"
             
+            # ✅ الصيغة الجديدة البسيطة
             msg = (f"{emoji} **{signal['symbol']}** - {direction}\n\n"
-                   f"💰 دخول: {signal['entry_price']:.5f}\n"
-                   f"🛑 SL: {signal['stop_loss']:.5f}\n"
-                   f"🎯 TP: {signal['take_profit']:.5f}\n"
-                   f"💪 ثقة: {signal['confidence']:.1%}\n\n"
-                   f"🤖 Falcon Pro v5.3")
+                   f"💰 {signal['entry_price']:.5f}\n"
+                   f"⏳ {self.config.TRADE_DURATION_MINUTES} د\n"
+                   f"💪 {signal['confidence']:.1%}\n\n"
+                   f"🤖 Falcon Pro")
             
             self.tb.send_message(self.config.TELEGRAM_CHAT_ID, msg, parse_mode='Markdown')
-        except:
-            pass
+            self.logger.info(f"✅ إشارة: {signal['symbol']} {signal['direction']}")
+        except Exception as e:
+            self.logger.error(f"Send error: {e}")
     
     def check_trades(self):
         for trade in self.db.get_pending_trades():
@@ -691,23 +597,18 @@ class FalconProBot:
                 entry = trade['entry_price']
                 direction = trade['direction']
                 
-                pip_value = 0.01 if 'JPY' in trade['symbol'] else 0.0001
-                
                 if direction == 'BUY':
                     pnl = (current - entry) / entry * 100
-                    pips = (current - entry) / pip_value
                     result = 'WIN' if current > entry else 'LOSS'
                 else:
                     pnl = (entry - current) / entry * 100
-                    pips = (entry - current) / pip_value
                     result = 'WIN' if current < entry else 'LOSS'
                 
-                self.db.update_result(trade['id'], current, result, pnl, round(pips, 1))
+                self.db.update_result(trade['id'], current, result, pnl)
             except:
                 pass
     
     def scan_all_symbols(self):
-        """✅ فحص كل الأزواج مرة واحدة"""
         futures = {self.executor.submit(self.analyze_symbol, s): s for s in self.config.SYMBOLS}
         signals = 0
         for future in as_completed(futures, timeout=30):
@@ -747,9 +648,8 @@ class FalconProBot:
         self.running = True
         
         self.logger.info("=" * 50)
-        self.logger.info("🦅 Falcon Pro v5.3 - No Sleep")
+        self.logger.info("🦅 Falcon AI Pro v5.4")
         self.logger.info(f"🔄 فحص كل {self.config.SCAN_INTERVAL_SECONDS} ثانية")
-        self.logger.info(f"🕯️ انتظار إغلاق الشمعة")
         self.logger.info("=" * 50)
         
         self.tg.start_polling()
@@ -763,42 +663,29 @@ class FalconProBot:
         try:
             trained = sum(1 for m in self.models.values() if m.is_trained)
             self.tb.send_message(self.config.TELEGRAM_CHAT_ID,
-                f"🦅 **Falcon Pro v5.3**\n✅ {trained}/{len(self.config.SYMBOLS)}\n🔄 فحص مستمر\n⚡️ يعمل...",
+                f"🦅 **Falcon Pro**\n✅ {trained}/{len(self.config.SYMBOLS)}\n⚡️ يعمل...",
                 parse_mode='Markdown')
         except:
             pass
         
-        # ============================================
-        # ✅ الحلقة الرئيسية - بدون نوم طويل
-        # ============================================
         while self.running:
             try:
-                # ✅ فحص الصفقات المنتهية
                 self.check_trades()
-                
-                # ✅ فحص كل الأزواج
                 signals = self.scan_all_symbols()
                 
-                # ✅ إعادة تدريب يومي
                 if (datetime.now() - self.last_retrain).total_seconds() > 86400:
                     self.train_all_models()
                 
-                # ✅ لو في إشارات، سجل. لو مفيش، نام شوية صغيرين
                 if signals > 0:
                     self.logger.info(f"✅ إشارات: {signals}")
-                else:
-                    # نام 5 ثواني بس بدل 3 دقائق!
-                    time.sleep(5)
-                    continue
                 
-                # ✅ انتظار قصير جداً بين الدورات
                 time.sleep(self.config.SCAN_INTERVAL_SECONDS)
                 
             except KeyboardInterrupt:
                 break
             except Exception as e:
                 self.logger.error(f"خطأ: {e}")
-                time.sleep(5)  # لو فيه خطأ، نام 5 ثواني وجرب تاني
+                time.sleep(5)
         
         self.executor.shutdown(wait=True)
         self.logger.info("🛑 توقف")
