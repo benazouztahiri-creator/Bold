@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """
-Falcon AI Pro v6.1 - Scientific Trade Timing
-==============================================
-Duration based on: Momentum, Cycles, Reversal Points, Volume
+Falcon AI Pro v7.0 - River Online Learning
+============================================
+Scientific Timing + Continuous Learning with River
+Model adapts to market changes in real-time.
 """
 
 import os
@@ -28,6 +29,9 @@ import yfinance as yf
 import requests
 from scipy import stats
 from scipy.signal import find_peaks
+
+# ✅ River - Online Machine Learning
+from river import compose, preprocessing, linear_model, ensemble, metrics, optim, tree, neighbors, naive_bayes
 
 import matplotlib
 matplotlib.use('Agg')
@@ -61,7 +65,6 @@ class Config:
     
     SCAN_INTERVAL_SECONDS: int = 30
     
-    # ✅ المدة بقت ذكية بالكامل
     MIN_TRADE_DURATION: int = 2
     MAX_TRADE_DURATION: int = 20
     
@@ -228,225 +231,119 @@ class Database:
 # ============================================================================
 
 class ScientificDuration:
-    """
-    ✅ حساب المدة المثالية للصفقة بناءً على:
-    1. زخم السعر (Momentum) - متى بينتهي الزخم؟
-    2. دورات السوق (Cycles) - فين الدورة الحالية؟
-    3. نقاط الانعكاس (Reversal Points) - أقرب دعم/مقاومة
-    4. حجم التداول (Volume) - تأكيد الحركة
-    """
-    
     @staticmethod
     def calculate(df_5m: pd.DataFrame, df_15m: pd.DataFrame, direction: str) -> Tuple[int, str]:
-        """
-        ✅ حساب المدة المثالية علمياً
-        
-        Returns:
-            (المدة بالدقائق, سبب المدة)
-        """
         reasons = []
         durations = []
         
-        # ========== 1. تحليل الزخم ==========
         momentum_duration, momentum_reason = ScientificDuration._momentum_analysis(df_5m, direction)
         durations.append(momentum_duration)
         reasons.append(momentum_reason)
         
-        # ========== 2. تحليل الدورات ==========
         cycle_duration, cycle_reason = ScientificDuration._cycle_analysis(df_15m)
         durations.append(cycle_duration)
         reasons.append(cycle_reason)
         
-        # ========== 3. تحليل نقاط الانعكاس ==========
         reversal_duration, reversal_reason = ScientificDuration._reversal_analysis(df_15m, direction)
         durations.append(reversal_duration)
         reasons.append(reversal_reason)
         
-        # ========== 4. تحليل حجم التداول ==========
         volume_duration, volume_reason = ScientificDuration._volume_analysis(df_5m)
         durations.append(volume_duration)
         reasons.append(volume_reason)
         
-        # ========== 5. المتوسط المرجح ==========
-        # الزخم له وزن أكبر لأنه الأهم
         weights = [0.35, 0.25, 0.25, 0.15]
         final_duration = sum(d * w for d, w in zip(durations, weights))
-        
-        # تقريب لأقرب دقيقة
         final_duration = max(2, min(20, round(final_duration)))
         
-        # سبب واحد مختصر
-        main_reason = reasons[0]  # الزخم هو السبب الرئيسي
-        
-        return final_duration, main_reason
+        return final_duration, reasons[0]
     
     @staticmethod
     def _momentum_analysis(df: pd.DataFrame, direction: str) -> Tuple[int, str]:
-        """
-        ✅ تحليل الزخم: متى بينتهي الزخم الحالي؟
-        """
         closes = df['Close'].values
-        
         if len(closes) < 20:
             return 8, "زخم غير واضح"
         
-        # حساب معدل التغير (ROC) لفترات مختلفة
         roc_3 = (closes[-1] - closes[-4]) / closes[-4] * 100
         roc_5 = (closes[-1] - closes[-6]) / closes[-6] * 100
         roc_10 = (closes[-1] - closes[-11]) / closes[-11] * 100
-        
-        # حساب تسارع الزخم (هل الزخم بيزيد ولا بيقل؟)
         momentum_acceleration = roc_3 - roc_10
         
-        # حساب RSI للزخم
         delta = np.diff(closes)
         gain = np.where(delta > 0, delta, 0)
         loss = np.where(delta < 0, -delta, 0)
-        
         avg_gain = np.mean(gain[-14:]) if len(gain) >= 14 else np.mean(gain)
         avg_loss = np.mean(loss[-14:]) if len(loss) >= 14 else np.mean(loss)
-        
         rs = avg_gain / (avg_loss + 1e-8)
         rsi = 100 - (100 / (1 + rs))
         
-        # تحديد المدة حسب الزخم
         if abs(roc_3) > 0.15 and abs(momentum_acceleration) > 0.05:
-            # زخم قوي ومتسارع
-            if direction == 'BUY' and roc_3 > 0:
-                return 4, "زخم قوي متسارع"
-            elif direction == 'SELL' and roc_3 < 0:
-                return 4, "زخم قوي متسارع"
-            else:
-                return 6, "زخم عكسي"
-        
+            return 4, "زخم قوي متسارع"
         elif abs(roc_5) > 0.1:
-            # زخم متوسط
-            if rsi > 70 or rsi < 30:
-                return 3, "زخم متوسط + تشبع"
-            else:
-                return 7, "زخم متوسط"
-        
+            return 3 if rsi > 70 or rsi < 30 else 7, "زخم متوسط"
         else:
-            # زخم ضعيف
             return 10, "زخم ضعيف"
     
     @staticmethod
     def _cycle_analysis(df: pd.DataFrame) -> Tuple[int, str]:
-        """
-        ✅ تحليل دورات السوق: فين احنا في الدورة؟
-        """
         closes = df['Close'].values
-        
         if len(closes) < 50:
             return 8, "دورة غير واضحة"
-        
-        # استخدام autocorrelation لاكتشاف الدورة
         try:
-            # تبسيط: حساب المسافة بين القمم المحلية
             peaks, _ = find_peaks(closes[-50:], distance=5)
-            
             if len(peaks) >= 2:
-                # متوسط المسافة بين القمم
                 avg_cycle = np.mean(np.diff(peaks))
-                
-                # تحديد موقعنا في الدورة
                 last_peak_idx = peaks[-1] if len(peaks) > 0 else 0
                 position_in_cycle = len(closes[-50:]) - last_peak_idx
-                
                 if position_in_cycle < avg_cycle * 0.3:
                     return 5, "بداية دورة"
                 elif position_in_cycle < avg_cycle * 0.7:
                     return 8, "وسط دورة"
                 else:
                     return 4, "نهاية دورة"
-            
         except:
             pass
-        
         return 7, "دورة طبيعية"
     
     @staticmethod
     def _reversal_analysis(df: pd.DataFrame, direction: str) -> Tuple[int, str]:
-        """
-        ✅ تحليل نقاط الانعكاس: أقرب دعم/مقاومة
-        """
         closes = df['Close'].values
         highs = df['High'].values
         lows = df['Low'].values
-        
         if len(closes) < 20:
             return 8, "مستويات غير واضحة"
-        
         current_price = closes[-1]
         
-        # حساب أقرب مقاومة (للشراء) أو دعم (للبيع)
         if direction == 'BUY':
-            # البحث عن أقرب مقاومة
             recent_highs = highs[-20:]
-            resistance_levels = []
-            
-            for i in range(len(recent_highs) - 1):
-                if recent_highs[i] > current_price:
-                    resistance_levels.append(recent_highs[i])
-            
+            resistance_levels = [h for h in recent_highs if h > current_price]
             if resistance_levels:
-                nearest_resistance = min(resistance_levels)
-                distance_pct = (nearest_resistance - current_price) / current_price * 100
-                
-                if distance_pct < 0.05:
-                    return 3, "مقاومة قريبة جداً"
-                elif distance_pct < 0.1:
-                    return 6, "مقاومة قريبة"
-                else:
-                    return 10, "مقاومة بعيدة"
+                distance_pct = (min(resistance_levels) - current_price) / current_price * 100
+                if distance_pct < 0.05: return 3, "مقاومة قريبة جداً"
+                elif distance_pct < 0.1: return 6, "مقاومة قريبة"
+                else: return 10, "مقاومة بعيدة"
         else:
-            # البحث عن أقرب دعم
             recent_lows = lows[-20:]
-            support_levels = []
-            
-            for i in range(len(recent_lows) - 1):
-                if recent_lows[i] < current_price:
-                    support_levels.append(recent_lows[i])
-            
+            support_levels = [l for l in recent_lows if l < current_price]
             if support_levels:
-                nearest_support = max(support_levels)
-                distance_pct = (current_price - nearest_support) / current_price * 100
-                
-                if distance_pct < 0.05:
-                    return 3, "دعم قريب جداً"
-                elif distance_pct < 0.1:
-                    return 6, "دعم قريب"
-                else:
-                    return 10, "دعم بعيد"
-        
+                distance_pct = (current_price - max(support_levels)) / current_price * 100
+                if distance_pct < 0.05: return 3, "دعم قريب جداً"
+                elif distance_pct < 0.1: return 6, "دعم قريب"
+                else: return 10, "دعم بعيد"
         return 8, "بدون مستويات قريبة"
     
     @staticmethod
     def _volume_analysis(df: pd.DataFrame) -> Tuple[int, str]:
-        """
-        ✅ تحليل حجم التداول: تأكيد الحركة
-        """
         if 'Volume' not in df.columns or df['Volume'].sum() == 0:
-            return 8, "حجم تداول غير متاح"
-        
+            return 8, "حجم غير متاح"
         volumes = df['Volume'].values
-        
         if len(volumes) < 20:
             return 8, "حجم غير كافي"
-        
-        current_vol = volumes[-1]
-        avg_vol = np.mean(volumes[-20:])
-        
-        vol_ratio = current_vol / (avg_vol + 1e-8)
-        
-        if vol_ratio > 2.0:
-            return 5, "حجم تداول عالي جداً"
-        elif vol_ratio > 1.5:
-            return 7, "حجم تداول عالي"
-        elif vol_ratio > 1.0:
-            return 9, "حجم تداول طبيعي"
-        else:
-            return 12, "حجم تداول منخفض"
+        vol_ratio = volumes[-1] / (np.mean(volumes[-20:]) + 1e-8)
+        if vol_ratio > 2.0: return 5, "حجم عالي جداً"
+        elif vol_ratio > 1.5: return 7, "حجم عالي"
+        elif vol_ratio > 1.0: return 9, "حجم طبيعي"
+        else: return 12, "حجم منخفض"
 
 # ============================================================================
 # MARKET FILTER
@@ -458,12 +355,8 @@ class MarketFilter:
         now = datetime.utcnow()
         day = now.weekday()
         hour = now.hour
-        
-        if day >= 5:
-            return False, "ويكند"
-        if day == 4 and hour >= 20:
-            return False, "إغلاق جمعة"
-        
+        if day >= 5: return False, "ويكند"
+        if day == 4 and hour >= 20: return False, "إغلاق جمعة"
         return True, "مسموح"
 
 # ============================================================================
@@ -472,11 +365,10 @@ class MarketFilter:
 
 def calculate_features(df: pd.DataFrame) -> pd.DataFrame:
     f = pd.DataFrame(index=df.index)
-    c, h, l, o = df['Close'], df['High'], df['Low'], df['Open']
+    c, h, l = df['Close'], df['High'], df['Low']
     
     for p in [1, 3, 5, 10]:
         f[f'ret_{p}'] = c.pct_change(p)
-    
     for p in [5, 10, 20, 50]:
         f[f'sma_{p}'] = c.rolling(p).mean()
         f[f'ema_{p}'] = c.ewm(span=p, adjust=False).mean()
@@ -529,7 +421,6 @@ def create_balanced_target(df: pd.DataFrame, periods: int) -> pd.Series:
     threshold = atr * 0.5
     
     target = pd.Series(np.nan, index=df.index)
-    
     buy_count = (change > threshold).sum()
     sell_count = (change < -threshold).sum()
     
@@ -546,23 +437,64 @@ def create_balanced_target(df: pd.DataFrame, periods: int) -> pd.Series:
     return target
 
 # ============================================================================
-# MODEL
+# HYBRID MODEL (XGBoost + CatBoost + River Online)
 # ============================================================================
 
-class EnsembleModel:
+class HybridEnsembleModel:
+    """
+    ✅ نموذج هجين:
+    - XGBoost + CatBoost + RF + GB (تدريب أولي)
+    - River Online Models (تدريب مستمر)
+    - Scientific Duration Calculator
+    """
+    
     def __init__(self, symbol: str, config: Config, logger: logging.Logger):
         self.symbol = symbol
         self.config = config
         self.logger = logger
+        
+        # نماذج تقليدية
         self.models = {}
         self.meta_model = None
         self.calibrators = {}
         self.scaler = RobustScaler()
         self.selected_features = []
+        
+        # ✅ نماذج River للتدريب المستمر
+        self.river_models = {}
+        self.river_weights = {}
+        self.river_online_samples = 0
+        
         self.is_trained = False
         self.version = None
+        
+        self._init_river_models()
     
-    def _init_models(self):
+    def _init_river_models(self):
+        """✅ تهيئة نماذج River"""
+        self.river_models = {
+            'hoeffding': compose.Pipeline(
+                preprocessing.StandardScaler(),
+                tree.HoeffdingTreeClassifier(grace_period=100, delta=1e-5)
+            ),
+            'knn': compose.Pipeline(
+                preprocessing.StandardScaler(),
+                neighbors.KNNClassifier(n_neighbors=5, window_size=500)
+            ),
+            'nb': compose.Pipeline(
+                preprocessing.StandardScaler(),
+                naive_bayes.GaussianNB()
+            ),
+            'lr': compose.Pipeline(
+                preprocessing.StandardScaler(),
+                linear_model.LogisticRegression(optimizer=optim.SGD(0.01))
+            )
+        }
+        
+        self.river_weights = {name: 0.25 for name in self.river_models}
+        self.river_performance = {name: {'correct': 0, 'total': 0} for name in self.river_models}
+    
+    def _init_sklearn_models(self):
         self.models = {
             'xgb': xgb.XGBClassifier(n_estimators=150, learning_rate=0.03, max_depth=4,
                                       random_state=42, n_jobs=2, verbosity=0, tree_method='hist'),
@@ -572,6 +504,39 @@ class EnsembleModel:
             'rf': RandomForestClassifier(n_estimators=150, max_depth=8, random_state=42, n_jobs=2),
             'gb': GradientBoostingClassifier(n_estimators=150, learning_rate=0.03, max_depth=4, random_state=42)
         }
+    
+    def _update_river_models(self, X_dict: dict, y_true: int):
+        """✅ تدريب مستمر: حدث نماذج River ببيانات جديدة"""
+        try:
+            for name, model in self.river_models.items():
+                try:
+                    y_pred = model.predict_one(X_dict)
+                    if y_pred is not None:
+                        self.river_performance[name]['total'] += 1
+                        if y_pred == y_true:
+                            self.river_performance[name]['correct'] += 1
+                    
+                    model.learn_one(X_dict, y_true)
+                except:
+                    pass
+            
+            self.river_online_samples += 1
+            
+            # ✅ تحديث الأوزان كل 50 عينة
+            if self.river_online_samples % 50 == 0:
+                total_correct = sum(p['correct'] for p in self.river_performance.values())
+                if total_correct > 0:
+                    for name in self.river_weights:
+                        perf = self.river_performance[name]
+                        acc = perf['correct'] / max(perf['total'], 1)
+                        self.river_weights[name] = max(0.1, acc)
+                    
+                    # تطبيع الأوزان
+                    total_weight = sum(self.river_weights.values())
+                    for name in self.river_weights:
+                        self.river_weights[name] /= total_weight
+        except:
+            pass
     
     def train(self, df: pd.DataFrame) -> bool:
         try:
@@ -593,7 +558,15 @@ class EnsembleModel:
             self.selected_features = [s[0] for s in scores[:self.config.MAX_FEATURES]]
             X = X[self.selected_features]
             
-            self._init_models()
+            # ✅ تدريب نماذج River على كل البيانات
+            self.logger.info(f"🔄 {self.symbol}: تدريب River المستمر على {len(X)} عينة...")
+            for i in range(len(X)):
+                row = X.iloc[i].to_dict()
+                self._update_river_models(row, int(y.iloc[i]))
+            self.logger.info(f"✅ {self.symbol}: River اتدرب على {self.river_online_samples} عينة")
+            
+            # تدريب النماذج التقليدية
+            self._init_sklearn_models()
             X_s = self.scaler.fit_transform(X)
             
             split_idx = int(len(X) * 0.8)
@@ -622,7 +595,8 @@ class EnsembleModel:
             self.version = datetime.now().strftime('v%Y%m%d_%H%M%S')
             return True
             
-        except:
+        except Exception as e:
+            self.logger.error(f"Train {self.symbol}: {e}")
             return False
     
     def predict(self, df: pd.DataFrame, threshold: float = 0.60) -> Tuple[str, float]:
@@ -639,29 +613,66 @@ class EnsembleModel:
             X = features[available].fillna(0)
             X_s = self.scaler.transform(X)
             
-            base_probas = []
-            votes = 0
+            # ✅ تنبؤات النماذج التقليدية
+            sklearn_probas = []
+            sklearn_votes = 0
             
             for name, cal in self.calibrators.items():
                 try:
                     proba = float(cal.predict_proba(X_s)[0, 1])
-                    base_probas.append(proba)
+                    sklearn_probas.append(proba)
                     if proba > 0.5:
-                        votes += 1
+                        sklearn_votes += 1
                 except:
-                    base_probas.append(0.5)
+                    sklearn_probas.append(0.5)
             
-            proba_buy = float(self.meta_model.predict_proba(np.array([base_probas]))[0, 1])
+            sklearn_proba = float(self.meta_model.predict_proba(np.array([sklearn_probas]))[0, 1])
             
-            if proba_buy > threshold and votes >= self.config.ENSEMBLE_AGREEMENT:
-                return "BUY", proba_buy
-            elif (1 - proba_buy) > threshold and (len(self.calibrators) - votes) >= self.config.ENSEMBLE_AGREEMENT:
-                return "SELL", 1 - proba_buy
+            # ✅ تنبؤات نماذج River
+            X_dict = features[available].fillna(0).iloc[0].to_dict()
+            river_probas = []
+            river_votes = 0
             
-            return "NEUTRAL", max(proba_buy, 1 - proba_buy)
+            for name, model in self.river_models.items():
+                try:
+                    proba = model.predict_proba_one(X_dict)
+                    if proba:
+                        river_prob = proba.get(True, 0.5)
+                        river_probas.append(river_prob)
+                        if river_prob > 0.5:
+                            river_votes += 1
+                    else:
+                        river_probas.append(0.5)
+                except:
+                    river_probas.append(0.5)
+            
+            river_proba = sum(river_probas) / len(river_probas) if river_probas else 0.5
+            
+            # ✅ دمج الاحتمالات (60% sklearn + 40% river)
+            final_proba = sklearn_proba * 0.6 + river_proba * 0.4
+            total_votes = sklearn_votes + river_votes
+            total_models = len(self.calibrators) + len(self.river_models)
+            
+            if final_proba > threshold and total_votes >= self.config.ENSEMBLE_AGREEMENT:
+                return "BUY", final_proba
+            elif (1 - final_proba) > threshold and (total_models - total_votes) >= self.config.ENSEMBLE_AGREEMENT:
+                return "SELL", 1 - final_proba
+            
+            return "NEUTRAL", max(final_proba, 1 - final_proba)
             
         except:
             return "NEUTRAL", 0.0
+    
+    def online_learn(self, df: pd.DataFrame, result: int):
+        """✅ تعلم من نتيجة الصفقة"""
+        try:
+            features = calculate_features(df).iloc[[-1]]
+            available = [f for f in self.selected_features if f in features.columns]
+            if len(available) >= 10:
+                X_dict = features[available].fillna(0).iloc[0].to_dict()
+                self._update_river_models(X_dict, result)
+        except:
+            pass
     
     def save(self):
         path = os.path.join(self.config.MODELS_DIR, self.symbol)
@@ -672,11 +683,14 @@ class EnsembleModel:
             'calibrators': self.calibrators,
             'scaler': self.scaler,
             'features': self.selected_features,
-            'version': self.version
-        }, os.path.join(path, 'model.pkl'))
+            'version': self.version,
+            'river_models': self.river_models,
+            'river_weights': self.river_weights,
+            'river_samples': self.river_online_samples
+        }, os.path.join(path, 'hybrid_model.pkl'))
     
     def load(self) -> bool:
-        path = os.path.join(self.config.MODELS_DIR, self.symbol, 'model.pkl')
+        path = os.path.join(self.config.MODELS_DIR, self.symbol, 'hybrid_model.pkl')
         if not os.path.exists(path):
             return False
         data = joblib.load(path)
@@ -686,6 +700,9 @@ class EnsembleModel:
         self.scaler = data['scaler']
         self.selected_features = data['features']
         self.version = data['version']
+        self.river_models = data.get('river_models', {})
+        self.river_weights = data.get('river_weights', {})
+        self.river_online_samples = data.get('river_samples', 0)
         self.is_trained = True
         return True
 
@@ -706,16 +723,15 @@ class FalconProBot:
         self._setup_commands()
         
         for symbol in config.SYMBOLS:
-            model = EnsembleModel(symbol, config, self.logger)
+            model = HybridEnsembleModel(symbol, config, self.logger)
             if model.load():
-                self.logger.info(f"📂 {symbol}")
+                self.logger.info(f"📂 {symbol} (River: {model.river_online_samples} عينة)")
             else:
                 self.logger.info(f"🆕 {symbol}")
             self.models[symbol] = model
         
         self.running = False
         self.last_retrain = None
-        self.last_scan_time = {}
     
     def _setup_commands(self):
         @self.tb.message_handler(commands=['start', 'status'])
@@ -725,12 +741,13 @@ class FalconProBot:
             trained = sum(1 for m in self.models.values() if m.is_trained)
             stats = self.db.get_stats()
             can_trade, reason = MarketFilter.can_trade()
-            text = (f"🦅 **Falcon Pro v6.1**\n"
+            total_river = sum(m.river_online_samples for m in self.models.values())
+            text = (f"🦅 **Falcon Pro v7**\n"
                    f"✅ نماذج: {trained}/{len(self.models)}\n"
                    f"📊 صفقات: {stats['total']}\n"
                    f"📈 نجاح: {stats['win_rate']:.1%}\n"
                    f"💰 ربح: {stats['total_pnl']:.2f}%\n"
-                   f"🧠 مدة علمية\n"
+                   f"🌊 River: {total_river} تعلم مستمر\n"
                    f"🚦 {'✅' if can_trade else '⛔ '+reason}")
             self.tb.reply_to(msg, text, parse_mode='Markdown')
     
@@ -779,12 +796,10 @@ class FalconProBot:
             if confidence < self.config.CONFIDENCE_THRESHOLD:
                 return None
             
-            # ✅ حساب المدة العلمية
             trade_duration, duration_reason = ScientificDuration.calculate(df_5m, df_15m, dir_5m)
-            
             entry_price = float(df_5m['Close'].iloc[-1])
             
-            self.logger.info(f"🎯 {symbol}: {dir_5m} | {confidence:.1%} | {trade_duration}د | {duration_reason}")
+            self.logger.info(f"🎯 {symbol}: {dir_5m} | {confidence:.1%} | {trade_duration}د | 🌊River")
             
             return {
                 'symbol': symbol,
@@ -811,7 +826,7 @@ class FalconProBot:
                    f"🤖 Falcon Pro")
             
             self.tb.send_message(self.config.TELEGRAM_CHAT_ID, msg, parse_mode='Markdown')
-            self.logger.info(f"✅ {signal['symbol']} {signal['direction']} | {signal['trade_duration']}د | {signal.get('duration_reason', '')}")
+            self.logger.info(f"✅ {signal['symbol']} {signal['direction']} | {signal['trade_duration']}د")
         except:
             pass
     
@@ -834,6 +849,12 @@ class FalconProBot:
                     result = 'WIN' if current < entry else 'LOSS'
                 
                 self.db.update_result(trade['id'], current, result, pnl)
+                
+                # ✅ تدريب River على نتيجة الصفقة
+                model = self.models.get(trade['symbol'])
+                if model and df is not None:
+                    model.online_learn(df, 1 if result == 'WIN' else 0)
+                
             except:
                 pass
     
@@ -862,7 +883,7 @@ class FalconProBot:
                     time.sleep(2)
                 
                 if df is not None:
-                    model = EnsembleModel(symbol, self.config, self.logger)
+                    model = HybridEnsembleModel(symbol, self.config, self.logger)
                     if model.train(df):
                         model.save()
                         self.models[symbol] = model
@@ -876,7 +897,7 @@ class FalconProBot:
     def run(self):
         self.running = True
         
-        self.logger.info("🦅 Falcon Pro v6.1 - Scientific Timing")
+        self.logger.info("🦅 Falcon Pro v7.0 - River Online Learning")
         
         self.tg.start_polling()
         time.sleep(1)
@@ -889,7 +910,7 @@ class FalconProBot:
         try:
             trained = sum(1 for m in self.models.values() if m.is_trained)
             self.tb.send_message(self.config.TELEGRAM_CHAT_ID,
-                f"🦅 **Falcon Pro v6.1**\n✅ {trained}/{len(self.config.SYMBOLS)}\n🧠 توقيت علمي\n⚡️ يعمل...",
+                f"🦅 **Falcon Pro v7**\n✅ {trained}/{len(self.config.SYMBOLS)}\n🌊 River Active\n⚡️ يعمل...",
                 parse_mode='Markdown')
         except:
             pass
@@ -897,7 +918,7 @@ class FalconProBot:
         while self.running:
             try:
                 self.check_trades()
-                signals = self.scan_all_symbols()
+                self.scan_all_symbols()
                 
                 if (datetime.now() - self.last_retrain).total_seconds() > 86400:
                     self.train_all_models()
