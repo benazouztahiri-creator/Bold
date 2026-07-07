@@ -1,14 +1,8 @@
 #!/usr/bin/env python3
 """
-Falcon AI Ultimate v4.0 - Professional Forex Bot
-==================================================
-- 12-24 Month Training
-- Walk-Forward Validation
-- Meta Model (Stacking)
-- Probability Calibration
-- Market Regime Detection
-- Dynamic Threshold
-- Weighted Probabilities
+Falcon AI Pro v4.0 - No LightGBM
+=================================
+XGBoost + CatBoost + RandomForest + GradientBoosting
 """
 
 import os
@@ -25,7 +19,6 @@ from typing import Dict, List, Tuple, Optional, Any
 from datetime import datetime, timedelta
 from dataclasses import dataclass, field
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from collections import deque
 
 import numpy as np
 import pandas as pd
@@ -40,11 +33,10 @@ from sklearn.model_selection import TimeSeriesSplit
 from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
 from sklearn.feature_selection import mutual_info_classif
 from sklearn.preprocessing import RobustScaler
-from sklearn.metrics import accuracy_score, f1_score, brier_score_loss
-from sklearn.calibration import CalibratedClassifierCV, calibration_curve
+from sklearn.metrics import accuracy_score, f1_score
+from sklearn.calibration import CalibratedClassifierCV
 from sklearn.linear_model import LogisticRegression
 import xgboost as xgb
-import lightgbm as lgb
 from catboost import CatBoostClassifier
 
 import telebot
@@ -54,7 +46,7 @@ warnings.filterwarnings('ignore')
 os.environ['OMP_NUM_THREADS'] = '2'
 
 # ============================================================================
-# CONFIGURATION
+# CONFIG
 # ============================================================================
 
 @dataclass
@@ -70,28 +62,18 @@ class Config:
         'USDCAD=X', 'NZDUSD=X', 'EURGBP=X', 'EURJPY=X'
     ])
     
-    # ✅ Training: 12-24 months
-    TRAINING_PERIOD_1H: str = '12mo'  # ✅ 12 شهر للفريم الكبير
-    TRAINING_PERIOD_15M: str = '2mo'  # ✅ شهرين للفريم المتوسط
+    TRAINING_PERIOD_1H: str = '6mo'
+    TRAINING_PERIOD_15M: str = '1mo'
     
-    # ✅ Walk-Forward
-    WALK_FORWARD_WINDOWS: int = 5
+    WALK_FORWARD_WINDOWS: int = 3
     MIN_TRAINING_SAMPLES: int = 500
     
-    # ✅ Dynamic Threshold
-    CONFIDENCE_THRESHOLD_INITIAL: float = 0.65
-    CONFIDENCE_THRESHOLD_MIN: float = 0.55
-    CONFIDENCE_THRESHOLD_MAX: float = 0.80
-    
-    # ✅ Market Regime
-    ADX_TREND_THRESHOLD: float = 25
-    VOLATILITY_HIGH_THRESHOLD: float = 1.5
-    
-    # ✅ Performance tracking
-    PERFORMANCE_WINDOW: int = 50  # آخر 50 صفقة لتقييم الأداء
+    CONFIDENCE_THRESHOLD: float = 0.60
+    DYNAMIC_THRESHOLD_MIN: float = 0.55
+    DYNAMIC_THRESHOLD_MAX: float = 0.75
     
     RETRAINING_INTERVAL_HOURS: int = 24
-    MAX_FEATURES: int = 80
+    MAX_FEATURES: int = 60
     FORECAST_PERIODS: int = 5
     
     DB_PATH: str = 'falcon_trading.db'
@@ -121,7 +103,7 @@ def setup_logging(config: Config) -> logging.Logger:
     return logging.getLogger('FalconPro')
 
 # ============================================================================
-# DATABASE WITH PERFORMANCE TRACKING
+# DATABASE
 # ============================================================================
 
 class Database:
@@ -140,11 +122,10 @@ class Database:
                     expiry_time DATETIME, result TEXT DEFAULT 'PENDING',
                     pnl_percent REAL, meta_proba REAL, signal_hash TEXT UNIQUE
                 );
-                CREATE TABLE IF NOT EXISTS model_performance (
+                CREATE TABLE IF NOT EXISTS performance (
                     symbol TEXT PRIMARY KEY,
                     last_50_wins INTEGER DEFAULT 0,
                     last_50_total INTEGER DEFAULT 0,
-                    current_threshold REAL DEFAULT 0.65,
                     updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
                 );
             ''')
@@ -169,53 +150,34 @@ class Database:
     
     def update_result(self, signal_id: int, exit_price: float, result: str, pnl: float, symbol: str):
         with sqlite3.connect(self.db_path) as conn:
+            conn.execute('UPDATE signals SET exit_price=?, result=?, pnl_percent=? WHERE id=?',
+                        (exit_price, result, pnl, signal_id))
             conn.execute('''
-                UPDATE signals SET exit_price=?, result=?, pnl_percent=? WHERE id=?
-            ''', (exit_price, result, pnl, signal_id))
-            
-            # Update performance tracker
-            conn.execute('''
-                INSERT INTO model_performance (symbol, last_50_wins, last_50_total, current_threshold)
-                VALUES (?, ?, 1, 0.65)
+                INSERT INTO performance (symbol, last_50_wins, last_50_total)
+                VALUES (?, ?, 1)
                 ON CONFLICT(symbol) DO UPDATE SET
-                last_50_wins = CASE WHEN last_50_total >= 50 
-                    THEN last_50_wins + ? - (SELECT CASE WHEN result='WIN' THEN 1 ELSE 0 END 
-                        FROM signals WHERE symbol=? AND result!='PENDING' 
-                        ORDER BY entry_time DESC LIMIT 1 OFFSET 49)
-                    ELSE last_50_wins + ? END,
-                last_50_total = CASE WHEN last_50_total >= 50 
-                    THEN 50 ELSE last_50_total + 1 END
-            ''', (symbol, 
-                  1 if result == 'WIN' else 0, symbol,
-                  1 if result == 'WIN' else 0))
+                last_50_wins = last_50_wins + ?,
+                last_50_total = last_50_total + 1
+            ''', (symbol, 1 if result == 'WIN' else 0, 1 if result == 'WIN' else 0))
             conn.commit()
     
     def get_dynamic_threshold(self, symbol: str) -> float:
         with sqlite3.connect(self.db_path) as conn:
-            row = conn.execute('''
-                SELECT last_50_wins, last_50_total FROM model_performance WHERE symbol=?
-            ''', (symbol,)).fetchone()
-            
+            row = conn.execute('SELECT last_50_wins, last_50_total FROM performance WHERE symbol=?',
+                              (symbol,)).fetchone()
             if not row or row[1] < 10:
                 return 0.65
-            
             win_rate = row[0] / row[1]
-            
-            # Dynamic threshold based on performance
-            if win_rate > 0.70:
-                return 0.58  # أداء ممتاز → عتبة أقل
-            elif win_rate > 0.60:
-                return 0.62
-            elif win_rate > 0.50:
-                return 0.68
-            else:
-                return 0.75  # أداء ضعيف → عتبة أعلى
+            if win_rate > 0.70: return 0.58
+            elif win_rate > 0.60: return 0.62
+            elif win_rate > 0.50: return 0.68
+            else: return 0.75
     
     def check_active_signal(self, symbol: str) -> bool:
         with sqlite3.connect(self.db_path) as conn:
             count = conn.execute('''
-                SELECT COUNT(*) FROM signals WHERE symbol=? 
-                AND result='PENDING' AND expiry_time > datetime('now', 'localtime')
+                SELECT COUNT(*) FROM signals WHERE symbol=? AND result='PENDING' 
+                AND expiry_time > datetime('now', 'localtime')
             ''', (symbol,)).fetchone()[0]
             return count > 0
     
@@ -244,22 +206,17 @@ class Database:
                     'win_rate': wins/total if total > 0 else 0}
 
 # ============================================================================
-# MARKET REGIME DETECTION
+# MARKET REGIME
 # ============================================================================
 
 class MarketRegime:
-    """Detect market regime: TREND, RANGE, HIGH_VOL, LOW_VOL"""
-    
     @staticmethod
     def detect(df: pd.DataFrame) -> Dict:
         if len(df) < 50:
-            return {'regime': 'UNKNOWN', 'adx': 0, 'volatility_ratio': 1}
+            return {'regime': 'UNKNOWN', 'adx': 0, 'is_trend': False}
         
-        c = df['Close']
-        h = df['High']
-        l = df['Low']
+        c, h, l = df['Close'], df['High'], df['Low']
         
-        # ADX
         tr1 = h - l
         tr2 = abs(h - c.shift())
         tr3 = abs(l - c.shift())
@@ -273,111 +230,73 @@ class MarketRegime:
         dx = 100 * abs(plus_di - minus_di) / (plus_di + minus_di + 1e-8)
         adx = float(dx.ewm(span=14).mean().iloc[-1])
         
-        # Volatility ratio (current vs historical)
         current_vol = c.pct_change().rolling(20).std().iloc[-1]
         historical_vol = c.pct_change().rolling(100).std().iloc[-1] if len(c) >= 100 else current_vol
         vol_ratio = current_vol / (historical_vol + 1e-8)
         
-        # Bollinger width
-        sma20 = c.rolling(20).mean()
-        std20 = c.rolling(20).std()
-        bb_width = (4 * std20.iloc[-1]) / (sma20.iloc[-1] + 1e-8)
-        
-        # Regime classification
         if adx > 25:
-            if vol_ratio > 1.3:
-                regime = 'TREND_HIGH_VOL'
-            else:
-                regime = 'TREND_LOW_VOL'
+            regime = 'TREND_HIGH_VOL' if vol_ratio > 1.3 else 'TREND_LOW_VOL'
         else:
-            if vol_ratio > 1.3:
-                regime = 'RANGE_HIGH_VOL'
-            else:
-                regime = 'RANGE_LOW_VOL'
+            regime = 'RANGE_HIGH_VOL' if vol_ratio > 1.3 else 'RANGE_LOW_VOL'
         
-        return {
-            'regime': regime,
-            'adx': round(adx, 1),
-            'volatility_ratio': round(vol_ratio, 2),
-            'bb_width': round(bb_width, 4),
-            'is_trend': adx > 25,
-            'is_volatile': vol_ratio > 1.3
-        }
+        return {'regime': regime, 'adx': round(adx, 1), 'is_trend': adx > 25}
 
 # ============================================================================
-# ADVANCED FEATURES (80+)
+# FEATURES (60+)
 # ============================================================================
 
-def calculate_advanced_features(df: pd.DataFrame) -> pd.DataFrame:
-    """80+ professional features."""
+def calculate_features(df: pd.DataFrame) -> pd.DataFrame:
     f = pd.DataFrame(index=df.index)
     c, h, l, o = df['Close'], df['High'], df['Low'], df['Open']
     v = df.get('Volume', pd.Series(1, index=df.index))
     
-    # Returns (6)
-    for p in [1, 2, 3, 5, 10, 20]:
+    for p in [1, 3, 5, 10, 20]:
         f[f'ret_{p}'] = c.pct_change(p)
-    f['log_ret'] = np.log(c / c.shift(1))
-    f['hl_ratio'] = (h - l) / (c + 1e-8)
-    f['close_pos'] = (c - l) / (h - l + 1e-8)
-    f['gap'] = (o - c.shift(1)) / c.shift(1)
     
-    # Moving Averages (18)
     for p in [5, 10, 20, 50, 100, 200]:
         if len(df) >= p:
             f[f'sma_{p}'] = c.rolling(p).mean()
             f[f'ema_{p}'] = c.ewm(span=p, adjust=False).mean()
             f[f'dist_sma_{p}'] = (c - f[f'sma_{p}']) / (f[f'sma_{p}'] + 1e-8)
     
-    # RSI (3)
     for p in [7, 14, 21]:
         delta = c.diff()
         gain = delta.where(delta > 0, 0.0).rolling(p).mean()
         loss = (-delta.where(delta < 0, 0.0)).rolling(p).mean()
         f[f'rsi_{p}'] = 100 - (100 / (1 + gain / (loss + 1e-8)))
     
-    # MACD (3)
     ema12 = c.ewm(span=12).mean()
     ema26 = c.ewm(span=26).mean()
     f['macd'] = ema12 - ema26
     f['macd_signal'] = f['macd'].ewm(span=9).mean()
     f['macd_hist'] = f['macd'] - f['macd_signal']
     
-    # Bollinger (4)
     sma20 = c.rolling(20).mean()
     std20 = c.rolling(20).std()
-    f['bb_upper'] = sma20 + 2 * std20
-    f['bb_lower'] = sma20 - 2 * std20
-    f['bb_pos'] = (c - f['bb_lower']) / (f['bb_upper'] - f['bb_lower'] + 1e-8)
-    f['bb_width'] = (f['bb_upper'] - f['bb_lower']) / (sma20 + 1e-8)
+    f['bb_pos'] = (c - sma20) / (2 * std20 + 1e-8)
+    f['bb_width'] = (4 * std20) / (sma20 + 1e-8)
     
-    # ATR (3)
     tr1 = h - l
     tr2 = abs(h - c.shift())
     tr3 = abs(l - c.shift())
     tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
-    f['atr_14'] = tr.ewm(span=14).mean()
-    f['atr_pct'] = f['atr_14'] / (c + 1e-8)
-    f['atr_ratio'] = f['atr_14'] / f['atr_14'].rolling(50).mean()
+    f['atr'] = tr.ewm(span=14).mean()
+    f['atr_pct'] = f['atr'] / (c + 1e-8)
     
-    # Stochastic (2)
     low14 = l.rolling(14).min()
     high14 = h.rolling(14).max()
     f['stoch_k'] = 100 * (c - low14) / (high14 - low14 + 1e-8)
     f['stoch_d'] = f['stoch_k'].rolling(3).mean()
     
-    # CCI (1)
     tp = (h + l + c) / 3
     sma_tp = tp.rolling(20).mean()
     mad = tp.rolling(20).apply(lambda x: np.abs(x - x.mean()).mean())
     f['cci'] = (tp - sma_tp) / (0.015 * mad + 1e-8)
     
-    # Williams %R (1)
     hh14 = h.rolling(14).max()
     ll14 = l.rolling(14).min()
     f['williams_r'] = -100 * (hh14 - c) / (hh14 - ll14 + 1e-8)
     
-    # ADX (3)
     plus_dm = h.diff().clip(lower=0)
     minus_dm = (-l.diff()).clip(lower=0)
     atr14 = tr.ewm(span=14).mean()
@@ -388,53 +307,23 @@ def calculate_advanced_features(df: pd.DataFrame) -> pd.DataFrame:
     f['di_plus'] = plus_di
     f['di_minus'] = minus_di
     
-    # MFI (1)
-    tp_mfi = (h + l + c) / 3
-    mf = tp_mfi * v
-    pos_mf = mf.where(tp_mfi > tp_mfi.shift(1), 0).rolling(14).sum()
-    neg_mf = mf.where(tp_mfi < tp_mfi.shift(1), 0).rolling(14).sum()
-    f['mfi'] = 100 - (100 / (1 + pos_mf / (neg_mf + 1e-8)))
-    
-    # ROC & Momentum (6)
     for p in [5, 10, 20]:
         f[f'roc_{p}'] = (c - c.shift(p)) / (c.shift(p) + 1e-8) * 100
         f[f'mom_{p}'] = c - c.shift(p)
     
-    # Volatility (3)
     for p in [5, 10, 20]:
         f[f'vol_{p}'] = c.pct_change().rolling(p).std()
     
-    # Donchian (2)
     f['dc_upper'] = h.rolling(20).max()
     f['dc_lower'] = l.rolling(20).min()
     f['dc_pos'] = (c - f['dc_lower']) / (f['dc_upper'] - f['dc_lower'] + 1e-8)
     
-    # Keltner (2)
-    kc_mid = c.ewm(span=20).mean()
-    f['kc_upper'] = kc_mid + 1.5 * f['atr_14']
-    f['kc_lower'] = kc_mid - 1.5 * f['atr_14']
-    f['kc_pos'] = (c - f['kc_lower']) / (f['kc_upper'] - f['kc_lower'] + 1e-8)
-    
-    # SuperTrend (1)
-    f['supertrend'] = ((c > (h+l)/2 + 2*f['atr_14']).astype(int) - 
-                       (c < (h+l)/2 - 2*f['atr_14']).astype(int))
-    
-    # Candlestick (4)
     f['body_size'] = abs(c - o) / (h - l + 1e-8)
     f['upper_wick'] = (h - np.maximum(c, o)) / (h - l + 1e-8)
     f['lower_wick'] = (np.minimum(c, o) - l) / (h - l + 1e-8)
-    f['candle_type'] = (c > o).astype(int) - (c < o).astype(int)
     
-    # Support/Resistance (4)
-    for p in [20, 50]:
-        f[f'high_{p}d'] = c / (h.rolling(p).max() + 1e-8)
-        f[f'low_{p}d'] = c / (l.rolling(p).min() + 1e-8)
-    
-    # Trend Strength (2)
     f['trend_str'] = c.rolling(20).apply(lambda x: np.polyfit(range(len(x)), x, 1)[0] if len(x) > 1 else 0)
-    f['hh_ll_ratio'] = (h.rolling(20).max() - c) / (c - l.rolling(20).min() + 1e-8)
     
-    # Volume (2)
     f['vol_ratio'] = v / (v.rolling(20).mean() + 1e-8)
     f['vol_trend'] = v.rolling(5).mean() / (v.rolling(20).mean() + 1e-8)
     
@@ -444,38 +333,22 @@ def calculate_advanced_features(df: pd.DataFrame) -> pd.DataFrame:
 # SMART TARGET
 # ============================================================================
 
-def create_smart_target(df: pd.DataFrame, periods: int) -> pd.Series:
-    """Target based on meaningful ATR movement."""
-    atr = df['High'] - df['Low']
-    atr = atr.rolling(14).mean()
-    
-    future_price = df['Close'].shift(-periods)
-    price_change = future_price - df['Close']
-    
-    threshold = atr * 0.5  # 0.5 × ATR
-    
-    buy_signal = price_change > threshold
-    sell_signal = price_change < -threshold
+def create_target(df: pd.DataFrame, periods: int) -> pd.Series:
+    atr = (df['High'] - df['Low']).rolling(14).mean()
+    future = df['Close'].shift(-periods)
+    change = future - df['Close']
+    threshold = atr * 0.5
     
     target = pd.Series(np.nan, index=df.index)
-    target[buy_signal] = 1
-    target[sell_signal] = 0
-    
+    target[change > threshold] = 1
+    target[change < -threshold] = 0
     return target
 
 # ============================================================================
-# PRO ENSEMBLE MODEL WITH META-STACKING
+# ENSEMBLE MODEL (3 models + Meta)
 # ============================================================================
 
-class ProEnsembleModel:
-    """
-    Professional ensemble with:
-    - Walk-Forward Validation
-    - Meta Model (Stacking)
-    - Probability Calibration
-    - Dynamic Threshold
-    """
-    
+class EnsembleModel:
     def __init__(self, symbol: str, config: Config, logger: logging.Logger):
         self.symbol = symbol
         self.config = config
@@ -488,22 +361,19 @@ class ProEnsembleModel:
         self.selected_features = []
         self.is_trained = False
         self.version = None
-        self.walk_forward_score = 0
-        self.current_threshold = config.CONFIDENCE_THRESHOLD_INITIAL
+        self.wf_score = 0
     
-    def _init_base_models(self):
+    def _init_models(self):
         self.base_models = {
             'xgboost': xgb.XGBClassifier(n_estimators=200, learning_rate=0.03, max_depth=5,
                                           random_state=42, n_jobs=2, verbosity=0, tree_method='hist'),
             'catboost': CatBoostClassifier(iterations=200, learning_rate=0.03, depth=5,
                                             random_seed=42, verbose=False, thread_count=2, allow_writing_files=False),
-            'lightgbm': lgb.LGBMClassifier(n_estimators=200, learning_rate=0.03, max_depth=5,
-                                            random_state=42, n_jobs=2, verbose=-1),
-            'randomforest': RandomForestClassifier(n_estimators=200, max_depth=10, random_state=42, n_jobs=2)
+            'randomforest': RandomForestClassifier(n_estimators=200, max_depth=10, random_state=42, n_jobs=2),
+            'gradient_boost': GradientBoostingClassifier(n_estimators=200, learning_rate=0.03, max_depth=5, random_state=42)
         }
     
     def _walk_forward_train(self, X: pd.DataFrame, y: pd.Series) -> float:
-        """Walk-forward validation."""
         tscv = TimeSeriesSplit(n_splits=self.config.WALK_FORWARD_WINDOWS)
         scores = []
         
@@ -514,147 +384,113 @@ class ProEnsembleModel:
             X_train_s = self.scaler.fit_transform(X_train)
             X_val_s = self.scaler.transform(X_val)
             
-            # Train base models
-            base_preds_val = np.zeros((len(X_val), len(self.base_models)))
+            base_preds = np.zeros((len(X_val), len(self.base_models)))
             
             for i, (name, model) in enumerate(self.base_models.items()):
                 try:
                     if name == 'catboost':
                         model.fit(X_train_s, y_train, verbose=False)
-                    elif name == 'lightgbm':
-                        model.fit(X_train_s, y_train)
                     else:
                         model.fit(X_train_s, y_train)
-                    base_preds_val[:, i] = model.predict_proba(X_val_s)[:, 1]
+                    base_preds[:, i] = model.predict_proba(X_val_s)[:, 1]
                 except:
-                    base_preds_val[:, i] = 0.5
+                    base_preds[:, i] = 0.5
             
-            # Meta model
             meta = LogisticRegression()
-            meta.fit(base_preds_val, y_val)
-            meta_pred = meta.predict(base_preds_val)
-            scores.append(accuracy_score(y_val, meta_pred))
+            meta.fit(base_preds, y_val)
+            scores.append(accuracy_score(y_val, meta.predict(base_preds)))
         
         return np.mean(scores)
     
     def train(self, df: pd.DataFrame) -> bool:
         try:
             if len(df) < self.config.MIN_TRAINING_SAMPLES:
-                self.logger.warning(f"{self.symbol}: بيانات غير كافية ({len(df)})")
                 return False
             
-            self.logger.info(f"🎓 {self.symbol}: {len(df)} عينة - تدريب متقدم...")
+            self.logger.info(f"🎓 {self.symbol}: {len(df)} عينة...")
             
-            features = calculate_advanced_features(df)
-            target = create_smart_target(df, self.config.FORECAST_PERIODS)
+            features = calculate_features(df)
+            target = create_target(df, self.config.FORECAST_PERIODS)
             
             valid = ~(features.isna().any(axis=1) | target.isna())
             X = features[valid]
             y = target[valid]
             
-            neutral_pct = target.isna().sum() / len(target) * 100
-            self.logger.info(f"📊 {self.symbol}: {len(X)} صالحة ({neutral_pct:.0f}% محايدة)")
-            
             if len(X) < 200:
                 return False
             
-            # Feature selection
             mi = mutual_info_classif(X, y, random_state=42)
             scores = sorted(zip(X.columns, mi), key=lambda x: x[1], reverse=True)
             self.selected_features = [s[0] for s in scores[:self.config.MAX_FEATURES]]
             X = X[self.selected_features]
             
-            # Walk-Forward validation
-            self._init_base_models()
-            self.logger.info(f"🔄 {self.symbol}: Walk-Forward ({self.config.WALK_FORWARD_WINDOWS} windows)...")
-            self.walk_forward_score = self._walk_forward_train(X, y)
-            self.logger.info(f"📈 {self.symbol}: Walk-Forward Score = {self.walk_forward_score:.3f}")
+            self._init_models()
             
-            # Final train on all data
+            # Walk-Forward
+            self.wf_score = self._walk_forward_train(X, y)
+            self.logger.info(f"📈 {self.symbol}: WF Score = {self.wf_score:.3f}")
+            
+            # Final train
             X_s = self.scaler.fit_transform(X)
-            
             base_preds_all = np.zeros((len(X), len(self.base_models)))
             
             for i, (name, model) in enumerate(self.base_models.items()):
                 try:
                     if name == 'catboost':
                         model.fit(X_s, y, verbose=False)
-                    elif name == 'lightgbm':
-                        model.fit(X_s, y)
                     else:
                         model.fit(X_s, y)
                     base_preds_all[:, i] = model.predict_proba(X_s)[:, 1]
                     
-                    # ✅ Probability Calibration
                     self.calibrators[name] = CalibratedClassifierCV(model, cv=3, method='isotonic')
                     self.calibrators[name].fit(X_s, y)
                 except:
                     pass
             
-            # ✅ Meta Model (Stacking)
             self.meta_model = LogisticRegression()
             self.meta_model.fit(base_preds_all, y)
             
             self.is_trained = True
             self.version = datetime.now().strftime('v%Y%m%d_%H%M%S')
             
-            meta_pred = self.meta_model.predict(base_preds_all)
-            acc = accuracy_score(y, meta_pred)
-            
+            acc = accuracy_score(y, self.meta_model.predict(base_preds_all))
             self.logger.info(f"✅ {self.symbol}: دقة={acc:.1%}, ميزات={len(self.selected_features)}")
             return True
             
         except Exception as e:
-            self.logger.error(f"❌ {self.symbol}: {e}", exc_info=True)
+            self.logger.error(f"❌ {self.symbol}: {e}")
             return False
     
-    def predict(self, df: pd.DataFrame, dynamic_threshold: float = None) -> Tuple[str, float, Dict]:
-        """Predict with meta-model and calibration."""
+    def predict(self, df: pd.DataFrame, threshold: float = 0.65) -> Tuple[str, float, Dict]:
         if not self.is_trained:
             return "NEUTRAL", 0.0, {}
         
-        threshold = dynamic_threshold or self.config.CONFIDENCE_THRESHOLD_INITIAL
-        
         try:
-            features = calculate_advanced_features(df).iloc[[-1]]
+            features = calculate_features(df).iloc[[-1]]
             available = [f for f in self.selected_features if f in features.columns]
             
-            if len(available) < 15:
+            if len(available) < 10:
                 return "NEUTRAL", 0.0, {}
             
             X = features[available].fillna(0)
             X_s = self.scaler.transform(X)
             
-            # Get calibrated probabilities
             base_probas = []
-            
-            for name, calibrator in self.calibrators.items():
+            for name, cal in self.calibrators.items():
                 try:
-                    proba = float(calibrator.predict_proba(X_s)[0, 1])
-                    base_probas.append(proba)
+                    base_probas.append(float(cal.predict_proba(X_s)[0, 1]))
                 except:
                     base_probas.append(0.5)
             
-            # ✅ Meta model prediction (weighted, not voting!)
             meta_proba = float(self.meta_model.predict_proba(np.array([base_probas]))[0, 1])
             
-            # Determine direction
             if meta_proba > threshold:
-                direction = "BUY"
-                confidence = meta_proba
+                return "BUY", meta_proba, {'meta_proba': meta_proba}
             elif meta_proba < (1 - threshold):
-                direction = "SELL"
-                confidence = 1 - meta_proba
-            else:
-                direction = "NEUTRAL"
-                confidence = max(meta_proba, 1 - meta_proba)
+                return "SELL", 1 - meta_proba, {'meta_proba': meta_proba}
+            return "NEUTRAL", max(meta_proba, 1 - meta_proba), {'meta_proba': meta_proba}
             
-            return direction, confidence, {
-                'meta_proba': meta_proba,
-                'base_probas': dict(zip(self.calibrators.keys(), base_probas))
-            }
-            
-        except Exception as e:
+        except:
             return "NEUTRAL", 0.0, {}
     
     def save(self):
@@ -667,7 +503,7 @@ class ProEnsembleModel:
             'scaler': self.scaler,
             'features': self.selected_features,
             'version': self.version,
-            'walk_forward_score': self.walk_forward_score
+            'wf_score': self.wf_score
         }, os.path.join(path, 'pro_model.pkl'))
     
     def load(self) -> bool:
@@ -681,7 +517,7 @@ class ProEnsembleModel:
         self.scaler = data['scaler']
         self.selected_features = data['features']
         self.version = data['version']
-        self.walk_forward_score = data.get('walk_forward_score', 0)
+        self.wf_score = data.get('wf_score', 0)
         self.is_trained = True
         return True
 
@@ -701,7 +537,7 @@ class FalconProBot:
         self._setup_commands()
         
         for symbol in config.SYMBOLS:
-            model = ProEnsembleModel(symbol, config, self.logger)
+            model = EnsembleModel(symbol, config, self.logger)
             loaded = model.load()
             self.logger.info(f"{'📂' if loaded else '🆕'} {symbol}")
             self.models[symbol] = model
@@ -716,7 +552,7 @@ class FalconProBot:
                 return
             trained = sum(1 for m in self.models.values() if m.is_trained)
             stats = self.db.get_stats()
-            text = f"🦅 **Falcon Pro v4**\n✅ نماذج: {trained}/{len(self.models)}\n📊 صفقات: {stats['total']}\n📈 نجاح: {stats['win_rate']:.1%}"
+            text = f"🦅 **Falcon Pro**\n✅ نماذج: {trained}/{len(self.models)}\n📊 صفقات: {stats['total']}\n📈 نجاح: {stats['win_rate']:.1%}"
             self.tb.reply_to(msg, text, parse_mode='Markdown')
         
         @self.tb.message_handler(commands=['stats'])
@@ -725,18 +561,6 @@ class FalconProBot:
                 return
             s = self.db.get_stats()
             self.tb.reply_to(msg, f"📊 {s['total']} | ✅ {s['wins']} | 📈 {s['win_rate']:.1%}")
-        
-        @self.tb.message_handler(commands=['regime'])
-        def regime_cmd(msg):
-            if str(msg.chat.id) != self.config.TELEGRAM_CHAT_ID:
-                return
-            text = "📊 **حالة الأسواق:**\n"
-            for symbol in self.config.SYMBOLS[:4]:
-                df = self.fetch_data(symbol, '15m', '5d')
-                if df is not None:
-                    regime = MarketRegime.detect(df)
-                    text += f"\n• {symbol}: {regime['regime']} (ADX: {regime['adx']})"
-            self.tb.reply_to(msg, text, parse_mode='Markdown')
     
     def fetch_data(self, symbol: str, interval: str = '5m', period: str = '5d') -> Optional[pd.DataFrame]:
         for attempt in range(self.config.MAX_RETRIES):
@@ -745,7 +569,7 @@ class FalconProBot:
                 if not df.empty:
                     df.columns = [c.capitalize() for c in df.columns]
                     return df
-            except Exception as e:
+            except:
                 if attempt < self.config.MAX_RETRIES - 1:
                     time.sleep(self.config.RETRY_DELAY)
         return None
@@ -768,7 +592,6 @@ class FalconProBot:
             if df_5m is None or df_15m is None:
                 return None
             
-            # ✅ Dynamic threshold based on performance
             threshold = self.db.get_dynamic_threshold(symbol)
             
             dir_5m, conf_5m, info_5m = model.predict(df_5m, threshold)
@@ -777,10 +600,8 @@ class FalconProBot:
             if dir_5m != dir_15m or dir_5m == "NEUTRAL":
                 return None
             
-            # ✅ Market Regime
             regime = MarketRegime.detect(df_15m)
             
-            # Don't trade ranges with low confidence
             if not regime['is_trend'] and conf_5m < 0.70:
                 return None
             
@@ -810,7 +631,7 @@ class FalconProBot:
             emoji = "🟢" if signal['direction'] == 'BUY' else "🔴"
             direction = "شراء ▲" if signal['direction'] == 'BUY' else "بيع ▼"
             
-            msg = f"{emoji} **{signal['symbol']}** - {direction}\n\n💰 {signal['entry_price']:.5f}\n⏳ {self.config.TRADE_DURATION_MINUTES} د\n💪 {signal['confidence']:.1%}\n📊 {signal['regime']}\n\n🤖 Falcon Pro v4"
+            msg = f"{emoji} **{signal['symbol']}** - {direction}\n\n💰 {signal['entry_price']:.5f}\n⏳ {self.config.TRADE_DURATION_MINUTES} د\n💪 {signal['confidence']:.1%}\n📊 {signal['regime']}\n\n🤖 Falcon Pro"
             
             self.tb.send_message(self.config.TELEGRAM_CHAT_ID, msg, parse_mode='Markdown')
             self.logger.info(f"✅ إشارة: {signal['symbol']} {signal['direction']}")
@@ -852,22 +673,20 @@ class FalconProBot:
         return signals
     
     def train_all_models(self):
-        self.logger.info("🎓 بدء التدريب المتقدم...")
+        self.logger.info("🎓 تدريب...")
         
         for symbol in self.config.SYMBOLS:
             try:
-                # ✅ 12-24 month training data
                 df = None
                 for interval, period in [('1h', self.config.TRAINING_PERIOD_1H), 
                                           ('15m', self.config.TRAINING_PERIOD_15M)]:
                     df = self.fetch_data(symbol, interval, period)
                     if df is not None and len(df) >= self.config.MIN_TRAINING_SAMPLES:
-                        self.logger.info(f"{symbol}: {len(df)} صف بفريم {interval} ({period})")
                         break
                     time.sleep(3)
                 
                 if df is not None:
-                    model = ProEnsembleModel(symbol, self.config, self.logger)
+                    model = EnsembleModel(symbol, self.config, self.logger)
                     if model.train(df):
                         model.save()
                         self.models[symbol] = model
@@ -881,7 +700,7 @@ class FalconProBot:
         trained = sum(1 for m in self.models.values() if m.is_trained)
         try:
             self.tb.send_message(self.config.TELEGRAM_CHAT_ID,
-                f"🎓 **تدريب مكتمل**\n✅ {trained}/{len(self.config.SYMBOLS)}\n📊 Walk-Forward + Meta Model",
+                f"🎓 **تدريب مكتمل**\n✅ {trained}/{len(self.config.SYMBOLS)}",
                 parse_mode='Markdown')
         except:
             pass
@@ -898,14 +717,11 @@ class FalconProBot:
     def run(self):
         self.running = True
         
-        self.logger.info("=" * 50)
-        self.logger.info("🦅 Falcon AI Pro v4.0")
-        self.logger.info(f"📅 تدريب: {self.config.TRAINING_PERIOD_1H}")
-        self.logger.info(f"🔄 Walk-Forward: {self.config.WALK_FORWARD_WINDOWS} windows")
-        self.logger.info(f"🧠 Meta Model: Logistic Regression")
-        self.logger.info(f"📊 Calibration: Isotonic")
-        self.logger.info(f"🎯 Dynamic Threshold: {self.config.CONFIDENCE_THRESHOLD_MIN}-{self.config.CONFIDENCE_THRESHOLD_MAX}")
-        self.logger.info("=" * 50)
+        self.logger.info("=" * 40)
+        self.logger.info("🦅 Falcon AI Pro v4")
+        self.logger.info(f"🤖 XGBoost + CatBoost + RF + GB")
+        self.logger.info(f"🧠 Meta Model Active")
+        self.logger.info("=" * 40)
         
         self.start_telegram()
         time.sleep(2)
@@ -918,7 +734,7 @@ class FalconProBot:
         try:
             trained = sum(1 for m in self.models.values() if m.is_trained)
             self.tb.send_message(self.config.TELEGRAM_CHAT_ID,
-                f"🦅 **Falcon Pro v4**\n✅ {trained}/{len(self.config.SYMBOLS)}\n🧠 Meta Model Active\n⚡️ Scanning...",
+                f"🦅 **Falcon Pro**\n✅ {trained}/{len(self.config.SYMBOLS)}\n⚡️ Scanning...",
                 parse_mode='Markdown')
         except:
             pass
