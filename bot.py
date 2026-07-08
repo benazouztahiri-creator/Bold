@@ -41,7 +41,7 @@ class Config:
     TELEGRAM_CHAT_ID: str = os.environ.get('TELEGRAM_CHAT_ID', '7553333305')
     
     # ✅ Alpha Vantage API Key (مجاني من alphavantage.co)
-    ALPHA_VANTAGE_KEY: str = os.environ.get('ALPHA_VANTAGE_KEY', 'demo')
+    ALPHA_VANTAGE_KEY: str = os.environ.get('5TFFWK21CUNA3P25', 'demo')
     
     SCAN_INTERVAL: int = 60
     
