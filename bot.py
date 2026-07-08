@@ -5,6 +5,7 @@ Falcon AI v11 - Adaptive Strategy Switcher
 Step 1: Read market (Trend / Range / Breakout)
 Step 2: Choose strategy (1 / 2 / 3)
 Step 3: Execute
+No auto-train on startup. Use /train command.
 """
 
 import os
@@ -17,14 +18,13 @@ import hashlib
 import threading
 from typing import Dict, List, Tuple, Optional
 from datetime import datetime, timedelta
-from collections import deque
 import numpy as np
 import pandas as pd
 import requests
 
 from sklearn.preprocessing import RobustScaler
+from sklearn.feature_selection import mutual_info_classif
 import xgboost as xgb
-from sklearn.ensemble import RandomForestClassifier
 
 import telebot
 import joblib
@@ -35,6 +35,7 @@ import joblib
 
 TELEGRAM_TOKEN = os.environ.get('TELEGRAM_TOKEN', '8773849578:AAH9a6-8hU5YFYTad2EA5jQyfffIoeL8npk')
 TELEGRAM_CHAT_ID = os.environ.get('TELEGRAM_CHAT_ID', '7553333305')
+ALPHA_VANTAGE_KEY = os.environ.get('ALPHA_VANTAGE_KEY', '5TFFWK21CUNA3P25')
 
 SYMBOLS = ['EURUSD', 'GBPUSD', 'USDJPY', 'AUDUSD', 'USDCAD', 'EURGBP', 'EURJPY', 'GBPJPY']
 
@@ -142,22 +143,12 @@ class Database:
             return stats
 
 # ============================================================================
-# MARKET READER - أهم جزء
+# MARKET READER
 # ============================================================================
 
 class MarketReader:
-    """
-    يقرأ السوق ويحدد نوعه:
-    1. TREND (ترند قوي)
-    2. RANGE (تذبذب)
-    3. BREAKOUT (اختراق)
-    """
-    
     @staticmethod
     def read(df: pd.DataFrame) -> Dict:
-        """
-        تحليل السوق وتحديد النوع
-        """
         if len(df) < 50:
             return {'type': 'unknown', 'confidence': 0}
         
@@ -165,62 +156,44 @@ class MarketReader:
         h = df['High'].values
         l = df['Low'].values
         
-        # ========== 1. حساب ADX (قوة الترند) ==========
+        # ADX
         adx = MarketReader._calculate_adx(df)
         current_adx = adx[-1]
         
-        # ========== 2. حساب Bollinger Band Width (التذبذب) ==========
+        # Bollinger Band Width
         sma20 = np.mean(c[-20:])
         std20 = np.std(c[-20:])
-        bb_width = (4 * std20) / sma20 * 100  # كنسبة مئوية
+        bb_width = (4 * std20) / sma20 * 100
         
-        # متوسط عرض البولنجر لآخر 50 شمعة
         historical_widths = []
         for i in range(50, len(c)):
             sma = np.mean(c[i-20:i])
             std = np.std(c[i-20:i])
             historical_widths.append((4 * std) / sma * 100)
-        
         avg_width = np.mean(historical_widths) if historical_widths else bb_width
         
-        # ========== 3. حساب الاختراقات ==========
+        # Breakout detection
         high_20 = np.max(h[-20:])
         low_20 = np.min(l[-20:])
         current_price = c[-1]
-        
-        # هل السعر قريب من اختراق؟
         near_breakout_high = current_price > high_20 * 0.998
         near_breakout_low = current_price < low_20 * 1.002
         
-        # ========== 4. تحديد النوع ==========
+        # Scoring
         scores = {'trend': 0, 'range': 0, 'breakout': 0}
         
-        # ترند؟
-        if current_adx > 25:
-            scores['trend'] += 3
-        elif current_adx > 20:
-            scores['trend'] += 1
+        if current_adx > 25: scores['trend'] += 3
+        elif current_adx > 20: scores['trend'] += 1
         
-        # تذبذب؟
-        if bb_width < avg_width * 0.7:  # بولنجر بينضغط = تذبذب
-            scores['range'] += 3
-        elif bb_width < avg_width * 0.9:
-            scores['range'] += 1
+        if bb_width < avg_width * 0.7: scores['range'] += 3
+        elif bb_width < avg_width * 0.9: scores['range'] += 1
         
-        # اختراق؟
-        if near_breakout_high or near_breakout_low:
-            scores['breakout'] += 2
-        
-        # لو بولنجر متسع = غالباً ترند أو اختراق
+        if near_breakout_high or near_breakout_low: scores['breakout'] += 2
         if bb_width > avg_width * 1.3:
             scores['trend'] += 1
             scores['breakout'] += 1
+        if current_adx < 20: scores['range'] += 2
         
-        # لو ADX منخفض = تذبذب
-        if current_adx < 20:
-            scores['range'] += 2
-        
-        # تحديد الفائز
         market_type = max(scores, key=scores.get)
         confidence = scores[market_type] / max(sum(scores.values()), 1)
         
@@ -229,8 +202,7 @@ class MarketReader:
             'confidence': confidence,
             'adx': round(current_adx, 1),
             'bb_width': round(bb_width, 2),
-            'scores': scores,
-            'near_breakout': near_breakout_high or near_breakout_low
+            'scores': scores
         }
     
     @staticmethod
@@ -243,12 +215,10 @@ class MarketReader:
         tr2 = np.abs(h[1:] - c[:-1])
         tr3 = np.abs(l[1:] - c[:-1])
         tr = np.maximum(np.maximum(tr1, tr2), tr3)
-        
         atr = pd.Series(tr).ewm(span=period, adjust=False).mean().values
         
         up_move = h[1:] - h[:-1]
         down_move = l[:-1] - l[1:]
-        
         plus_dm = np.where((up_move > down_move) & (up_move > 0), up_move, 0)
         minus_dm = np.where((down_move > up_move) & (down_move > 0), down_move, 0)
         
@@ -300,84 +270,49 @@ def calculate_features(df: pd.DataFrame) -> pd.DataFrame:
     return f.fillna(0)
 
 # ============================================================================
-# STRATEGIES
+# STRATEGY ENGINE
 # ============================================================================
 
 class StrategyEngine:
-    """
-    3 استراتيجيات مختلفة:
-    1. TREND: اتباع الترند (EMA crossover)
-    2. RANGE: الارتداد من الحدود (Bollinger + RSI)
-    3. BREAKOUT: اختراق القمم/القيعان (Donchian)
-    """
-    
     def __init__(self):
-        self.models = {
-            'trend': None,    # XGBoost للترند
-            'range': None,    # XGBoost للتذبذب
-            'breakout': None  # XGBoost للاختراق
-        }
-        self.scalers = {
-            'trend': RobustScaler(),
-            'range': RobustScaler(),
-            'breakout': RobustScaler()
-        }
+        self.models = {'trend': None, 'range': None, 'breakout': None}
+        self.scalers = {'trend': RobustScaler(), 'range': RobustScaler(), 'breakout': RobustScaler()}
         self.features = {}
         self.is_trained = False
     
     def train_all(self, df: pd.DataFrame):
-        """تدريب 3 نماذج على 3 أنواع مختلفة من الأسواق"""
-        logger.info("🎓 تدريب الاستراتيجيات الثلاث...")
+        logger.info("🎓 تدريب الاستراتيجيات...")
         
         X = calculate_features(df)
-        
-        # تصنيف السوق لكل شمعة
-        market_types = []
-        for i in range(50, len(df)):
-            chunk = df.iloc[i-50:i+1]
-            market_info = MarketReader.read(chunk)
-            market_types.append(market_info['type'])
-        
-        # محاذاة البيانات
-        X = X.iloc[50:]
-        
-        # Target
         future = df['Close'].shift(-5)
         change = (future - df['Close']) / df['Close'] * 100
-        y_trend = pd.Series(np.nan, index=df.index)
-        y_range = pd.Series(np.nan, index=df.index)
-        y_breakout = pd.Series(np.nan, index=df.index)
         
-        # ترند: حركة قوية في اتجاه الترند
         ema20 = df['Close'].ewm(span=20).mean()
         ema50 = df['Close'].ewm(span=50).mean()
         uptrend = ema20 > ema50
         downtrend = ema20 < ema50
         
-        y_trend[(uptrend) & (change > 0.05)] = 1
-        y_trend[(downtrend) & (change < -0.05)] = 0
-        
-        # تذبذب: ارتداد من الحدود
         rsi = X['rsi']
-        y_range[(rsi < 35) & (change > 0.03)] = 1
-        y_range[(rsi > 65) & (change < -0.03)] = 0
-        
-        # اختراق: حركة سريعة بعد الاختراق
         high_20 = df['High'].rolling(20).max()
         low_20 = df['Low'].rolling(20).min()
         breakout_up = df['Close'] > high_20.shift(1)
         breakout_down = df['Close'] < low_20.shift(1)
         
-        y_breakout[(breakout_up) & (change > 0.08)] = 1
-        y_breakout[(breakout_down) & (change < -0.08)] = 0
+        targets = {
+            'trend': pd.Series(np.nan, index=df.index),
+            'range': pd.Series(np.nan, index=df.index),
+            'breakout': pd.Series(np.nan, index=df.index)
+        }
         
-        # محاذاة
-        y_trend = y_trend.iloc[50:]
-        y_range = y_range.iloc[50:]
-        y_breakout = y_breakout.iloc[50:]
+        targets['trend'][(uptrend) & (change > 0.05)] = 1
+        targets['trend'][(downtrend) & (change < -0.05)] = 0
+        targets['range'][(rsi < 35) & (change > 0.03)] = 1
+        targets['range'][(rsi > 65) & (change < -0.03)] = 0
+        targets['breakout'][(breakout_up) & (change > 0.08)] = 1
+        targets['breakout'][(breakout_down) & (change < -0.08)] = 0
         
-        # تدريب كل نموذج
-        for name, y in [('trend', y_trend), ('range', y_range), ('breakout', y_breakout)]:
+        for name in ['trend', 'range', 'breakout']:
+            y = targets[name]
             valid = ~(X.isna().any(axis=1) | y.isna())
             X_valid = X[valid]
             y_valid = y[valid]
@@ -385,14 +320,11 @@ class StrategyEngine:
             if len(X_valid) < 100:
                 continue
             
-            # اختيار ميزات
-            from sklearn.feature_selection import mutual_info_classif
             mi = mutual_info_classif(X_valid, y_valid, random_state=42)
             scores = sorted(zip(X_valid.columns, mi), key=lambda x: x[1], reverse=True)
             self.features[name] = [s[0] for s in scores[:12]]
             
             X_sel = X_valid[self.features[name]]
-            
             split = int(len(X_sel) * 0.8)
             X_train_s = self.scalers[name].fit_transform(X_sel[:split])
             
@@ -401,34 +333,26 @@ class StrategyEngine:
                 random_state=42, verbosity=0, tree_method='hist'
             )
             model.fit(X_train_s, y_valid[:split])
-            
             self.models[name] = model
             logger.info(f"  ✅ {name}: {len(X_valid)} عينة")
         
         self.is_trained = True
     
     def predict(self, df: pd.DataFrame, strategy: str, threshold: float = 0.55) -> Tuple[Optional[str], float]:
-        """تنبؤ باستخدام استراتيجية محددة"""
-        if not self.is_trained or strategy not in self.models:
-            return None, 0.0
-        
-        model = self.models[strategy]
-        scaler = self.scalers[strategy]
-        features = self.features.get(strategy, [])
-        
-        if model is None:
+        if not self.is_trained or strategy not in self.models or self.models[strategy] is None:
             return None, 0.0
         
         X = calculate_features(df).iloc[[-1]]
+        features = self.features.get(strategy, [])
         available = [f for f in features if f in X.columns]
         
         if len(available) < 5:
             return None, 0.0
         
         X = X[available].fillna(0)
-        X_s = scaler.transform(X)
+        X_s = self.scalers[strategy].transform(X)
         
-        proba = model.predict_proba(X_s)[0]
+        proba = self.models[strategy].predict_proba(X_s)[0]
         
         if proba[1] > threshold:
             return 'BUY', proba[1]
@@ -457,7 +381,7 @@ class StrategyEngine:
         return True
 
 # ============================================================================
-# MAIN TRADER
+# MAIN BOT
 # ============================================================================
 
 class FalconV11:
@@ -469,22 +393,96 @@ class FalconV11:
         self.tb = telebot.TeleBot(TELEGRAM_TOKEN)
         self._setup_bot()
         
-        # تدريب أو تحميل
-        if not self.engine.load():
-            self._initial_train()
+        if self.engine.load():
+            logger.info("📂 تم تحميل الاستراتيجيات")
+        else:
+            logger.info("⚠️ استخدم /train للتدريب")
     
-    def _initial_train(self):
-        """تدريب أولي"""
-        logger.info("📥 جلب بيانات للتدريب...")
+    def _fetch_live(self, symbol: str) -> Optional[pd.DataFrame]:
+        # Yahoo Finance
+        try:
+            import yfinance as yf
+            df = yf.download(f'{symbol}=X', period='5d', interval='5m', progress=False)
+            if not df.empty:
+                df.columns = [c.capitalize() for c in df.columns]
+                return df
+        except:
+            pass
         
-        import yfinance as yf
-        df = yf.download('EURUSD=X', period='3mo', interval='15m', progress=False)
+        # Alpha Vantage
+        try:
+            from_curr = symbol[:3]
+            to_curr = symbol[3:]
+            params = {
+                'function': 'FX_INTRADAY',
+                'from_symbol': from_curr,
+                'to_symbol': to_curr,
+                'interval': '5min',
+                'outputsize': 'compact',
+                'apikey': ALPHA_VANTAGE_KEY
+            }
+            r = requests.get('https://www.alphavantage.co/query', params=params, timeout=10)
+            data = r.json()
+            key = 'Time Series FX (5min)'
+            if key in data:
+                records = []
+                for ts, vals in data[key].items():
+                    records.append({
+                        'Date': ts, 'Open': float(vals['1. open']),
+                        'High': float(vals['2. high']), 'Low': float(vals['3. low']),
+                        'Close': float(vals['4. close']), 'Volume': 0
+                    })
+                df = pd.DataFrame(records)
+                df['Date'] = pd.to_datetime(df['Date'])
+                df = df.set_index('Date').sort_index()
+                return df
+        except:
+            pass
         
-        if not df.empty:
-            df.columns = [c.capitalize() for c in df.columns]
-            self.engine.train_all(df)
-            self.engine.save()
-            logger.info("✅ التدريب اكتمل")
+        return None
+    
+    def _fetch_training_data(self) -> Optional[pd.DataFrame]:
+        """جلب بيانات للتدريب"""
+        # Alpha Vantage
+        try:
+            params = {
+                'function': 'FX_INTRADAY',
+                'from_symbol': 'EUR', 'to_symbol': 'USD',
+                'interval': '15min', 'outputsize': 'full',
+                'apikey': ALPHA_VANTAGE_KEY
+            }
+            r = requests.get('https://www.alphavantage.co/query', params=params, timeout=15)
+            data = r.json()
+            key = 'Time Series FX (15min)'
+            if key in data:
+                records = []
+                for ts, vals in data[key].items():
+                    records.append({
+                        'Date': ts, 'Open': float(vals['1. open']),
+                        'High': float(vals['2. high']), 'Low': float(vals['3. low']),
+                        'Close': float(vals['4. close']), 'Volume': 0
+                    })
+                df = pd.DataFrame(records)
+                df['Date'] = pd.to_datetime(df['Date'])
+                df = df.set_index('Date').sort_index()
+                df.columns = [c.capitalize() for c in df.columns]
+                logger.info(f"✅ Alpha Vantage: {len(df)} صف")
+                return df
+        except:
+            pass
+        
+        # Yahoo بديل
+        try:
+            import yfinance as yf
+            df = yf.download('EURUSD=X', period='2mo', interval='15m', progress=False)
+            if not df.empty:
+                df.columns = [c.capitalize() for c in df.columns]
+                logger.info(f"✅ Yahoo: {len(df)} صف")
+                return df
+        except:
+            pass
+        
+        return None
     
     def _setup_bot(self):
         try:
@@ -497,19 +495,42 @@ class FalconV11:
             if str(msg.chat.id) != TELEGRAM_CHAT_ID:
                 return
             
-            stats = self.db.get_strategy_stats()
-            
-            text = (f"🦅 **Falcon V11 - Adaptive**\n\n"
-                   f"🧠 3 استراتيجيات\n"
-                   f"📊 ترند: {stats['trend']['win_rate']:.0%} ({stats['trend']['total']})\n"
-                   f"📊 تذبذب: {stats['range']['win_rate']:.0%} ({stats['range']['total']})\n"
-                   f"📊 اختراق: {stats['breakout']['win_rate']:.0%} ({stats['breakout']['total']})")
+            if self.engine.is_trained:
+                stats = self.db.get_strategy_stats()
+                text = (f"🦅 **Falcon V11**\n\n"
+                       f"🧠 3 استراتيجيات\n"
+                       f"📈 ترند: {stats['trend']['win_rate']:.0%}\n"
+                       f"📊 تذبذب: {stats['range']['win_rate']:.0%}\n"
+                       f"🚀 اختراق: {stats['breakout']['win_rate']:.0%}")
+            else:
+                text = "🦅 **Falcon V11**\n\n⚠️ استخدم /train للتدريب"
             
             self.tb.reply_to(msg, text, parse_mode='Markdown')
+        
+        @self.tb.message_handler(commands=['train'])
+        def train_cmd(msg):
+            if str(msg.chat.id) != TELEGRAM_CHAT_ID:
+                return
+            
+            self.tb.reply_to(msg, "📥 جلب بيانات للتدريب...")
+            df = self._fetch_training_data()
+            
+            if df is None or len(df) < 100:
+                self.tb.reply_to(msg, "❌ لا توجد بيانات كافية")
+                return
+            
+            self.tb.reply_to(msg, f"🎓 تدريب على {len(df)} صف...")
+            self.engine.train_all(df)
+            self.engine.save()
+            self.tb.reply_to(msg, "✅ التدريب اكتمل!")
         
         @self.tb.message_handler(func=lambda msg: True)
         def analyze_any(msg):
             if str(msg.chat.id) != TELEGRAM_CHAT_ID:
+                return
+            
+            if not self.engine.is_trained:
+                self.tb.reply_to(msg, "❌ استخدم /train الأول")
                 return
             
             symbol = msg.text.strip().upper()
@@ -520,46 +541,26 @@ class FalconV11:
                 self.tb.reply_to(msg, "❌ لا بيانات")
                 return
             
-            # قراءة السوق
             market = self.reader.read(df)
-            
-            # اختيار الاستراتيجية
             strategy = market['type']
-            
-            # تنبؤ
             direction, confidence = self.engine.predict(df, strategy, 0.52)
-            
             price = float(df['Close'].iloc[-1])
             
             if direction:
                 emoji = "🟢" if direction == 'BUY' else "🔴"
                 dir_ar = "شراء ▲" if direction == 'BUY' else "بيع ▼"
-                
                 text = (f"📊 **{symbol}**\n\n"
-                       f"🏷 السوق: {strategy}\n"
-                       f"{emoji} {dir_ar}\n"
-                       f"💰 {price:.5f}\n"
-                       f"💪 {confidence:.1%}")
+                       f"🏷 {strategy}\n{emoji} {dir_ar}\n"
+                       f"💰 {price:.5f}\n💪 {confidence:.1%}")
             else:
-                text = (f"📊 **{symbol}**\n\n"
-                       f"🏷 السوق: {strategy}\n"
-                       f"💰 {price:.5f}\n"
-                       f"⏳ انتظار...")
+                text = (f"📊 **{symbol}**\n\n🏷 {strategy}\n💰 {price:.5f}\n⏳ انتظار")
             
             self.tb.reply_to(msg, text, parse_mode='Markdown')
     
-    def _fetch_live(self, symbol: str) -> Optional[pd.DataFrame]:
-        try:
-            import yfinance as yf
-            df = yf.download(f'{symbol}=X', period='5d', interval='5m', progress=False)
-            if not df.empty:
-                df.columns = [c.capitalize() for c in df.columns]
-                return df
-        except:
-            pass
-        return None
-    
     def analyze(self, symbol: str) -> Optional[Dict]:
+        if not self.engine.is_trained:
+            return None
+        
         if self.db.has_active_signal(symbol):
             return None
         
@@ -570,34 +571,27 @@ class FalconV11:
         if df is None:
             return None
         
-        # ✅ خطوة 1: اقرأ السوق
         market = self.reader.read(df)
         strategy = market['type']
         
         if market['confidence'] < 0.4:
-            return None  # السوق مش واضح
+            return None
         
-        # ✅ خطوة 2: استخدم الاستراتيجية المناسبة
         threshold = 0.55 if strategy == 'trend' else (0.52 if strategy == 'range' else 0.58)
         direction, confidence = self.engine.predict(df, strategy, threshold)
         
         if direction is None:
             return None
         
-        # ✅ خطوة 3: حدد المدة حسب نوع السوق
         duration = 5 if strategy == 'breakout' else (7 if strategy == 'trend' else 10)
-        
         entry = float(df['Close'].iloc[-1])
         
-        logger.info(f"🎯 {symbol}: {direction} | {strategy} | {confidence:.1%} | {duration}د")
+        logger.info(f"🎯 {symbol}: {direction} | {strategy} | {confidence:.1%}")
         
         return {
-            'symbol': symbol,
-            'direction': direction,
-            'entry_price': entry,
-            'confidence': confidence,
-            'strategy': strategy,
-            'market_type': strategy,
+            'symbol': symbol, 'direction': direction,
+            'entry_price': entry, 'confidence': confidence,
+            'strategy': strategy, 'market_type': strategy,
             'duration': duration,
             'expiry_time': (datetime.now() + timedelta(minutes=duration)).strftime('%Y-%m-%d %H:%M:%S')
         }
@@ -605,7 +599,6 @@ class FalconV11:
     def send_signal(self, signal: Dict):
         emoji = "🟢" if signal['direction'] == 'BUY' else "🔴"
         direction = "شراء ▲" if signal['direction'] == 'BUY' else "بيع ▼"
-        
         strategy_emoji = {'trend': '📈', 'range': '📊', 'breakout': '🚀'}
         
         msg = (f"{emoji} **{signal['symbol']}** - {direction}\n\n"
@@ -617,7 +610,6 @@ class FalconV11:
         
         try:
             self.tb.send_message(TELEGRAM_CHAT_ID, msg, parse_mode='Markdown')
-            logger.info(f"✅ {signal['symbol']} {signal['direction']} ({signal['strategy']})")
         except:
             pass
     
@@ -631,7 +623,6 @@ class FalconV11:
                 current = float(df['Close'].iloc[-1])
                 entry = trade['entry_price']
                 direction = trade['direction']
-                
                 pip_value = 0.01 if 'JPY' in trade['symbol'] else 0.0001
                 
                 if direction == 'BUY':
@@ -644,7 +635,6 @@ class FalconV11:
                     result = 'WIN' if current < entry else 'LOSS'
                 
                 self.db.update_result(trade['id'], current, result, pnl, round(pips, 1))
-                logger.info(f"{'✅' if result == 'WIN' else '❌'} {trade['symbol']}: {result} | {trade.get('strategy', '')}")
             except:
                 pass
     
@@ -659,7 +649,6 @@ class FalconV11:
     
     def run(self):
         logger.info("🦅 Falcon V11 - Adaptive Strategy Switcher")
-        logger.info("🧠 3 استراتيجيات: ترند | تذبذب | اختراق")
         
         def poll():
             while True:
@@ -671,9 +660,10 @@ class FalconV11:
         time.sleep(1)
         
         try:
-            self.tb.send_message(TELEGRAM_CHAT_ID,
-                "🦅 **Falcon V11**\n\n🧠 3 استراتيجيات\n📈 ترند | 📊 تذبذب | 🚀 اختراق\n⚡️ يعمل...",
-                parse_mode='Markdown')
+            status_text = "🦅 **Falcon V11**\n\n🧠 3 استراتيجيات\n📈 📊 🚀\n⚡️ يعمل..."
+            if not self.engine.is_trained:
+                status_text += "\n⚠️ استخدم /train"
+            self.tb.send_message(TELEGRAM_CHAT_ID, status_text, parse_mode='Markdown')
         except:
             pass
         
