@@ -1,10 +1,8 @@
 #!/usr/bin/env python3
 """
-Falcon AI v9.0 - Self-Evolving Trading Strategy
-=================================================
-The AI discovers its own winning strategy.
-No hardcoded rules. Pure reinforcement learning.
-12 Forex pairs. Automatic training.
+Falcon AI v9.1 - Alpha Vantage Data
+=====================================
+Free data source. No Yahoo Finance needed.
 """
 
 import os
@@ -23,7 +21,6 @@ from collections import deque
 
 import numpy as np
 import pandas as pd
-import yfinance as yf
 import requests
 
 from sklearn.preprocessing import RobustScaler
@@ -43,13 +40,15 @@ class Config:
     TELEGRAM_TOKEN: str = os.environ.get('TELEGRAM_TOKEN', '8773849578:AAH9a6-8hU5YFYTad2EA5jQyfffIoeL8npk')
     TELEGRAM_CHAT_ID: str = os.environ.get('TELEGRAM_CHAT_ID', '7553333305')
     
+    # ✅ Alpha Vantage API Key (مجاني من alphavantage.co)
+    ALPHA_VANTAGE_KEY: str = os.environ.get('ALPHA_VANTAGE_KEY', 'demo')
+    
     SCAN_INTERVAL: int = 60
     
-    # ✅ 12 زوج فوركس
     SYMBOLS: List[str] = field(default_factory=lambda: [
-        'EURUSD=X', 'GBPUSD=X', 'USDJPY=X', 'AUDUSD=X',
-        'USDCAD=X', 'NZDUSD=X', 'EURGBP=X', 'EURJPY=X',
-        'GBPJPY=X', 'EURCHF=X', 'USDCHF=X', 'AUDJPY=X'
+        'EURUSD', 'GBPUSD', 'USDJPY', 'AUDUSD',
+        'USDCAD', 'NZDUSD', 'EURGBP', 'EURJPY',
+        'GBPJPY', 'EURCHF', 'USDCHF', 'AUDJPY'
     ])
     
     TRAINING_PERIOD: str = '2mo'
@@ -59,9 +58,6 @@ class Config:
     MODELS_DIR: str = 'models_v9'
     STRATEGY_FILE: str = 'evolved_strategy.json'
     
-    LEARNING_RATE: float = 0.1
-    MEMORY_SIZE: int = 100
-    MIN_WIN_RATE: float = 0.45
     SIGNAL_COOLDOWN_MINUTES: int = 5
 
 # ============================================================================
@@ -77,108 +73,159 @@ logging.basicConfig(
 logger = logging.getLogger('FalconV9')
 
 # ============================================================================
-# SELF-EVOLVING STRATEGY
+# DATA FETCHER - Alpha Vantage (مجاني)
+# ============================================================================
+
+class DataFetcher:
+    def __init__(self, api_key: str):
+        self.api_key = api_key
+        self.base_url = "https://www.alphavantage.co/query"
+        self.cache = {}
+        self.cache_time = {}
+        self.cache_duration = 30  # ثواني
+    
+    def fetch_forex(self, symbol: str, interval: str = '5min', outputsize: str = 'compact') -> Optional[pd.DataFrame]:
+        """جلب بيانات الفوركس"""
+        
+        # ✅ رمز الفوركس لـ Alpha Vantage
+        from_currency = symbol[:3]
+        to_currency = symbol[3:]
+        
+        # ✅ كاش
+        cache_key = f"{symbol}_{interval}_{outputsize}"
+        if cache_key in self.cache:
+            if time.time() - self.cache_time.get(cache_key, 0) < self.cache_duration:
+                return self.cache[cache_key].copy()
+        
+        # ✅ تحويل الفاصل الزمني
+        interval_map = {
+            '1m': '1min', '5m': '5min', '15m': '15min',
+            '30m': '30min', '1h': '60min'
+        }
+        av_interval = interval_map.get(interval, '5min')
+        
+        params = {
+            'function': 'FX_INTRADAY',
+            'from_symbol': from_currency,
+            'to_symbol': to_currency,
+            'interval': av_interval,
+            'outputsize': outputsize,
+            'apikey': self.api_key
+        }
+        
+        try:
+            response = requests.get(self.base_url, params=params, timeout=10)
+            data = response.json()
+            
+            # ✅ استخراج البيانات
+            time_series_key = f"Time Series FX ({av_interval})"
+            
+            if time_series_key not in data:
+                logger.warning(f"⚠️ {symbol}: لا بيانات من Alpha Vantage")
+                # ✅ جرب Yahoo Finance كبديل
+                return self._fetch_yahoo_fallback(symbol, interval)
+            
+            time_series = data[time_series_key]
+            
+            records = []
+            for timestamp, values in time_series.items():
+                records.append({
+                    'Date': timestamp,
+                    'Open': float(values['1. open']),
+                    'High': float(values['2. high']),
+                    'Low': float(values['3. low']),
+                    'Close': float(values['4. close']),
+                    'Volume': 0
+                })
+            
+            df = pd.DataFrame(records)
+            df['Date'] = pd.to_datetime(df['Date'])
+            df = df.set_index('Date').sort_index()
+            
+            # ✅ حفظ في الكاش
+            self.cache[cache_key] = df
+            self.cache_time[cache_key] = time.time()
+            
+            logger.info(f"✅ {symbol}: {len(df)} صف من Alpha Vantage")
+            return df
+            
+        except Exception as e:
+            logger.error(f"❌ {symbol}: Alpha Vantage فشل - {e}")
+            return self._fetch_yahoo_fallback(symbol, interval)
+    
+    def _fetch_yahoo_fallback(self, symbol: str, interval: str) -> Optional[pd.DataFrame]:
+        """✅ بديل احتياطي: Yahoo Finance"""
+        try:
+            import yfinance as yf
+            
+            # تحويل الرمز
+            yahoo_symbol = f"{symbol}=X"
+            
+            # تحويل الفاصل
+            interval_map = {'1m': '1m', '5m': '5m', '15m': '15m', '1h': '1h'}
+            yf_interval = interval_map.get(interval, '5m')
+            
+            df = yf.download(yahoo_symbol, period='5d', interval=yf_interval, progress=False)
+            
+            if not df.empty:
+                df.columns = [c.capitalize() for c in df.columns]
+                logger.info(f"✅ {symbol}: {len(df)} صف من Yahoo (بديل)")
+                return df
+            
+        except:
+            pass
+        
+        return None
+
+# ============================================================================
+# STRATEGY
 # ============================================================================
 
 class EvolvingStrategy:
     def __init__(self, config: Config):
         self.config = config
-        self.memory = deque(maxlen=config.MEMORY_SIZE)
-        
-        self.confidence_threshold = 0.52  # ✅ أقل عشان إشارات أكثر
+        self.memory = deque(maxlen=100)
+        self.confidence_threshold = 0.52
         self.base_duration = 7
-        self.symbol_weights = {s: 1.0 for s in config.SYMBOLS}
-        self.best_hours = list(range(24))
-        self.avoid_hours = []
-        
         self.total_trades = 0
         self.total_wins = 0
         self.current_win_rate = 0.5
         self.evolution_generation = 1
-        
         self.load()
     
     def add_result(self, trade_data: Dict):
-        self.memory.append({
-            'symbol': trade_data['symbol'],
-            'direction': trade_data['direction'],
-            'hour': trade_data.get('hour', datetime.now().hour),
-            'confidence': trade_data.get('confidence', 0),
-            'duration': trade_data.get('trade_duration', 7),
-            'pnl': trade_data.get('pnl_percent', 0),
-            'result': trade_data.get('result', 'LOSS'),
-        })
-        
+        self.memory.append(trade_data)
         self.total_trades += 1
         if trade_data.get('result') == 'WIN':
             self.total_wins += 1
-        
         self.current_win_rate = self.total_wins / max(self.total_trades, 1)
         
         if self.total_trades >= 10 and self.total_trades % 10 == 0:
-            self.evolve()
+            recent = list(self.memory)[-20:]
+            wins = [t for t in recent if t['result'] == 'WIN']
+            if wins:
+                self.confidence_threshold = np.clip(
+                    self.confidence_threshold + (0.01 if len(wins) > len(recent)/2 else -0.01),
+                    0.48, 0.70
+                )
+                self.base_duration = int(np.mean([t.get('duration', 7) for t in wins]))
+            self.evolution_generation += 1
+            self.save()
     
-    def evolve(self):
-        logger.info(f"🧬 تطور {self.evolution_generation}...")
-        
-        recent = list(self.memory)[-30:]
-        wins = [t for t in recent if t['result'] == 'WIN']
-        losses = [t for t in recent if t['result'] == 'LOSS']
-        
-        if wins and losses:
-            avg_win_conf = np.mean([t['confidence'] for t in wins])
-            avg_loss_conf = np.mean([t['confidence'] for t in losses])
-            
-            if avg_win_conf > avg_loss_conf + 0.05:
-                self.confidence_threshold = min(0.70, self.confidence_threshold + 0.02)
-            elif avg_loss_conf > avg_win_conf + 0.05:
-                self.confidence_threshold = max(0.48, self.confidence_threshold - 0.02)
-        
-        if wins:
-            self.base_duration = int(np.mean([t['duration'] for t in wins]))
-        
-        hour_perf = {}
-        for t in recent:
-            h = t['hour']
-            if h not in hour_perf:
-                hour_perf[h] = {'w': 0, 't': 0}
-            hour_perf[h]['t'] += 1
-            if t['result'] == 'WIN':
-                hour_perf[h]['w'] += 1
-        
-        sorted_h = sorted(hour_perf.items(), key=lambda x: x[1]['w']/max(x[1]['t'],1), reverse=True)
-        self.best_hours = [h for h, _ in sorted_h[:10]]
-        
-        self.evolution_generation += 1
-        self.save()
-        
-        logger.info(f"  🎯 عتبة={self.confidence_threshold:.0%} | ⏱️ مدة={self.base_duration}د")
-    
-    def should_trade_now(self, symbol: str) -> Tuple[bool, str]:
+    def should_trade_now(self) -> Tuple[bool, str]:
         now = datetime.utcnow()
         if now.weekday() >= 5:
             return False, "ويكند"
-        if now.weekday() == 4 and now.hour >= 20:
-            return False, "إغلاق جمعة"
         return True, "مسموح"
-    
-    def get_dynamic_threshold(self, symbol: str) -> float:
-        return self.confidence_threshold
-    
-    def get_dynamic_duration(self, symbol: str) -> int:
-        return self.base_duration
     
     def save(self):
         with open(self.config.STRATEGY_FILE, 'w') as f:
             json.dump({
                 'confidence_threshold': self.confidence_threshold,
                 'base_duration': self.base_duration,
-                'symbol_weights': self.symbol_weights,
-                'best_hours': self.best_hours,
                 'total_trades': self.total_trades,
-                'total_wins': self.total_wins,
                 'evolution_generation': self.evolution_generation
-            }, f, indent=2)
+            }, f)
     
     def load(self):
         if os.path.exists(self.config.STRATEGY_FILE):
@@ -187,7 +234,6 @@ class EvolvingStrategy:
                 self.confidence_threshold = data.get('confidence_threshold', 0.52)
                 self.base_duration = data.get('base_duration', 7)
                 self.total_trades = data.get('total_trades', 0)
-                self.total_wins = data.get('total_wins', 0)
                 self.evolution_generation = data.get('evolution_generation', 1)
 
 # ============================================================================
@@ -203,13 +249,11 @@ class Database:
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     symbol TEXT, direction TEXT, entry_price REAL,
                     exit_price REAL, confidence REAL,
-                    proba_buy REAL, proba_sell REAL,
-                    trade_duration INTEGER, trade_hour INTEGER,
+                    trade_duration INTEGER,
                     entry_time DATETIME DEFAULT CURRENT_TIMESTAMP,
                     expiry_time DATETIME, exit_time DATETIME,
                     result TEXT DEFAULT 'PENDING',
                     pnl_percent REAL, pnl_pips REAL,
-                    strategy_generation INTEGER,
                     signal_hash TEXT UNIQUE
                 )
             ''')
@@ -221,13 +265,12 @@ class Database:
             with sqlite3.connect(self.db_path) as conn:
                 conn.execute('''
                     INSERT OR IGNORE INTO signals 
-                    (symbol, direction, entry_price, confidence, proba_buy, proba_sell,
-                     trade_duration, trade_hour, expiry_time, strategy_generation, signal_hash)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    (symbol, direction, entry_price, confidence, trade_duration,
+                     expiry_time, signal_hash)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
                 ''', (data['symbol'], data['direction'], data['entry_price'],
-                      data['confidence'], data.get('proba_buy', 0), data.get('proba_sell', 0),
-                      data['trade_duration'], data.get('hour', datetime.now().hour),
-                      data['expiry_time'], data.get('strategy_gen', 1), h))
+                      data['confidence'], data['trade_duration'],
+                      data['expiry_time'], h))
                 conn.commit()
                 return conn.execute('SELECT last_insert_rowid()').fetchone()[0]
         except:
@@ -276,7 +319,7 @@ def calculate_features(df: pd.DataFrame) -> pd.DataFrame:
     
     for p in [1, 3, 5, 10]:
         f[f'ret_{p}'] = c.pct_change(p)
-    for p in [5, 10, 20, 50]:
+    for p in [5, 10, 20]:
         f[f'sma_{p}'] = c.rolling(p).mean()
         f[f'dist_{p}'] = (c - f[f'sma_{p}']) / (f[f'sma_{p}'] + 1e-8)
     
@@ -289,7 +332,6 @@ def calculate_features(df: pd.DataFrame) -> pd.DataFrame:
     ema26 = c.ewm(span=26).mean()
     f['macd'] = ema12 - ema26
     f['macd_s'] = f['macd'].ewm(span=9).mean()
-    f['macd_h'] = f['macd'] - f['macd_s']
     
     sma20 = c.rolling(20).mean()
     std20 = c.rolling(20).std()
@@ -309,13 +351,6 @@ def calculate_features(df: pd.DataFrame) -> pd.DataFrame:
     ndi = 100 * (ndm.ewm(span=14).mean()) / (atr14 + 1e-8)
     dx = 100 * abs(pdi - ndi) / (pdi + ndi + 1e-8)
     f['adx'] = dx.ewm(span=14).mean()
-    
-    l14 = l.rolling(14).min()
-    h14 = h.rolling(14).max()
-    f['stoch'] = 100 * (c - l14) / (h14 - l14 + 1e-8)
-    
-    for p in [5, 10]:
-        f[f'mom_{p}'] = c - c.shift(p)
     
     return f.fillna(0)
 
@@ -356,7 +391,7 @@ class TradingModel:
             
             mi = mutual_info_classif(X, y, random_state=42)
             scores = sorted(zip(X.columns, mi), key=lambda x: x[1], reverse=True)
-            self.features = [s[0] for s in scores[:18]]
+            self.features = [s[0] for s in scores[:15]]
             X = X[self.features]
             
             split = int(len(X) * 0.8)
@@ -365,20 +400,15 @@ class TradingModel:
             X_train_s = self.scaler.fit_transform(X_train)
             
             self.model = xgb.XGBClassifier(
-                n_estimators=200, max_depth=5, learning_rate=0.03,
+                n_estimators=150, max_depth=4, learning_rate=0.05,
                 random_state=42, n_jobs=1, verbosity=0, tree_method='hist'
             )
             self.model.fit(X_train_s, y_train)
             
-            X_val_s = self.scaler.transform(X_val)
-            val_pred = self.model.predict(X_val_s)
-            acc = accuracy_score(y_val, val_pred)
-            
-            logger.info(f"✅ {self.symbol}: دقة={acc:.1%}")
             self.is_trained = True
+            logger.info(f"✅ {self.symbol}: مدرب")
             return True
-        except Exception as e:
-            logger.error(f"❌ {self.symbol}: {e}")
+        except:
             return False
     
     def predict(self, df: pd.DataFrame, threshold: float = 0.52) -> Tuple[str, float, float, float]:
@@ -388,7 +418,7 @@ class TradingModel:
         try:
             X = calculate_features(df).iloc[[-1]]
             available = [f for f in self.features if f in X.columns]
-            if len(available) < 8:
+            if len(available) < 5:
                 return "NEUTRAL", 0.0, 0.5, 0.5
             
             X = X[available].fillna(0)
@@ -430,6 +460,7 @@ class TradingModel:
 class FalconV9:
     def __init__(self, config: Config):
         self.config = config
+        self.fetcher = DataFetcher(config.ALPHA_VANTAGE_KEY)
         self.db = Database(config.DB_PATH)
         self.strategy = EvolvingStrategy(config)
         self.models = {}
@@ -437,36 +468,31 @@ class FalconV9:
         self.tb = telebot.TeleBot(config.TELEGRAM_TOKEN)
         self._setup_bot()
         
-        # ✅ حذف النماذج القديمة وتدريب جديد
         if os.path.exists(config.MODELS_DIR):
             shutil.rmtree(config.MODELS_DIR)
         
         self._train_all_models()
     
     def _train_all_models(self):
-        """✅ تدريب كل الأزواج"""
-        logger.info(f"🎓 بدء تدريب {len(self.config.SYMBOLS)} زوج...")
+        logger.info(f"🎓 تدريب {len(self.config.SYMBOLS)} زوج...")
         
         for symbol in self.config.SYMBOLS:
             try:
-                logger.info(f"📥 {symbol}: جلب البيانات...")
-                df = self.fetch_data(symbol, '15m', self.config.TRAINING_PERIOD)
+                df = self.fetcher.fetch_forex(symbol, '15min', 'compact')
                 
-                if df is not None and len(df) >= self.config.MIN_TRAINING_SAMPLES:
+                if df is not None and len(df) >= 200:
                     model = TradingModel(symbol)
                     if model.train(df):
                         model.save()
                         self.models[symbol] = model
-                        logger.info(f"✅ {symbol}: تم")
-                else:
-                    logger.warning(f"⚠️ {symbol}: بيانات غير كافية")
+                        logger.info(f"✅ {symbol}")
                 
-                time.sleep(3)  # ✅ استراحة بين كل زوج
+                time.sleep(15)  # ✅ Alpha Vantage: 5 طلبات/دقيقة
             except Exception as e:
                 logger.error(f"❌ {symbol}: {e}")
         
         trained = sum(1 for m in self.models.values() if m.is_trained)
-        logger.info(f"🎓 اكتمل التدريب: {trained}/{len(self.config.SYMBOLS)}")
+        logger.info(f"🎓 جاهز: {trained}/{len(self.config.SYMBOLS)}")
     
     def _setup_bot(self):
         try:
@@ -479,20 +505,19 @@ class FalconV9:
             if str(msg.chat.id) != self.config.TELEGRAM_CHAT_ID:
                 return
             trained = sum(1 for m in self.models.values() if m.is_trained)
-            text = (f"🦅 **Falcon V9.0**\n"
+            text = (f"🦅 **Falcon V9.1**\n"
                    f"✅ نماذج: {trained}/{len(self.config.SYMBOLS)}\n"
-                   f"🧬 الجيل: {self.strategy.evolution_generation}\n"
                    f"📊 صفقات: {self.strategy.total_trades}\n"
                    f"📈 نجاح: {self.strategy.current_win_rate:.1%}\n"
                    f"🎯 العتبة: {self.strategy.confidence_threshold:.0%}\n"
-                   f"⏱️ المدة: {self.strategy.base_duration} د")
+                   f"📡 Alpha Vantage")
             self.tb.reply_to(msg, text, parse_mode='Markdown')
         
         @self.tb.message_handler(commands=['train'])
         def train_cmd(msg):
             if str(msg.chat.id) != self.config.TELEGRAM_CHAT_ID:
                 return
-            self.tb.reply_to(msg, "🎓 جاري إعادة التدريب...")
+            self.tb.reply_to(msg, "🎓 جاري التدريب...")
             self._train_all_models()
             trained = sum(1 for m in self.models.values() if m.is_trained)
             self.tb.reply_to(msg, f"✅ جاهز: {trained}/{len(self.config.SYMBOLS)}")
@@ -503,15 +528,11 @@ class FalconV9:
                 return
             
             symbol = msg.text.strip().upper()
-            if '=X' not in symbol and '/' not in symbol and '-' not in symbol:
-                symbol = f"{symbol}=X"
-            
             self.tb.reply_to(msg, f"🔍 تحليل {symbol}...")
             
-            df_5m = self.fetch_data(symbol, '5m', '3d')
-            df_15m = self.fetch_data(symbol, '15m', '5d')
+            df_5m = self.fetcher.fetch_forex(symbol, '5min')
             
-            if df_5m is None or df_15m is None:
+            if df_5m is None or df_5m.empty:
                 self.tb.reply_to(msg, f"❌ لا بيانات لـ {symbol}")
                 return
             
@@ -522,30 +543,16 @@ class FalconV9:
                 return
             
             dir_5m, conf_5m, pb_5m, ps_5m = model.predict(df_5m, 0.50)
-            dir_15m, conf_15m, pb_15m, ps_15m = model.predict(df_15m, 0.50)
             price = float(df_5m['Close'].iloc[-1])
             
             text = (f"📊 **{symbol}**\n\n"
                    f"💰 {price:.5f}\n\n"
-                   f"M5: {dir_5m} (B:{pb_5m:.0%} S:{ps_5m:.0%})\n"
-                   f"M15: {dir_15m} (B:{pb_15m:.0%} S:{ps_15m:.0%})")
+                   f"M5: {dir_5m} (B:{pb_5m:.0%} S:{ps_5m:.0%})")
             
             self.tb.reply_to(msg, text, parse_mode='Markdown')
     
-    def fetch_data(self, symbol: str, interval: str = '5m', period: str = '5d') -> Optional[pd.DataFrame]:
-        for _ in range(3):
-            try:
-                df = yf.Ticker(symbol).history(period=period, interval=interval)
-                if not df.empty:
-                    df.columns = [c.capitalize() for c in df.columns]
-                    return df
-            except:
-                time.sleep(3)
-        return None
-    
     def analyze(self, symbol: str) -> Optional[Dict]:
-        should_trade, reason = self.strategy.should_trade_now(symbol)
-        if not should_trade:
+        if not self.strategy.should_trade_now()[0]:
             return None
         
         model = self.models.get(symbol)
@@ -558,13 +565,13 @@ class FalconV9:
         if self.db.was_recent(symbol, self.config.SIGNAL_COOLDOWN_MINUTES):
             return None
         
-        df_5m = self.fetch_data(symbol, '5m', '3d')
-        df_15m = self.fetch_data(symbol, '15m', '5d')
+        df_5m = self.fetcher.fetch_forex(symbol, '5min')
+        df_15m = self.fetcher.fetch_forex(symbol, '15min')
         
         if df_5m is None or df_15m is None:
             return None
         
-        threshold = self.strategy.get_dynamic_threshold(symbol)
+        threshold = self.strategy.confidence_threshold
         
         dir_5m, conf_5m, pb_5m, ps_5m = model.predict(df_5m, threshold)
         dir_15m, conf_15m, pb_15m, ps_15m = model.predict(df_15m, threshold)
@@ -577,7 +584,6 @@ class FalconV9:
         if confidence < threshold:
             return None
         
-        duration = self.strategy.get_dynamic_duration(symbol)
         entry = float(df_5m['Close'].iloc[-1])
         
         return {
@@ -585,12 +591,8 @@ class FalconV9:
             'direction': dir_5m,
             'entry_price': entry,
             'confidence': confidence,
-            'proba_buy': (pb_5m + pb_15m) / 2,
-            'proba_sell': (ps_5m + ps_15m) / 2,
-            'trade_duration': duration,
-            'hour': datetime.now().hour,
-            'strategy_gen': self.strategy.evolution_generation,
-            'expiry_time': (datetime.now() + timedelta(minutes=duration)).strftime('%Y-%m-%d %H:%M:%S')
+            'trade_duration': self.strategy.base_duration,
+            'expiry_time': (datetime.now() + timedelta(minutes=self.strategy.base_duration)).strftime('%Y-%m-%d %H:%M:%S')
         }
     
     def send_signal(self, signal: Dict):
@@ -605,14 +607,13 @@ class FalconV9:
         
         try:
             self.tb.send_message(self.config.TELEGRAM_CHAT_ID, msg, parse_mode='Markdown')
-            logger.info(f"✅ {signal['symbol']} {signal['direction']}")
         except:
             pass
     
     def check_trades(self):
         for trade in self.db.get_expired_trades():
             try:
-                df = self.fetch_data(trade['symbol'], '5m', '1d')
+                df = self.fetcher.fetch_forex(trade['symbol'], '5min')
                 if df is None:
                     continue
                 
@@ -632,11 +633,8 @@ class FalconV9:
                     result = 'WIN' if current < entry else 'LOSS'
                 
                 self.db.update_result(trade['id'], current, result, pnl, round(pips, 1))
-                
-                trade['pnl_percent'] = pnl
-                trade['result'] = result
-                self.strategy.add_result(trade)
-                
+                self.strategy.add_result({'symbol': trade['symbol'], 'result': result, 
+                                          'duration': trade.get('trade_duration', 7)})
             except:
                 pass
     
@@ -646,12 +644,11 @@ class FalconV9:
                 signal = self.analyze(symbol)
                 if signal and self.db.save_signal(signal):
                     self.send_signal(signal)
-                time.sleep(0.5)
             except:
                 pass
     
     def run(self):
-        logger.info(f"🦅 Falcon V9.0 - {len(self.config.SYMBOLS)} زوج")
+        logger.info(f"🦅 Falcon V9.1 - Alpha Vantage - {len(self.config.SYMBOLS)} زوج")
         
         def poll():
             while True:
@@ -665,7 +662,7 @@ class FalconV9:
         trained = sum(1 for m in self.models.values() if m.is_trained)
         try:
             self.tb.send_message(self.config.TELEGRAM_CHAT_ID,
-                f"🦅 **Falcon V9.0**\n✅ {trained}/{len(self.config.SYMBOLS)}\n⚡️ يعمل...",
+                f"🦅 **Falcon V9.1**\n✅ {trained}/{len(self.config.SYMBOLS)}\n📡 Alpha Vantage\n⚡️ يعمل...",
                 parse_mode='Markdown')
         except:
             pass
@@ -677,13 +674,8 @@ class FalconV9:
                 time.sleep(self.config.SCAN_INTERVAL)
             except KeyboardInterrupt:
                 break
-            except Exception as e:
-                logger.error(f"خطأ: {e}")
+            except:
                 time.sleep(10)
-
-# ============================================================================
-# RUN
-# ============================================================================
 
 if __name__ == "__main__":
     config = Config()
