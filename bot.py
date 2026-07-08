@@ -1,13 +1,9 @@
 #!/usr/bin/env python3
 """
-Falcon AI Pro v8.0 - Resource Optimized
-========================================
-Smart CPU/RAM management without sacrificing accuracy.
-- Weekly retraining (instead of daily)
-- Cached features
-- Optimized River models
-- Smart sleep between symbols
-- Adaptive workers
+Falcon AI Pro v8.0 - Fixed Buy/Sell Logic
+============================================
+Corrected target and prediction logic.
+BUY = price goes UP. SELL = price goes DOWN.
 """
 
 import os
@@ -20,7 +16,6 @@ import hashlib
 import warnings
 import threading
 import gc
-from functools import lru_cache
 from typing import Dict, List, Tuple, Optional, Any
 from datetime import datetime, timedelta
 from dataclasses import dataclass, field
@@ -30,10 +25,9 @@ import numpy as np
 import pandas as pd
 import yfinance as yf
 import requests
-from scipy.signal import find_peaks
 
-# ✅ River - Optimized (lightweight models only)
-from river import compose, preprocessing, linear_model, optim, tree
+# River
+from river import compose, preprocessing, tree
 
 import matplotlib
 matplotlib.use('Agg')
@@ -57,7 +51,7 @@ warnings.filterwarnings('ignore')
 os.environ['OMP_NUM_THREADS'] = '2'
 
 # ============================================================================
-# OPTIMIZED CONFIG
+# CONFIG
 # ============================================================================
 
 @dataclass
@@ -65,9 +59,7 @@ class Config:
     TELEGRAM_TOKEN: str = os.environ.get('TELEGRAM_TOKEN', '8773849578:AAH9a6-8hU5YFYTad2EA5jQyfffIoeL8npk')
     TELEGRAM_CHAT_ID: str = os.environ.get('TELEGRAM_CHAT_ID', '7553333305')
     
-    # ✅ فحص أقل = استهلاك أقل
     SCAN_INTERVAL_SECONDS: int = 60
-    
     MIN_TRADE_DURATION: int = 3
     MAX_TRADE_DURATION: int = 15
     
@@ -76,17 +68,13 @@ class Config:
         'USDCAD=X', 'NZDUSD=X', 'EURGBP=X', 'EURJPY=X'
     ])
     
-    # ✅ تدريب أقل
     TRAINING_PERIOD_1H: str = '3mo'
     TRAINING_PERIOD_15M: str = '1mo'
     
-    CONFIDENCE_THRESHOLD: float = 0.65
+    CONFIDENCE_THRESHOLD: float = 0.60
     ENSEMBLE_AGREEMENT: int = 2
     MIN_TRAINING_SAMPLES: int = 300
-    
-    # ✅ ميزات أقل = رام أقل
     MAX_FEATURES: int = 20
-    
     FORECAST_PERIODS: int = 5
     
     DB_PATH: str = 'falcon_trading.db'
@@ -94,17 +82,10 @@ class Config:
     
     MAX_RETRIES: int = 3
     RETRY_DELAY: int = 5
-    
-    # ✅ عمال أقل = CPU أقل
     MAX_WORKERS: int = min(2, os.cpu_count() or 2)
-    
     SIGNAL_COOLDOWN_MINUTES: int = 10
-    
-    # ✅ تحديث River كل 200 عينة (بدل 50)
     RIVER_UPDATE_INTERVAL: int = 200
-    
-    # ✅ إعادة تدريب أسبوعية (بدل يومية)
-    RETRAINING_INTERVAL_SECONDS: int = 604800  # 7 أيام
+    RETRAINING_INTERVAL_SECONDS: int = 604800
     
     LOG_FILE: str = 'falcon_bot.log'
 
@@ -168,7 +149,8 @@ class Database:
                 CREATE TABLE IF NOT EXISTS signals (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     symbol TEXT, direction TEXT, entry_price REAL,
-                    confidence REAL, trade_duration INTEGER,
+                    confidence REAL, proba_buy REAL, proba_sell REAL,
+                    trade_duration INTEGER,
                     entry_time DATETIME DEFAULT CURRENT_TIMESTAMP,
                     expiry_time DATETIME, result TEXT DEFAULT 'PENDING',
                     pnl_percent REAL, signal_hash TEXT UNIQUE
@@ -182,10 +164,12 @@ class Database:
             with sqlite3.connect(self.db_path) as conn:
                 conn.execute('''
                     INSERT OR IGNORE INTO signals 
-                    (symbol, direction, entry_price, confidence, trade_duration, expiry_time, signal_hash)
-                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    (symbol, direction, entry_price, confidence, proba_buy, proba_sell,
+                     trade_duration, expiry_time, signal_hash)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ''', (data['symbol'], data['direction'], data['entry_price'],
-                      data['confidence'], data['trade_duration'], data['expiry_time'], h))
+                      data['confidence'], data.get('proba_buy', 0), data.get('proba_sell', 0),
+                      data['trade_duration'], data['expiry_time'], h))
                 conn.commit()
             return True
         except:
@@ -232,65 +216,15 @@ class Database:
                     'win_rate': wins/total if total > 0 else 0}
 
 # ============================================================================
-# SCIENTIFIC DURATION (OPTIMIZED)
+# FEATURES
 # ============================================================================
 
-class ScientificDuration:
-    @staticmethod
-    def calculate(df_5m: pd.DataFrame, df_15m: pd.DataFrame, direction: str) -> int:
-        closes = df_5m['Close'].values
-        
-        if len(closes) < 20:
-            return 7
-        
-        # ✅ حساب سريع: ROC فقط
-        roc_3 = (closes[-1] - closes[-4]) / closes[-4] * 100
-        roc_5 = (closes[-1] - closes[-6]) / closes[-6] * 100
-        
-        # RSI سريع
-        delta = np.diff(closes[-20:])
-        gain = np.mean(delta[delta > 0]) if any(delta > 0) else 0
-        loss = np.mean(-delta[delta < 0]) if any(delta < 0) else 0
-        rsi = 100 - (100 / (1 + gain / (loss + 1e-8))) if loss > 0 else 50
-        
-        # تحديد المدة
-        if abs(roc_3) > 0.12:
-            duration = 4 if rsi > 70 or rsi < 30 else 5
-        elif abs(roc_5) > 0.08:
-            duration = 6
-        else:
-            duration = 8
-        
-        return max(3, min(12, duration))
-
-# ============================================================================
-# MARKET FILTER
-# ============================================================================
-
-class MarketFilter:
-    @staticmethod
-    def can_trade() -> bool:
-        now = datetime.utcnow()
-        if now.weekday() >= 5:
-            return False
-        if now.weekday() == 4 and now.hour >= 20:
-            return False
-        return True
-
-# ============================================================================
-# FEATURES WITH CACHING
-# ============================================================================
-
-# ✅ كاش عالمي للميزات
 _features_cache = {}
-_features_cache_ttl = 30  # ثواني
+_features_cache_ttl = 30
 
 def calculate_features(df: pd.DataFrame) -> pd.DataFrame:
-    """✅ ميزات محسنة مع كاش"""
-    # مفتاح الكاش
     if len(df) > 0:
         cache_key = hash(str(df.index[-1]) + str(len(df)))
-        
         if cache_key in _features_cache:
             cached_time, cached_data = _features_cache[cache_key]
             if time.time() - cached_time < _features_cache_ttl:
@@ -299,10 +233,8 @@ def calculate_features(df: pd.DataFrame) -> pd.DataFrame:
     f = pd.DataFrame(index=df.index)
     c, h, l = df['Close'], df['High'], df['Low']
     
-    # ✅ ميزات أقل = أسرع
     for p in [1, 3, 5]:
         f[f'ret_{p}'] = c.pct_change(p)
-    
     for p in [5, 10, 20]:
         f[f'sma_{p}'] = c.rolling(p).mean()
         f[f'dist_{p}'] = (c - f[f'sma_{p}']) / (f[f'sma_{p}'] + 1e-8)
@@ -326,62 +258,51 @@ def calculate_features(df: pd.DataFrame) -> pd.DataFrame:
     tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
     f['atr'] = tr.ewm(span=14).mean()
     
-    f['adx'] = _calculate_adx_fast(df)
+    # ADX
+    atr14 = tr.ewm(span=14, adjust=False).mean()
+    plus_dm = h.diff().clip(lower=0)
+    minus_dm = (-l.diff()).clip(lower=0)
+    plus_di = 100 * (plus_dm.ewm(span=14, adjust=False).mean()) / (atr14 + 1e-8)
+    minus_di = 100 * (minus_dm.ewm(span=14, adjust=False).mean()) / (atr14 + 1e-8)
+    dx = 100 * abs(plus_di - minus_di) / (plus_di + minus_di + 1e-8)
+    f['adx'] = dx.ewm(span=14, adjust=False).mean()
     
     result = f.fillna(0)
     
-    # حفظ في الكاش
     if len(df) > 0:
         _features_cache[cache_key] = (time.time(), result)
-        # تنظيف الكاش لو كبر
         if len(_features_cache) > 50:
             oldest = min(_features_cache, key=lambda k: _features_cache[k][0])
             del _features_cache[oldest]
     
     return result
 
-def _calculate_adx_fast(df: pd.DataFrame) -> pd.Series:
-    """✅ ADX سريع"""
-    h, l, c = df['High'], df['Low'], df['Close']
-    
-    tr1 = h - l
-    tr2 = abs(h - c.shift())
-    tr3 = abs(l - c.shift())
-    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
-    atr = tr.ewm(span=14, adjust=False).mean()
-    
-    plus_dm = h.diff().clip(lower=0)
-    minus_dm = (-l.diff()).clip(lower=0)
-    
-    plus_di = 100 * (plus_dm.ewm(span=14, adjust=False).mean()) / (atr + 1e-8)
-    minus_di = 100 * (minus_dm.ewm(span=14, adjust=False).mean()) / (atr + 1e-8)
-    
-    dx = 100 * abs(plus_di - minus_di) / (plus_di + minus_di + 1e-8)
-    return dx.ewm(span=14, adjust=False).mean()
-
 # ============================================================================
-# TARGET
+# TARGET - CORRECTED
 # ============================================================================
 
 def create_target(df: pd.DataFrame, periods: int) -> pd.Series:
-    atr = (df['High'] - df['Low']).rolling(14).mean()
+    """
+    ✅ Target واضح:
+    1 = BUY (السعر ارتفع)
+    0 = SELL (السعر انخفض)
+    NaN = محايد
+    """
     future = df['Close'].shift(-periods)
-    change = future - df['Close']
-    threshold = atr * 0.5
+    current = df['Close']
+    change_pct = (future - current) / current * 100
     
     target = pd.Series(np.nan, index=df.index)
-    target[change > threshold] = 1
-    target[change < -threshold] = 0
+    target[change_pct > 0.05] = 1   # BUY = Class 1
+    target[change_pct < -0.05] = 0  # SELL = Class 0
     
     return target
 
 # ============================================================================
-# OPTIMIZED HYBRID MODEL
+# MODEL - CORRECTED
 # ============================================================================
 
 class OptimizedModel:
-    """✅ نموذج محسن: XGBoost + CatBoost خفيف + River خفيف"""
-    
     def __init__(self, symbol: str, config: Config, logger: logging.Logger):
         self.symbol = symbol
         self.config = config
@@ -393,7 +314,6 @@ class OptimizedModel:
         self.scaler = RobustScaler()
         self.selected_features = []
         
-        # ✅ River خفيف (Hoeffding فقط)
         self.river_model = None
         self.river_samples = 0
         
@@ -401,13 +321,10 @@ class OptimizedModel:
         self.version = None
     
     def _init_river(self):
-        """✅ نموذج River واحد خفيف"""
         self.river_model = compose.Pipeline(
             preprocessing.StandardScaler(),
             tree.HoeffdingAdaptiveTreeClassifier(
-                grace_period=200,
-                delta=1e-4,
-                leaf_prediction='mc'
+                grace_period=200, delta=1e-4, leaf_prediction='mc'
             )
         )
     
@@ -421,6 +338,11 @@ class OptimizedModel:
             features = calculate_features(df)
             target = create_target(df, self.config.FORECAST_PERIODS)
             
+            # ✅ إحصائيات
+            buy_count = target.sum()
+            total = len(target.dropna())
+            self.logger.info(f"📊 Target: BUY={buy_count:.0f}, SELL={total-buy_count:.0f}")
+            
             valid = ~(features.isna().any(axis=1) | target.isna())
             X = features[valid]
             y = target[valid]
@@ -428,13 +350,11 @@ class OptimizedModel:
             if len(X) < 200:
                 return False
             
-            # ✅ اختيار ميزات سريع
             mi = mutual_info_classif(X, y, random_state=42)
             scores = sorted(zip(X.columns, mi), key=lambda x: x[1], reverse=True)
             self.selected_features = [s[0] for s in scores[:self.config.MAX_FEATURES]]
             X = X[self.selected_features]
             
-            # ✅ تدريب River
             self._init_river()
             for i in range(len(X)):
                 row = X.iloc[i].to_dict()
@@ -444,22 +364,19 @@ class OptimizedModel:
                 except:
                     pass
             
-            self.logger.info(f"🌊 {self.symbol}: River={self.river_samples} عينة")
+            self.logger.info(f"🌊 {self.symbol}: River={self.river_samples}")
             
-            # ✅ تدريب XGBoost + CatBoost (بسيط)
             X_s = self.scaler.fit_transform(X)
             split_idx = int(len(X) * 0.8)
             X_train, X_val = X_s[:split_idx], X_s[split_idx:]
             y_train, y_val = y[:split_idx], y[split_idx:]
             
-            # XGBoost
             self.xgb_model = xgb.XGBClassifier(
                 n_estimators=100, max_depth=4, learning_rate=0.05,
                 random_state=42, n_jobs=1, verbosity=0, tree_method='hist'
             )
             self.xgb_model.fit(X_train, y_train)
             
-            # CatBoost (خفيف)
             self.cat_model = CatBoostClassifier(
                 iterations=100, depth=4, learning_rate=0.05,
                 random_seed=42, verbose=False, thread_count=1,
@@ -467,7 +384,6 @@ class OptimizedModel:
             )
             self.cat_model.fit(X_train, y_train)
             
-            # Meta model
             xgb_pred = self.xgb_model.predict_proba(X_val)[:, 1]
             cat_pred = self.cat_model.predict_proba(X_val)[:, 1]
             
@@ -486,51 +402,53 @@ class OptimizedModel:
             self.logger.error(f"❌ {self.symbol}: {e}")
             return False
     
-    def predict(self, df: pd.DataFrame, threshold: float = 0.65) -> Tuple[str, float]:
+    def predict(self, df: pd.DataFrame, threshold: float = 0.60) -> Tuple[str, float, float, float]:
+        """
+        ✅ يرجع: (الاتجاه, الثقة, proba_buy, proba_sell)
+        """
         if not self.is_trained:
-            return "NEUTRAL", 0.0
+            return "NEUTRAL", 0.0, 0.5, 0.5
         
         try:
             features = calculate_features(df).iloc[[-1]]
             available = [f for f in self.selected_features if f in features.columns]
             
             if len(available) < 5:
-                return "NEUTRAL", 0.0
+                return "NEUTRAL", 0.0, 0.5, 0.5
             
             X = features[available].fillna(0)
             X_s = self.scaler.transform(X)
             
-            # ✅ تنبؤات النماذج
-            xgb_proba = float(self.xgb_model.predict_proba(X_s)[0, 1])
-            cat_proba = float(self.cat_model.predict_proba(X_s)[0, 1])
+            # ✅ احتمالية BUY = predict_proba[1]
+            xgb_proba_buy = float(self.xgb_model.predict_proba(X_s)[0, 1])
+            cat_proba_buy = float(self.cat_model.predict_proba(X_s)[0, 1])
             
-            # Meta
-            meta_proba = float(self.meta_model.predict_proba(
-                np.array([[xgb_proba, cat_proba]]))[0, 1])
+            meta_proba_buy = float(self.meta_model.predict_proba(
+                np.array([[xgb_proba_buy, cat_proba_buy]]))[0, 1])
             
-            # ✅ River
             X_dict = features[available].fillna(0).iloc[0].to_dict()
             try:
                 river_proba = self.river_model.predict_proba_one(X_dict)
-                river_prob = river_proba.get(True, 0.5) if river_proba else 0.5
+                river_proba_buy = river_proba.get(True, 0.5) if river_proba else 0.5
             except:
-                river_prob = 0.5
+                river_proba_buy = 0.5
             
-            # ✅ دمج (70% تقليدي + 30% River)
-            final_proba = meta_proba * 0.7 + river_prob * 0.3
+            # ✅ احتمالية BUY النهائية
+            proba_buy = meta_proba_buy * 0.7 + river_proba_buy * 0.3
+            proba_sell = 1 - proba_buy
             
-            if final_proba > threshold:
-                return "BUY", final_proba
-            elif final_proba < (1 - threshold):
-                return "SELL", 1 - final_proba
+            # ✅ قرار صريح
+            if proba_buy > threshold:
+                return "BUY", proba_buy, proba_buy, proba_sell
+            elif proba_sell > threshold:
+                return "SELL", proba_sell, proba_buy, proba_sell
             
-            return "NEUTRAL", max(final_proba, 1 - final_proba)
+            return "NEUTRAL", max(proba_buy, proba_sell), proba_buy, proba_sell
             
         except:
-            return "NEUTRAL", 0.0
+            return "NEUTRAL", 0.0, 0.5, 0.5
     
     def online_learn(self, df: pd.DataFrame, result: int):
-        """✅ تعلم مستمر خفيف"""
         try:
             features = calculate_features(df).iloc[[-1]]
             available = [f for f in self.selected_features if f in features.columns]
@@ -568,7 +486,7 @@ class OptimizedModel:
         return True
 
 # ============================================================================
-# MAIN BOT (OPTIMIZED)
+# MAIN BOT
 # ============================================================================
 
 class FalconProBot:
@@ -586,7 +504,7 @@ class FalconProBot:
         for symbol in config.SYMBOLS:
             model = OptimizedModel(symbol, config, self.logger)
             if model.load():
-                self.logger.info(f"📂 {symbol} (River: {model.river_samples})")
+                self.logger.info(f"📂 {symbol}")
             else:
                 self.logger.info(f"🆕 {symbol}")
             self.models[symbol] = model
@@ -601,16 +519,11 @@ class FalconProBot:
                 return
             trained = sum(1 for m in self.models.values() if m.is_trained)
             stats = self.db.stats()
-            can_trade = MarketFilter.can_trade()
-            total_river = sum(m.river_samples for m in self.models.values())
-            text = (f"🦅 **Falcon Pro v8**\n"
-                   f"✅ نماذج: {trained}/{len(self.models)}\n"
-                   f"📊 صفقات: {stats['total']}\n"
-                   f"📈 نجاح: {stats['win_rate']:.1%}\n"
-                   f"🌊 River: {total_river}\n"
-                   f"⚡️ محسن للموارد\n"
-                   f"🚦 {'✅' if can_trade else '⛔'}")
-            self.tb.reply_to(msg, text, parse_mode='Markdown')
+            text = f"🦅 Falcon Pro\n✅ نماذج: {trained}/{len(self.models)}\n📊 صفقات: {stats['total']}\n📈 نجاح: {stats['win_rate']:.1%}"
+            try:
+                self.tb.reply_to(msg, text)
+            except:
+                pass
     
     def fetch_data(self, symbol: str, interval: str = '5m', period: str = '3d') -> Optional[pd.DataFrame]:
         for attempt in range(self.config.MAX_RETRIES):
@@ -626,9 +539,6 @@ class FalconProBot:
     
     def analyze_symbol(self, symbol: str) -> Optional[Dict]:
         try:
-            if not MarketFilter.can_trade():
-                return None
-            
             model = self.models.get(symbol)
             if not model or not model.is_trained:
                 return None
@@ -645,8 +555,11 @@ class FalconProBot:
             if df_5m is None or df_15m is None:
                 return None
             
-            dir_5m, conf_5m = model.predict(df_5m, self.config.CONFIDENCE_THRESHOLD)
-            dir_15m, conf_15m = model.predict(df_15m, self.config.CONFIDENCE_THRESHOLD)
+            dir_5m, conf_5m, pb_5m, ps_5m = model.predict(df_5m, self.config.CONFIDENCE_THRESHOLD)
+            dir_15m, conf_15m, pb_15m, ps_15m = model.predict(df_15m, self.config.CONFIDENCE_THRESHOLD)
+            
+            self.logger.info(f"{symbol}: M5={dir_5m}(B:{pb_5m:.1%} S:{ps_5m:.1%}) "
+                           f"M15={dir_15m}(B:{pb_15m:.1%} S:{ps_15m:.1%})")
             
             if dir_5m != dir_15m or dir_5m == "NEUTRAL":
                 return None
@@ -656,16 +569,19 @@ class FalconProBot:
             if confidence < self.config.CONFIDENCE_THRESHOLD:
                 return None
             
-            trade_duration = ScientificDuration.calculate(df_5m, df_15m, dir_5m)
             entry_price = float(df_5m['Close'].iloc[-1])
+            atr = float(df_5m['High'].iloc[-1] - df_5m['Low'].iloc[-1])
+            duration = 5 if atr > 0.0008 else (7 if atr > 0.0004 else 10)
             
             return {
                 'symbol': symbol,
                 'direction': dir_5m,
                 'entry_price': entry_price,
                 'confidence': confidence,
-                'trade_duration': trade_duration,
-                'expiry_time': (datetime.now() + timedelta(minutes=trade_duration)).strftime('%Y-%m-%d %H:%M:%S')
+                'proba_buy': (pb_5m + pb_15m) / 2,
+                'proba_sell': (ps_5m + ps_15m) / 2,
+                'trade_duration': duration,
+                'expiry_time': (datetime.now() + timedelta(minutes=duration)).strftime('%Y-%m-%d %H:%M:%S')
             }
             
         except:
@@ -674,15 +590,15 @@ class FalconProBot:
     def send_signal(self, signal: Dict):
         try:
             emoji = "🟢" if signal['direction'] == 'BUY' else "🔴"
-            direction = "شراء ▲" if signal['direction'] == 'BUY' else "بيع ▼"
+            direction = "شراء" if signal['direction'] == 'BUY' else "بيع"
             
-            msg = (f"{emoji} **{signal['symbol']}** - {direction}\n\n"
-                   f"💰 {signal['entry_price']:.5f}\n"
-                   f"⏳ {signal['trade_duration']} د\n"
-                   f"💪 {signal['confidence']:.1%}\n\n"
-                   f"🤖 Falcon Pro")
+            msg = (f"{emoji} {signal['symbol']} - {direction}\n"
+                   f"السعر: {signal['entry_price']:.5f}\n"
+                   f"المدة: {signal['trade_duration']} د\n"
+                   f"الثقة: {signal['confidence']:.1%}")
             
-            self.tb.send_message(self.config.TELEGRAM_CHAT_ID, msg, parse_mode='Markdown')
+            self.tb.send_message(self.config.TELEGRAM_CHAT_ID, msg)
+            self.logger.info(f"✅ {signal['symbol']} {signal['direction']}")
         except:
             pass
     
@@ -706,32 +622,32 @@ class FalconProBot:
                 
                 self.db.update(trade['id'], current, result, pnl)
                 
-                # ✅ تدريب River على النتيجة
                 model = self.models.get(trade['symbol'])
                 if model and df is not None:
-                    model.online_learn(df, 1 if result == 'WIN' else 0)
+                    if direction == 'BUY':
+                        learn = 1 if result == 'WIN' else 0
+                    else:
+                        learn = 0 if result == 'WIN' else 1
+                    model.online_learn(df, learn)
                 
             except:
                 pass
     
     def scan_all_symbols(self):
         signals = 0
-        
-        # ✅ نوم ذكي بين كل رمز
         for symbol in self.config.SYMBOLS:
             try:
                 signal = self.analyze_symbol(symbol)
                 if signal and self.db.save(signal):
                     self.send_signal(signal)
                     signals += 1
-                time.sleep(0.5)  # ✅ راحة للمعالج
+                time.sleep(0.5)
             except:
                 pass
-        
         return signals
     
     def train_all_models(self):
-        self.logger.info("🎓 تدريب أسبوعي...")
+        self.logger.info("🎓 تدريب...")
         
         for symbol in self.config.SYMBOLS:
             try:
@@ -750,7 +666,7 @@ class FalconProBot:
                         self.models[symbol] = model
                 
                 time.sleep(2)
-                gc.collect()  # ✅ تنظيف الذاكرة
+                gc.collect()
             except:
                 pass
         
@@ -758,11 +674,7 @@ class FalconProBot:
     
     def run(self):
         self.running = True
-        
-        self.logger.info("🦅 Falcon Pro v8.0 - Optimized")
-        self.logger.info(f"⚡️ Workers: {self.config.MAX_WORKERS}")
-        self.logger.info(f"📊 Features: {self.config.MAX_FEATURES}")
-        self.logger.info(f"🔄 Retrain: Weekly")
+        self.logger.info("🦅 Falcon Pro - Fixed Logic")
         
         self.tg.start_polling()
         time.sleep(1)
@@ -775,8 +687,7 @@ class FalconProBot:
         try:
             trained = sum(1 for m in self.models.values() if m.is_trained)
             self.tb.send_message(self.config.TELEGRAM_CHAT_ID,
-                f"🦅 **Falcon Pro v8**\n✅ {trained}/{len(self.config.SYMBOLS)}\n⚡️ محسن\n🚀 يعمل...",
-                parse_mode='Markdown')
+                f"🦅 Falcon Pro\n✅ {trained}/{len(self.config.SYMBOLS)}\n⚡️ يعمل...")
         except:
             pass
         
@@ -785,7 +696,6 @@ class FalconProBot:
                 self.check_trades()
                 self.scan_all_symbols()
                 
-                # ✅ إعادة تدريب أسبوعية
                 if (datetime.now() - self.last_retrain).total_seconds() > self.config.RETRAINING_INTERVAL_SECONDS:
                     self.train_all_models()
                 
