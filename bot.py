@@ -1,12 +1,10 @@
 #!/usr/bin/env python3
 """
-Falcon AI v10 - Complete System
-=================================
-Phase 1: Gather Data (Yahoo + Alpha Vantage)
-Phase 2: Train Models (XGBoost + RandomForest + GradientBoost)
-Phase 3: Backtest Strategies
-Phase 4: Evolve Brain (Choose Best)
-Phase 5: Trade Smart (Send Signals)
+Falcon AI v11 - Adaptive Strategy Switcher
+============================================
+Step 1: Read market (Trend / Range / Breakout)
+Step 2: Choose strategy (1 / 2 / 3)
+Step 3: Execute
 """
 
 import os
@@ -25,11 +23,20 @@ import pandas as pd
 import requests
 
 from sklearn.preprocessing import RobustScaler
-from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
 import xgboost as xgb
+from sklearn.ensemble import RandomForestClassifier
 
 import telebot
 import joblib
+
+# ============================================================================
+# CONFIG
+# ============================================================================
+
+TELEGRAM_TOKEN = os.environ.get('TELEGRAM_TOKEN', '8773849578:AAH9a6-8hU5YFYTad2EA5jQyfffIoeL8npk')
+TELEGRAM_CHAT_ID = os.environ.get('TELEGRAM_CHAT_ID', '7553333305')
+
+SYMBOLS = ['EURUSD', 'GBPUSD', 'USDJPY', 'AUDUSD', 'USDCAD', 'EURGBP', 'EURJPY', 'GBPJPY']
 
 # ============================================================================
 # LOGGING
@@ -41,54 +48,29 @@ logging.basicConfig(
     datefmt='%H:%M:%S',
     handlers=[logging.StreamHandler(sys.stdout)]
 )
-logger = logging.getLogger('FalconV10')
-
-# ============================================================================
-# CONFIG
-# ============================================================================
-
-TELEGRAM_TOKEN = os.environ.get('TELEGRAM_TOKEN', '8773849578:AAH9a6-8hU5YFYTad2EA5jQyfffIoeL8npk')
-TELEGRAM_CHAT_ID = os.environ.get('TELEGRAM_CHAT_ID', '7553333305')
-ALPHA_VANTAGE_KEY = os.environ.get('ALPHA_VANTAGE_KEY', '5TFFWK21CUNA3P25')
-
-SYMBOLS = [
-    'EURUSD', 'GBPUSD', 'USDJPY', 'AUDUSD',
-    'USDCAD', 'NZDUSD', 'EURGBP', 'EURJPY'
-]
-
-DB_PATH = 'falcon_v10.db'
-MODELS_DIR = 'models_v10'
-BRAIN_FILE = 'brain_v10.json'
+logger = logging.getLogger('FalconV11')
 
 # ============================================================================
 # DATABASE
 # ============================================================================
 
 class Database:
-    def __init__(self, db_path: str = DB_PATH):
+    def __init__(self, db_path: str = 'falcon_v11.db'):
         self.db_path = db_path
         with sqlite3.connect(db_path) as conn:
-            conn.executescript('''
-                CREATE TABLE IF NOT EXISTS market_data (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    symbol TEXT, timestamp DATETIME,
-                    open REAL, high REAL, low REAL, close REAL,
-                    UNIQUE(symbol, timestamp)
-                );
-                
+            conn.execute('''
                 CREATE TABLE IF NOT EXISTS signals (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     symbol TEXT, direction TEXT, entry_price REAL,
                     exit_price REAL, confidence REAL,
-                    duration INTEGER, model_name TEXT,
+                    strategy TEXT, market_type TEXT,
+                    duration INTEGER,
                     entry_time DATETIME DEFAULT CURRENT_TIMESTAMP,
                     expiry_time DATETIME, exit_time DATETIME,
                     result TEXT DEFAULT 'PENDING',
                     pnl_percent REAL, pnl_pips REAL,
                     signal_hash TEXT UNIQUE
-                );
-                
-                CREATE INDEX IF NOT EXISTS idx_market ON market_data(symbol, timestamp);
+                )
             ''')
             conn.commit()
     
@@ -98,12 +80,12 @@ class Database:
             with sqlite3.connect(self.db_path) as conn:
                 conn.execute('''
                     INSERT OR IGNORE INTO signals 
-                    (symbol, direction, entry_price, confidence, duration, model_name,
-                     expiry_time, signal_hash)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    (symbol, direction, entry_price, confidence, strategy, market_type,
+                     duration, expiry_time, signal_hash)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ''', (data['symbol'], data['direction'], data['entry_price'],
-                      data['confidence'], data.get('duration', 7), data.get('model_name', ''),
-                      data['expiry_time'], h))
+                      data['confidence'], data.get('strategy', ''), data.get('market_type', ''),
+                      data['duration'], data['expiry_time'], h))
                 conn.commit()
                 return conn.execute('SELECT last_insert_rowid()').fetchone()[0]
         except:
@@ -142,371 +124,367 @@ class Database:
             ''').fetchall()
             return [dict(r) for r in rows]
     
-    def get_data_count(self, symbol: str) -> int:
+    def get_strategy_stats(self) -> Dict:
         with sqlite3.connect(self.db_path) as conn:
-            return conn.execute('SELECT COUNT(*) FROM market_data WHERE symbol=?', 
-                              (symbol,)).fetchone()[0]
+            stats = {}
+            for strategy in ['trend', 'range', 'breakout']:
+                total = conn.execute('''
+                    SELECT COUNT(*) FROM signals WHERE strategy=? AND result!='PENDING'
+                ''', (strategy,)).fetchone()[0]
+                wins = conn.execute('''
+                    SELECT COUNT(*) FROM signals WHERE strategy=? AND result='WIN'
+                ''', (strategy,)).fetchone()[0]
+                stats[strategy] = {
+                    'total': total,
+                    'wins': wins,
+                    'win_rate': wins/total if total > 0 else 0
+                }
+            return stats
 
 # ============================================================================
-# PHASE 1: DATA GATHERER
+# MARKET READER - أهم جزء
 # ============================================================================
 
-class DataGatherer:
-    def __init__(self, db: Database):
-        self.db = db
+class MarketReader:
+    """
+    يقرأ السوق ويحدد نوعه:
+    1. TREND (ترند قوي)
+    2. RANGE (تذبذب)
+    3. BREAKOUT (اختراق)
+    """
     
-    def fetch_all(self):
-        logger.info("📥 Phase 1: جمع البيانات...")
+    @staticmethod
+    def read(df: pd.DataFrame) -> Dict:
+        """
+        تحليل السوق وتحديد النوع
+        """
+        if len(df) < 50:
+            return {'type': 'unknown', 'confidence': 0}
         
-        for symbol in SYMBOLS:
-            self._fetch_yahoo(symbol)
-            time.sleep(2)
+        c = df['Close'].values
+        h = df['High'].values
+        l = df['Low'].values
         
-        # إحصائيات
-        for symbol in SYMBOLS:
-            count = self.db.get_data_count(symbol)
-            logger.info(f"  📊 {symbol}: {count} صف")
+        # ========== 1. حساب ADX (قوة الترند) ==========
+        adx = MarketReader._calculate_adx(df)
+        current_adx = adx[-1]
         
-        logger.info("✅ Phase 1: اكتمل")
-    
-    def _fetch_yahoo(self, symbol: str) -> bool:
-        try:
-            import yfinance as yf
-            
-            yf_symbol = f"{symbol}=X"
-            df = yf.download(yf_symbol, period='2mo', interval='15m', progress=False)
-            
-            if df is None or df.empty:
-                return False
-            
-            df.columns = ['open', 'high', 'low', 'close', 'volume']
-            
-            count = 0
-            with sqlite3.connect(self.db.db_path) as conn:
-                for idx, row in df.iterrows():
-                    conn.execute('''
-                        INSERT OR IGNORE INTO market_data (symbol, timestamp, open, high, low, close)
-                        VALUES (?, ?, ?, ?, ?, ?)
-                    ''', (symbol, str(idx), float(row['open']), float(row['high']),
-                          float(row['low']), float(row['close'])))
-                    count += 1
-                conn.commit()
-            
-            logger.info(f"  ✅ {symbol}: {count} صف (Yahoo)")
-            return count > 50
-            
-        except Exception as e:
-            logger.error(f"  ❌ {symbol}: {e}")
-            return False
-    
-    def fetch_live(self, symbol: str) -> Optional[pd.DataFrame]:
-        """جلب بيانات حية للفحص"""
-        try:
-            import yfinance as yf
-            
-            yf_symbol = f"{symbol}=X"
-            df = yf.download(yf_symbol, period='5d', interval='5m', progress=False)
-            
-            if df is not None and not df.empty:
-                df.columns = [c.capitalize() for c in df.columns]
-                return df
-            
-        except:
-            pass
+        # ========== 2. حساب Bollinger Band Width (التذبذب) ==========
+        sma20 = np.mean(c[-20:])
+        std20 = np.std(c[-20:])
+        bb_width = (4 * std20) / sma20 * 100  # كنسبة مئوية
         
-        # Alpha Vantage كبديل
-        try:
-            from_curr = symbol[:3]
-            to_curr = symbol[3:]
-            
-            params = {
-                'function': 'FX_INTRADAY',
-                'from_symbol': from_curr,
-                'to_symbol': to_curr,
-                'interval': '5min',
-                'outputsize': 'compact',
-                'apikey': ALPHA_VANTAGE_KEY
-            }
-            
-            r = requests.get('https://www.alphavantage.co/query', params=params, timeout=10)
-            data = r.json()
-            
-            key = 'Time Series FX (5min)'
-            if key in data:
-                records = []
-                for ts, vals in data[key].items():
-                    records.append({
-                        'Date': ts,
-                        'Open': float(vals['1. open']),
-                        'High': float(vals['2. high']),
-                        'Low': float(vals['3. low']),
-                        'Close': float(vals['4. close']),
-                        'Volume': 0
-                    })
-                
-                df = pd.DataFrame(records)
-                df['Date'] = pd.to_datetime(df['Date'])
-                df = df.set_index('Date').sort_index()
-                return df
-        except:
-            pass
+        # متوسط عرض البولنجر لآخر 50 شمعة
+        historical_widths = []
+        for i in range(50, len(c)):
+            sma = np.mean(c[i-20:i])
+            std = np.std(c[i-20:i])
+            historical_widths.append((4 * std) / sma * 100)
         
-        return None
-
-# ============================================================================
-# PHASE 2+3+4: TRAINER + BACKTESTER + BRAIN
-# ============================================================================
-
-class Brain:
-    def __init__(self, db: Database):
-        self.db = db
-        self.best_model = None
-        self.best_scaler = None
-        self.best_features = None
-        self.best_threshold = 0.55
-        self.best_duration = 7
-        self.best_name = ""
-        self.is_trained = False
-    
-    def get_data(self, symbol: str) -> Optional[pd.DataFrame]:
-        with sqlite3.connect(self.db.db_path) as conn:
-            df = pd.read_sql_query('''
-                SELECT * FROM market_data WHERE symbol=?
-                ORDER BY timestamp ASC
-            ''', conn, params=(symbol,))
+        avg_width = np.mean(historical_widths) if historical_widths else bb_width
         
-        if df.empty:
-            return None
+        # ========== 3. حساب الاختراقات ==========
+        high_20 = np.max(h[-20:])
+        low_20 = np.min(l[-20:])
+        current_price = c[-1]
         
-        df['timestamp'] = pd.to_datetime(df['timestamp'])
-        df = df.set_index('timestamp').sort_index()
-        return df
-    
-    def create_features(self, df: pd.DataFrame) -> pd.DataFrame:
-        f = pd.DataFrame(index=df.index)
-        c, h, l = df['close'], df['high'], df['low']
+        # هل السعر قريب من اختراق؟
+        near_breakout_high = current_price > high_20 * 0.998
+        near_breakout_low = current_price < low_20 * 1.002
         
-        for p in [1, 3, 5, 10]:
-            f[f'ret_{p}'] = c.pct_change(p)
-        for p in [5, 10, 20]:
-            f[f'sma_{p}'] = c.rolling(p).mean()
-            f[f'dist_{p}'] = (c - f[f'sma_{p}']) / (f[f'sma_{p}'] + 1e-8)
+        # ========== 4. تحديد النوع ==========
+        scores = {'trend': 0, 'range': 0, 'breakout': 0}
         
-        delta = c.diff()
-        gain = delta.where(delta > 0, 0.0).rolling(14).mean()
-        loss = (-delta.where(delta < 0, 0.0)).rolling(14).mean()
-        f['rsi'] = 100 - (100 / (1 + gain / (loss + 1e-8)))
+        # ترند؟
+        if current_adx > 25:
+            scores['trend'] += 3
+        elif current_adx > 20:
+            scores['trend'] += 1
         
-        ema12 = c.ewm(span=12).mean()
-        ema26 = c.ewm(span=26).mean()
-        f['macd'] = ema12 - ema26
-        f['macd_s'] = f['macd'].ewm(span=9).mean()
-        f['macd_h'] = f['macd'] - f['macd_s']
+        # تذبذب؟
+        if bb_width < avg_width * 0.7:  # بولنجر بينضغط = تذبذب
+            scores['range'] += 3
+        elif bb_width < avg_width * 0.9:
+            scores['range'] += 1
         
-        sma20 = c.rolling(20).mean()
-        std20 = c.rolling(20).std()
-        f['bb'] = (c - sma20) / (2 * std20 + 1e-8)
+        # اختراق؟
+        if near_breakout_high or near_breakout_low:
+            scores['breakout'] += 2
         
-        tr1 = h - l
-        tr2 = abs(h - c.shift())
-        tr3 = abs(l - c.shift())
-        tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
-        f['atr'] = tr.ewm(span=14).mean()
-        f['atr_pct'] = f['atr'] / (c + 1e-8)
+        # لو بولنجر متسع = غالباً ترند أو اختراق
+        if bb_width > avg_width * 1.3:
+            scores['trend'] += 1
+            scores['breakout'] += 1
         
-        return f.fillna(0)
-    
-    def create_target(self, df: pd.DataFrame, periods: int = 5) -> pd.Series:
-        future = df['close'].shift(-periods)
-        change = (future - df['close']) / df['close'] * 100
-        target = pd.Series(np.nan, index=df.index)
-        target[change > 0.03] = 1
-        target[change < -0.03] = 0
-        return target
-    
-    def evolve(self):
-        """تدريب واختبار واختيار أفضل استراتيجية"""
-        logger.info("🧠 Phase 2-4: تدريب واختبار وتعلم...")
+        # لو ADX منخفض = تذبذب
+        if current_adx < 20:
+            scores['range'] += 2
         
-        best_overall = {'win_rate': 0, 'total': 0}
+        # تحديد الفائز
+        market_type = max(scores, key=scores.get)
+        confidence = scores[market_type] / max(sum(scores.values()), 1)
         
-        for symbol in SYMBOLS[:4]:  # أول 4 أزواج
-            df = self.get_data(symbol)
-            if df is None or len(df) < 500:
-                logger.warning(f"  ⚠️ {symbol}: بيانات غير كافية")
-                continue
-            
-            X = self.create_features(df)
-            y = self.create_target(df)
-            
-            valid = ~(X.isna().any(axis=1) | y.isna())
-            X, y = X[valid], y[valid]
-            
-            if len(X) < 200:
-                continue
-            
-            features_list = list(X.columns)
-            split = int(len(X) * 0.8)
-            X_train, X_test = X[:split], X[split:]
-            y_train, y_test = y[:split], y[split:]
-            
-            scaler = RobustScaler()
-            X_train_s = scaler.fit_transform(X_train)
-            X_test_s = scaler.transform(X_test)
-            
-            # تدريب 3 نماذج
-            models = []
-            
-            # XGBoost
-            xgb_m = xgb.XGBClassifier(n_estimators=150, max_depth=4, learning_rate=0.05,
-                                       random_state=42, verbosity=0, tree_method='hist')
-            xgb_m.fit(X_train_s, y_train)
-            models.append(('XGBoost', xgb_m))
-            
-            # RandomForest
-            rf_m = RandomForestClassifier(n_estimators=150, max_depth=8, random_state=42, n_jobs=-1)
-            rf_m.fit(X_train_s, y_train)
-            models.append(('RandomForest', rf_m))
-            
-            # GradientBoosting
-            gb_m = GradientBoostingClassifier(n_estimators=150, max_depth=4, random_state=42)
-            gb_m.fit(X_train_s, y_train)
-            models.append(('GradientBoost', gb_m))
-            
-            # اختبار كل نموذج
-            for name, model in models:
-                for duration in [5, 7, 10]:
-                    for threshold in [0.52, 0.55, 0.58, 0.62]:
-                        result = self._backtest(model, scaler, features_list, 
-                                                X_test, df.iloc[split:], duration, threshold)
-                        
-                        if result['total'] >= 10 and result['win_rate'] > best_overall['win_rate']:
-                            best_overall = result
-                            self.best_model = model
-                            self.best_scaler = scaler
-                            self.best_features = features_list
-                            self.best_threshold = threshold
-                            self.best_duration = duration
-                            self.best_name = f"{symbol}_{name}"
-                            
-                            logger.info(f"  ⭐ {symbol} {name}: {result['win_rate']:.1%} "
-                                      f"({result['wins']}/{result['total']}) | {duration}د | {threshold:.0%}")
-        
-        if self.best_model:
-            self.is_trained = True
-            self._save_brain()
-            logger.info(f"🏆 أفضل استراتيجية: {self.best_name} "
-                       f"نسبة={best_overall['win_rate']:.1%}")
-            return True
-        
-        return False
-    
-    def _backtest(self, model, scaler, features, X_test, df_test, duration, threshold):
-        """اختبار سريع"""
-        results = []
-        
-        for i in range(0, len(X_test) - duration, 5):
-            X_s = X_test.iloc[[i]]
-            proba = model.predict_proba(X_s)[0]
-            
-            if proba[1] > threshold:
-                direction = 'BUY'
-            elif proba[0] > threshold:
-                direction = 'SELL'
-            else:
-                continue
-            
-            entry = float(df_test['close'].iloc[i])
-            exit_idx = min(i + duration * 3, len(df_test) - 1)
-            exit_price = float(df_test['close'].iloc[exit_idx])
-            
-            if direction == 'BUY':
-                pnl = (exit_price - entry) / entry * 100
-                win = exit_price > entry
-            else:
-                pnl = (entry - exit_price) / entry * 100
-                win = exit_price < entry
-            
-            results.append({'win': win, 'pnl': pnl})
-        
-        if not results:
-            return {'total': 0, 'wins': 0, 'win_rate': 0}
-        
-        wins = sum(1 for r in results if r['win'])
         return {
-            'total': len(results), 'wins': wins,
-            'losses': len(results) - wins,
-            'win_rate': wins / len(results)
+            'type': market_type,
+            'confidence': confidence,
+            'adx': round(current_adx, 1),
+            'bb_width': round(bb_width, 2),
+            'scores': scores,
+            'near_breakout': near_breakout_high or near_breakout_low
         }
     
-    def predict(self, df: pd.DataFrame) -> Tuple[Optional[str], float]:
-        """تنبؤ باستخدام أفضل نموذج"""
-        if not self.is_trained:
+    @staticmethod
+    def _calculate_adx(df: pd.DataFrame, period: int = 14) -> np.ndarray:
+        h = df['High'].values
+        l = df['Low'].values
+        c = df['Close'].values
+        
+        tr1 = h[1:] - l[1:]
+        tr2 = np.abs(h[1:] - c[:-1])
+        tr3 = np.abs(l[1:] - c[:-1])
+        tr = np.maximum(np.maximum(tr1, tr2), tr3)
+        
+        atr = pd.Series(tr).ewm(span=period, adjust=False).mean().values
+        
+        up_move = h[1:] - h[:-1]
+        down_move = l[:-1] - l[1:]
+        
+        plus_dm = np.where((up_move > down_move) & (up_move > 0), up_move, 0)
+        minus_dm = np.where((down_move > up_move) & (down_move > 0), down_move, 0)
+        
+        plus_di = 100 * pd.Series(plus_dm).ewm(span=period, adjust=False).mean().values / (atr + 1e-8)
+        minus_di = 100 * pd.Series(minus_dm).ewm(span=period, adjust=False).mean().values / (atr + 1e-8)
+        
+        dx = 100 * np.abs(plus_di - minus_di) / (plus_di + minus_di + 1e-8)
+        adx = pd.Series(dx).ewm(span=period, adjust=False).mean().values
+        
+        return adx
+
+# ============================================================================
+# FEATURES
+# ============================================================================
+
+def calculate_features(df: pd.DataFrame) -> pd.DataFrame:
+    f = pd.DataFrame(index=df.index)
+    c, h, l = df['Close'], df['High'], df['Low']
+    
+    for p in [1, 3, 5, 10]:
+        f[f'ret_{p}'] = c.pct_change(p)
+    for p in [5, 10, 20]:
+        f[f'sma_{p}'] = c.rolling(p).mean()
+        f[f'dist_{p}'] = (c - f[f'sma_{p}']) / (f[f'sma_{p}'] + 1e-8)
+    
+    delta = c.diff()
+    gain = delta.where(delta > 0, 0.0).rolling(14).mean()
+    loss = (-delta.where(delta < 0, 0.0)).rolling(14).mean()
+    f['rsi'] = 100 - (100 / (1 + gain / (loss + 1e-8)))
+    
+    ema12 = c.ewm(span=12).mean()
+    ema26 = c.ewm(span=26).mean()
+    f['macd'] = ema12 - ema26
+    f['macd_s'] = f['macd'].ewm(span=9).mean()
+    f['macd_h'] = f['macd'] - f['macd_s']
+    
+    sma20 = c.rolling(20).mean()
+    std20 = c.rolling(20).std()
+    f['bb'] = (c - sma20) / (2 * std20 + 1e-8)
+    f['bb_w'] = (4 * std20) / (sma20 + 1e-8)
+    
+    tr1 = h - l
+    tr2 = abs(h - c.shift())
+    tr3 = abs(l - c.shift())
+    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+    f['atr'] = tr.ewm(span=14).mean()
+    f['atr_pct'] = f['atr'] / (c + 1e-8)
+    
+    return f.fillna(0)
+
+# ============================================================================
+# STRATEGIES
+# ============================================================================
+
+class StrategyEngine:
+    """
+    3 استراتيجيات مختلفة:
+    1. TREND: اتباع الترند (EMA crossover)
+    2. RANGE: الارتداد من الحدود (Bollinger + RSI)
+    3. BREAKOUT: اختراق القمم/القيعان (Donchian)
+    """
+    
+    def __init__(self):
+        self.models = {
+            'trend': None,    # XGBoost للترند
+            'range': None,    # XGBoost للتذبذب
+            'breakout': None  # XGBoost للاختراق
+        }
+        self.scalers = {
+            'trend': RobustScaler(),
+            'range': RobustScaler(),
+            'breakout': RobustScaler()
+        }
+        self.features = {}
+        self.is_trained = False
+    
+    def train_all(self, df: pd.DataFrame):
+        """تدريب 3 نماذج على 3 أنواع مختلفة من الأسواق"""
+        logger.info("🎓 تدريب الاستراتيجيات الثلاث...")
+        
+        X = calculate_features(df)
+        
+        # تصنيف السوق لكل شمعة
+        market_types = []
+        for i in range(50, len(df)):
+            chunk = df.iloc[i-50:i+1]
+            market_info = MarketReader.read(chunk)
+            market_types.append(market_info['type'])
+        
+        # محاذاة البيانات
+        X = X.iloc[50:]
+        
+        # Target
+        future = df['Close'].shift(-5)
+        change = (future - df['Close']) / df['Close'] * 100
+        y_trend = pd.Series(np.nan, index=df.index)
+        y_range = pd.Series(np.nan, index=df.index)
+        y_breakout = pd.Series(np.nan, index=df.index)
+        
+        # ترند: حركة قوية في اتجاه الترند
+        ema20 = df['Close'].ewm(span=20).mean()
+        ema50 = df['Close'].ewm(span=50).mean()
+        uptrend = ema20 > ema50
+        downtrend = ema20 < ema50
+        
+        y_trend[(uptrend) & (change > 0.05)] = 1
+        y_trend[(downtrend) & (change < -0.05)] = 0
+        
+        # تذبذب: ارتداد من الحدود
+        rsi = X['rsi']
+        y_range[(rsi < 35) & (change > 0.03)] = 1
+        y_range[(rsi > 65) & (change < -0.03)] = 0
+        
+        # اختراق: حركة سريعة بعد الاختراق
+        high_20 = df['High'].rolling(20).max()
+        low_20 = df['Low'].rolling(20).min()
+        breakout_up = df['Close'] > high_20.shift(1)
+        breakout_down = df['Close'] < low_20.shift(1)
+        
+        y_breakout[(breakout_up) & (change > 0.08)] = 1
+        y_breakout[(breakout_down) & (change < -0.08)] = 0
+        
+        # محاذاة
+        y_trend = y_trend.iloc[50:]
+        y_range = y_range.iloc[50:]
+        y_breakout = y_breakout.iloc[50:]
+        
+        # تدريب كل نموذج
+        for name, y in [('trend', y_trend), ('range', y_range), ('breakout', y_breakout)]:
+            valid = ~(X.isna().any(axis=1) | y.isna())
+            X_valid = X[valid]
+            y_valid = y[valid]
+            
+            if len(X_valid) < 100:
+                continue
+            
+            # اختيار ميزات
+            from sklearn.feature_selection import mutual_info_classif
+            mi = mutual_info_classif(X_valid, y_valid, random_state=42)
+            scores = sorted(zip(X_valid.columns, mi), key=lambda x: x[1], reverse=True)
+            self.features[name] = [s[0] for s in scores[:12]]
+            
+            X_sel = X_valid[self.features[name]]
+            
+            split = int(len(X_sel) * 0.8)
+            X_train_s = self.scalers[name].fit_transform(X_sel[:split])
+            
+            model = xgb.XGBClassifier(
+                n_estimators=100, max_depth=4, learning_rate=0.05,
+                random_state=42, verbosity=0, tree_method='hist'
+            )
+            model.fit(X_train_s, y_valid[:split])
+            
+            self.models[name] = model
+            logger.info(f"  ✅ {name}: {len(X_valid)} عينة")
+        
+        self.is_trained = True
+    
+    def predict(self, df: pd.DataFrame, strategy: str, threshold: float = 0.55) -> Tuple[Optional[str], float]:
+        """تنبؤ باستخدام استراتيجية محددة"""
+        if not self.is_trained or strategy not in self.models:
             return None, 0.0
         
-        X = self.create_features(df).iloc[[-1]]
-        available = [f for f in self.best_features if f in X.columns]
+        model = self.models[strategy]
+        scaler = self.scalers[strategy]
+        features = self.features.get(strategy, [])
+        
+        if model is None:
+            return None, 0.0
+        
+        X = calculate_features(df).iloc[[-1]]
+        available = [f for f in features if f in X.columns]
         
         if len(available) < 5:
             return None, 0.0
         
         X = X[available].fillna(0)
-        X_s = self.best_scaler.transform(X)
+        X_s = scaler.transform(X)
         
-        proba = self.best_model.predict_proba(X_s)[0]
+        proba = model.predict_proba(X_s)[0]
         
-        if proba[1] > self.best_threshold:
+        if proba[1] > threshold:
             return 'BUY', proba[1]
-        elif proba[0] > self.best_threshold:
+        elif proba[0] > threshold:
             return 'SELL', proba[0]
         
         return None, max(proba)
     
-    def _save_brain(self):
-        os.makedirs(MODELS_DIR, exist_ok=True)
+    def save(self):
+        os.makedirs('models_v11', exist_ok=True)
         joblib.dump({
-            'model': self.best_model,
-            'scaler': self.best_scaler,
-            'features': self.best_features,
-            'threshold': self.best_threshold,
-            'duration': self.best_duration,
-            'name': self.best_name
-        }, f"{MODELS_DIR}/best_model.pkl")
-        
-        with open(BRAIN_FILE, 'w') as f:
-            json.dump({
-                'threshold': self.best_threshold,
-                'duration': self.best_duration,
-                'name': self.best_name,
-                'is_trained': self.is_trained
-            }, f)
+            'models': self.models,
+            'scalers': self.scalers,
+            'features': self.features
+        }, 'models_v11/strategies.pkl')
     
-    def load(self):
-        path = f"{MODELS_DIR}/best_model.pkl"
-        if os.path.exists(path):
-            data = joblib.load(path)
-            self.best_model = data['model']
-            self.best_scaler = data['scaler']
-            self.best_features = data['features']
-            self.best_threshold = data['threshold']
-            self.best_duration = data['duration']
-            self.best_name = data['name']
-            self.is_trained = True
-            logger.info(f"📂 تحميل: {self.best_name}")
-            return True
-        return False
+    def load(self) -> bool:
+        path = 'models_v11/strategies.pkl'
+        if not os.path.exists(path):
+            return False
+        data = joblib.load(path)
+        self.models = data['models']
+        self.scalers = data['scalers']
+        self.features = data['features']
+        self.is_trained = True
+        return True
 
 # ============================================================================
-# PHASE 5: TRADER
+# MAIN TRADER
 # ============================================================================
 
-class Trader:
-    def __init__(self, db: Database, brain: Brain, gatherer: DataGatherer):
-        self.db = db
-        self.brain = brain
-        self.gatherer = gatherer
+class FalconV11:
+    def __init__(self):
+        self.db = Database()
+        self.reader = MarketReader()
+        self.engine = StrategyEngine()
+        
         self.tb = telebot.TeleBot(TELEGRAM_TOKEN)
         self._setup_bot()
+        
+        # تدريب أو تحميل
+        if not self.engine.load():
+            self._initial_train()
+    
+    def _initial_train(self):
+        """تدريب أولي"""
+        logger.info("📥 جلب بيانات للتدريب...")
+        
+        import yfinance as yf
+        df = yf.download('EURUSD=X', period='3mo', interval='15m', progress=False)
+        
+        if not df.empty:
+            df.columns = [c.capitalize() for c in df.columns]
+            self.engine.train_all(df)
+            self.engine.save()
+            logger.info("✅ التدريب اكتمل")
     
     def _setup_bot(self):
         try:
@@ -519,32 +497,15 @@ class Trader:
             if str(msg.chat.id) != TELEGRAM_CHAT_ID:
                 return
             
-            if self.brain.is_trained:
-                text = (f"🦅 **Falcon V10**\n\n"
-                       f"🧠 العقل: نشط\n"
-                       f"⭐ {self.brain.best_name}\n"
-                       f"🎯 العتبة: {self.brain.best_threshold:.0%}\n"
-                       f"⏱️ المدة: {self.brain.best_duration} د")
-            else:
-                text = "🦅 **Falcon V10**\n\n🧠 العقل: يحتاج تدريب\n📥 استخدم /train"
+            stats = self.db.get_strategy_stats()
+            
+            text = (f"🦅 **Falcon V11 - Adaptive**\n\n"
+                   f"🧠 3 استراتيجيات\n"
+                   f"📊 ترند: {stats['trend']['win_rate']:.0%} ({stats['trend']['total']})\n"
+                   f"📊 تذبذب: {stats['range']['win_rate']:.0%} ({stats['range']['total']})\n"
+                   f"📊 اختراق: {stats['breakout']['win_rate']:.0%} ({stats['breakout']['total']})")
             
             self.tb.reply_to(msg, text, parse_mode='Markdown')
-        
-        @self.tb.message_handler(commands=['train'])
-        def train_cmd(msg):
-            if str(msg.chat.id) != TELEGRAM_CHAT_ID:
-                return
-            
-            self.tb.reply_to(msg, "📥 جمع البيانات...")
-            self.gatherer.fetch_all()
-            
-            self.tb.reply_to(msg, "🧠 تدريب واختبار...")
-            success = self.brain.evolve()
-            
-            if success:
-                self.tb.reply_to(msg, f"✅ جاهز!\n⭐ {self.brain.best_name}\n📈 العتبة: {self.brain.best_threshold:.0%}")
-            else:
-                self.tb.reply_to(msg, "❌ فشل. جرب تاني.")
         
         @self.tb.message_handler(func=lambda msg: True)
         def analyze_any(msg):
@@ -552,85 +513,118 @@ class Trader:
                 return
             
             symbol = msg.text.strip().upper()
-            
-            if not self.brain.is_trained:
-                self.tb.reply_to(msg, "❌ العقل مش مدرب. استخدم /train")
-                return
-            
             self.tb.reply_to(msg, f"🔍 تحليل {symbol}...")
             
-            df = self.gatherer.fetch_live(symbol)
+            df = self._fetch_live(symbol)
             if df is None:
                 self.tb.reply_to(msg, "❌ لا بيانات")
                 return
             
-            direction, confidence = self.brain.predict(df)
+            # قراءة السوق
+            market = self.reader.read(df)
             
-            if direction is None:
-                self.tb.reply_to(msg, f"💰 {float(df['Close'].iloc[-1]):.5f}\n⏳ انتظار...")
-                return
+            # اختيار الاستراتيجية
+            strategy = market['type']
             
-            emoji = "🟢" if direction == 'BUY' else "🔴"
-            dir_ar = "شراء ▲" if direction == 'BUY' else "بيع ▼"
+            # تنبؤ
+            direction, confidence = self.engine.predict(df, strategy, 0.52)
             
-            text = (f"📊 **{symbol}**\n\n"
-                   f"{emoji} {dir_ar}\n"
-                   f"💰 {float(df['Close'].iloc[-1]):.5f}\n"
-                   f"💪 {confidence:.1%}")
+            price = float(df['Close'].iloc[-1])
+            
+            if direction:
+                emoji = "🟢" if direction == 'BUY' else "🔴"
+                dir_ar = "شراء ▲" if direction == 'BUY' else "بيع ▼"
+                
+                text = (f"📊 **{symbol}**\n\n"
+                       f"🏷 السوق: {strategy}\n"
+                       f"{emoji} {dir_ar}\n"
+                       f"💰 {price:.5f}\n"
+                       f"💪 {confidence:.1%}")
+            else:
+                text = (f"📊 **{symbol}**\n\n"
+                       f"🏷 السوق: {strategy}\n"
+                       f"💰 {price:.5f}\n"
+                       f"⏳ انتظار...")
             
             self.tb.reply_to(msg, text, parse_mode='Markdown')
     
+    def _fetch_live(self, symbol: str) -> Optional[pd.DataFrame]:
+        try:
+            import yfinance as yf
+            df = yf.download(f'{symbol}=X', period='5d', interval='5m', progress=False)
+            if not df.empty:
+                df.columns = [c.capitalize() for c in df.columns]
+                return df
+        except:
+            pass
+        return None
+    
     def analyze(self, symbol: str) -> Optional[Dict]:
-        if not self.brain.is_trained:
-            return None
-        
         if self.db.has_active_signal(symbol):
             return None
         
         if self.db.was_recent(symbol, 5):
             return None
         
-        df = self.gatherer.fetch_live(symbol)
+        df = self._fetch_live(symbol)
         if df is None:
             return None
         
-        direction, confidence = self.brain.predict(df)
+        # ✅ خطوة 1: اقرأ السوق
+        market = self.reader.read(df)
+        strategy = market['type']
+        
+        if market['confidence'] < 0.4:
+            return None  # السوق مش واضح
+        
+        # ✅ خطوة 2: استخدم الاستراتيجية المناسبة
+        threshold = 0.55 if strategy == 'trend' else (0.52 if strategy == 'range' else 0.58)
+        direction, confidence = self.engine.predict(df, strategy, threshold)
         
         if direction is None:
             return None
         
+        # ✅ خطوة 3: حدد المدة حسب نوع السوق
+        duration = 5 if strategy == 'breakout' else (7 if strategy == 'trend' else 10)
+        
         entry = float(df['Close'].iloc[-1])
+        
+        logger.info(f"🎯 {symbol}: {direction} | {strategy} | {confidence:.1%} | {duration}د")
         
         return {
             'symbol': symbol,
             'direction': direction,
             'entry_price': entry,
             'confidence': confidence,
-            'duration': self.brain.best_duration,
-            'model_name': self.brain.best_name,
-            'expiry_time': (datetime.now() + timedelta(minutes=self.brain.best_duration)).strftime('%Y-%m-%d %H:%M:%S')
+            'strategy': strategy,
+            'market_type': strategy,
+            'duration': duration,
+            'expiry_time': (datetime.now() + timedelta(minutes=duration)).strftime('%Y-%m-%d %H:%M:%S')
         }
     
     def send_signal(self, signal: Dict):
         emoji = "🟢" if signal['direction'] == 'BUY' else "🔴"
         direction = "شراء ▲" if signal['direction'] == 'BUY' else "بيع ▼"
         
+        strategy_emoji = {'trend': '📈', 'range': '📊', 'breakout': '🚀'}
+        
         msg = (f"{emoji} **{signal['symbol']}** - {direction}\n\n"
                f"💰 {signal['entry_price']:.5f}\n"
                f"⏳ {signal['duration']} د\n"
-               f"💪 {signal['confidence']:.1%}\n\n"
-               f"🤖 Falcon V10")
+               f"💪 {signal['confidence']:.1%}\n"
+               f"{strategy_emoji.get(signal['strategy'], '')} {signal['strategy']}\n\n"
+               f"🤖 Falcon V11")
         
         try:
             self.tb.send_message(TELEGRAM_CHAT_ID, msg, parse_mode='Markdown')
-            logger.info(f"✅ {signal['symbol']} {signal['direction']}")
+            logger.info(f"✅ {signal['symbol']} {signal['direction']} ({signal['strategy']})")
         except:
             pass
     
     def check_trades(self):
         for trade in self.db.get_expired_trades():
             try:
-                df = self.gatherer.fetch_live(trade['symbol'])
+                df = self._fetch_live(trade['symbol'])
                 if df is None:
                     continue
                 
@@ -650,7 +644,7 @@ class Trader:
                     result = 'WIN' if current < entry else 'LOSS'
                 
                 self.db.update_result(trade['id'], current, result, pnl, round(pips, 1))
-                logger.info(f"{'✅' if result == 'WIN' else '❌'} {trade['symbol']}: {result} | {pnl:+.2f}%")
+                logger.info(f"{'✅' if result == 'WIN' else '❌'} {trade['symbol']}: {result} | {trade.get('strategy', '')}")
             except:
                 pass
     
@@ -664,7 +658,8 @@ class Trader:
                 pass
     
     def run(self):
-        logger.info("📡 Phase 5: بدء المراقبة...")
+        logger.info("🦅 Falcon V11 - Adaptive Strategy Switcher")
+        logger.info("🧠 3 استراتيجيات: ترند | تذبذب | اختراق")
         
         def poll():
             while True:
@@ -676,8 +671,9 @@ class Trader:
         time.sleep(1)
         
         try:
-            status_text = f"🦅 **Falcon V10**\n\n✅ جاهز\n⭐ {self.brain.best_name}\n⚡️ المراقبة بدأت..."
-            self.tb.send_message(TELEGRAM_CHAT_ID, status_text, parse_mode='Markdown')
+            self.tb.send_message(TELEGRAM_CHAT_ID,
+                "🦅 **Falcon V11**\n\n🧠 3 استراتيجيات\n📈 ترند | 📊 تذبذب | 🚀 اختراق\n⚡️ يعمل...",
+                parse_mode='Markdown')
         except:
             pass
         
@@ -692,34 +688,7 @@ class Trader:
                 logger.error(f"حلقة: {e}")
                 time.sleep(30)
 
-# ============================================================================
-# MAIN
-# ============================================================================
-
-class FalconV10:
-    def __init__(self):
-        self.db = Database()
-        self.gatherer = DataGatherer(self.db)
-        self.brain = Brain(self.db)
-        self.trader = Trader(self.db, self.brain, self.gatherer)
-    
-    def run(self):
-        logger.info("=" * 50)
-        logger.info("🦅 Falcon V10 - Born to Learn")
-        logger.info("=" * 50)
-        
-        # حاول تحميل عقل موجود
-        if not self.brain.load():
-            # Phase 1: جمع البيانات
-            self.gatherer.fetch_all()
-            
-            # Phase 2-4: تدريب واختبار وتعلم
-            self.brain.evolve()
-        
-        # Phase 5: تداول
-        self.trader.run()
-
 if __name__ == "__main__":
-    os.makedirs(MODELS_DIR, exist_ok=True)
-    bot = FalconV10()
+    os.makedirs('models_v11', exist_ok=True)
+    bot = FalconV11()
     bot.run()
