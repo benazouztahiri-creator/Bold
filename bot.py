@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """
-Falcon AI v9.1 - Alpha Vantage Data
-=====================================
-Free data source. No Yahoo Finance needed.
+Falcon AI v9.2 - Hybrid Data
+==============================
+Yahoo Finance = Fast Training (unlimited)
+Alpha Vantage = Live Scanning (accurate)
 """
 
 import os
@@ -25,7 +26,6 @@ import requests
 
 from sklearn.preprocessing import RobustScaler
 from sklearn.feature_selection import mutual_info_classif
-from sklearn.metrics import accuracy_score
 import xgboost as xgb
 
 import telebot
@@ -40,19 +40,16 @@ class Config:
     TELEGRAM_TOKEN: str = os.environ.get('TELEGRAM_TOKEN', '8773849578:AAH9a6-8hU5YFYTad2EA5jQyfffIoeL8npk')
     TELEGRAM_CHAT_ID: str = os.environ.get('TELEGRAM_CHAT_ID', '7553333305')
     
-    # ✅ Alpha Vantage API Key (مجاني من alphavantage.co)
-    ALPHA_VANTAGE_KEY: str = os.environ.get('5TFFWK21CUNA3P25', 'demo')
+    ALPHA_VANTAGE_KEY: str = os.environ.get('ALPHA_VANTAGE_KEY', '5TFFWK21CUNA3P25')
     
     SCAN_INTERVAL: int = 60
     
+    # ✅ 12 زوج
     SYMBOLS: List[str] = field(default_factory=lambda: [
         'EURUSD', 'GBPUSD', 'USDJPY', 'AUDUSD',
         'USDCAD', 'NZDUSD', 'EURGBP', 'EURJPY',
         'GBPJPY', 'EURCHF', 'USDCHF', 'AUDJPY'
     ])
-    
-    TRAINING_PERIOD: str = '2mo'
-    MIN_TRAINING_SAMPLES: int = 500
     
     DB_PATH: str = 'falcon_v9.db'
     MODELS_DIR: str = 'models_v9'
@@ -73,35 +70,53 @@ logging.basicConfig(
 logger = logging.getLogger('FalconV9')
 
 # ============================================================================
-# DATA FETCHER - Alpha Vantage (مجاني)
+# DATA FETCHER - Hybrid
 # ============================================================================
 
-class DataFetcher:
-    def __init__(self, api_key: str):
-        self.api_key = api_key
-        self.base_url = "https://www.alphavantage.co/query"
+class HybridDataFetcher:
+    """
+    ✅ Yahoo Finance = تدريب (سريع، غير محدود)
+    ✅ Alpha Vantage = فحص (دقيق، حي)
+    """
+    
+    def __init__(self, av_key: str):
+        self.av_key = av_key
         self.cache = {}
         self.cache_time = {}
-        self.cache_duration = 30  # ثواني
+        self.cache_duration = 30
     
-    def fetch_forex(self, symbol: str, interval: str = '5min', outputsize: str = 'compact') -> Optional[pd.DataFrame]:
-        """جلب بيانات الفوركس"""
+    def fetch_training_data(self, symbol: str) -> Optional[pd.DataFrame]:
+        """✅ تدريب: Yahoo Finance (سريع)"""
+        try:
+            import yfinance as yf
+            
+            yf_symbol = f"{symbol}=X"
+            df = yf.download(yf_symbol, period='2mo', interval='15m', progress=False)
+            
+            if df is not None and not df.empty:
+                df.columns = [c.capitalize() for c in df.columns]
+                logger.info(f"📥 {symbol}: {len(df)} صف (Yahoo)")
+                return df
+            
+        except:
+            pass
         
-        # ✅ رمز الفوركس لـ Alpha Vantage
-        from_currency = symbol[:3]
-        to_currency = symbol[3:]
+        return None
+    
+    def fetch_live_data(self, symbol: str, interval: str = '5min') -> Optional[pd.DataFrame]:
+        """✅ فحص: Alpha Vantage (دقيق)"""
         
         # ✅ كاش
-        cache_key = f"{symbol}_{interval}_{outputsize}"
+        cache_key = f"{symbol}_{interval}"
         if cache_key in self.cache:
             if time.time() - self.cache_time.get(cache_key, 0) < self.cache_duration:
                 return self.cache[cache_key].copy()
         
-        # ✅ تحويل الفاصل الزمني
-        interval_map = {
-            '1m': '1min', '5m': '5min', '15m': '15min',
-            '30m': '30min', '1h': '60min'
-        }
+        # ✅ Alpha Vantage
+        from_currency = symbol[:3]
+        to_currency = symbol[3:]
+        
+        interval_map = {'5m': '5min', '15m': '15min'}
         av_interval = interval_map.get(interval, '5min')
         
         params = {
@@ -109,69 +124,52 @@ class DataFetcher:
             'from_symbol': from_currency,
             'to_symbol': to_currency,
             'interval': av_interval,
-            'outputsize': outputsize,
-            'apikey': self.api_key
+            'outputsize': 'compact',
+            'apikey': self.av_key
         }
         
         try:
-            response = requests.get(self.base_url, params=params, timeout=10)
+            response = requests.get('https://www.alphavantage.co/query', params=params, timeout=10)
             data = response.json()
             
-            # ✅ استخراج البيانات
             time_series_key = f"Time Series FX ({av_interval})"
             
-            if time_series_key not in data:
-                logger.warning(f"⚠️ {symbol}: لا بيانات من Alpha Vantage")
-                # ✅ جرب Yahoo Finance كبديل
-                return self._fetch_yahoo_fallback(symbol, interval)
+            if time_series_key in data:
+                records = []
+                for timestamp, values in data[time_series_key].items():
+                    records.append({
+                        'Date': timestamp,
+                        'Open': float(values['1. open']),
+                        'High': float(values['2. high']),
+                        'Low': float(values['3. low']),
+                        'Close': float(values['4. close']),
+                        'Volume': 0
+                    })
+                
+                df = pd.DataFrame(records)
+                df['Date'] = pd.to_datetime(df['Date'])
+                df = df.set_index('Date').sort_index()
+                
+                self.cache[cache_key] = df
+                self.cache_time[cache_key] = time.time()
+                
+                logger.debug(f"📡 {symbol}: {len(df)} صف (Alpha)")
+                return df
             
-            time_series = data[time_series_key]
-            
-            records = []
-            for timestamp, values in time_series.items():
-                records.append({
-                    'Date': timestamp,
-                    'Open': float(values['1. open']),
-                    'High': float(values['2. high']),
-                    'Low': float(values['3. low']),
-                    'Close': float(values['4. close']),
-                    'Volume': 0
-                })
-            
-            df = pd.DataFrame(records)
-            df['Date'] = pd.to_datetime(df['Date'])
-            df = df.set_index('Date').sort_index()
-            
-            # ✅ حفظ في الكاش
-            self.cache[cache_key] = df
-            self.cache_time[cache_key] = time.time()
-            
-            logger.info(f"✅ {symbol}: {len(df)} صف من Alpha Vantage")
-            return df
-            
-        except Exception as e:
-            logger.error(f"❌ {symbol}: Alpha Vantage فشل - {e}")
-            return self._fetch_yahoo_fallback(symbol, interval)
-    
-    def _fetch_yahoo_fallback(self, symbol: str, interval: str) -> Optional[pd.DataFrame]:
-        """✅ بديل احتياطي: Yahoo Finance"""
+        except:
+            pass
+        
+        # ✅ بديل: Yahoo Finance
         try:
             import yfinance as yf
-            
-            # تحويل الرمز
-            yahoo_symbol = f"{symbol}=X"
-            
-            # تحويل الفاصل
-            interval_map = {'1m': '1m', '5m': '5m', '15m': '15m', '1h': '1h'}
-            yf_interval = interval_map.get(interval, '5m')
-            
-            df = yf.download(yahoo_symbol, period='5d', interval=yf_interval, progress=False)
+            yf_symbol = f"{symbol}=X"
+            yf_interval = '5m' if interval == '5min' else '15m'
+            df = yf.download(yf_symbol, period='3d', interval=yf_interval, progress=False)
             
             if not df.empty:
                 df.columns = [c.capitalize() for c in df.columns]
-                logger.info(f"✅ {symbol}: {len(df)} صف من Yahoo (بديل)")
+                logger.debug(f"📡 {symbol}: {len(df)} صف (Yahoo بديل)")
                 return df
-            
         except:
             pass
         
@@ -211,6 +209,7 @@ class EvolvingStrategy:
                 self.base_duration = int(np.mean([t.get('duration', 7) for t in wins]))
             self.evolution_generation += 1
             self.save()
+            logger.info(f"🧬 تطور {self.evolution_generation}: عتبة={self.confidence_threshold:.0%}")
     
     def should_trade_now(self) -> Tuple[bool, str]:
         now = datetime.utcnow()
@@ -395,8 +394,8 @@ class TradingModel:
             X = X[self.features]
             
             split = int(len(X) * 0.8)
-            X_train, X_val = X[:split], X[split:]
-            y_train, y_val = y[:split], y[split:]
+            X_train = X[:split]
+            y_train = y[:split]
             X_train_s = self.scaler.fit_transform(X_train)
             
             self.model = xgb.XGBClassifier(
@@ -460,7 +459,7 @@ class TradingModel:
 class FalconV9:
     def __init__(self, config: Config):
         self.config = config
-        self.fetcher = DataFetcher(config.ALPHA_VANTAGE_KEY)
+        self.fetcher = HybridDataFetcher(config.ALPHA_VANTAGE_KEY)
         self.db = Database(config.DB_PATH)
         self.strategy = EvolvingStrategy(config)
         self.models = {}
@@ -474,11 +473,13 @@ class FalconV9:
         self._train_all_models()
     
     def _train_all_models(self):
-        logger.info(f"🎓 تدريب {len(self.config.SYMBOLS)} زوج...")
+        """✅ تدريب سريع بـ Yahoo Finance"""
+        logger.info(f"🎓 تدريب {len(self.config.SYMBOLS)} زوج (Yahoo)...")
+        start_time = time.time()
         
         for symbol in self.config.SYMBOLS:
             try:
-                df = self.fetcher.fetch_forex(symbol, '15min', 'compact')
+                df = self.fetcher.fetch_training_data(symbol)
                 
                 if df is not None and len(df) >= 200:
                     model = TradingModel(symbol)
@@ -486,13 +487,16 @@ class FalconV9:
                         model.save()
                         self.models[symbol] = model
                         logger.info(f"✅ {symbol}")
+                else:
+                    logger.warning(f"⚠️ {symbol}: بيانات غير كافية")
                 
-                time.sleep(15)  # ✅ Alpha Vantage: 5 طلبات/دقيقة
+                time.sleep(1)  # استراحة سريعة
             except Exception as e:
                 logger.error(f"❌ {symbol}: {e}")
         
+        elapsed = time.time() - start_time
         trained = sum(1 for m in self.models.values() if m.is_trained)
-        logger.info(f"🎓 جاهز: {trained}/{len(self.config.SYMBOLS)}")
+        logger.info(f"🎓 جاهز: {trained}/{len(self.config.SYMBOLS)} في {elapsed:.0f} ثانية")
     
     def _setup_bot(self):
         try:
@@ -505,19 +509,19 @@ class FalconV9:
             if str(msg.chat.id) != self.config.TELEGRAM_CHAT_ID:
                 return
             trained = sum(1 for m in self.models.values() if m.is_trained)
-            text = (f"🦅 **Falcon V9.1**\n"
+            text = (f"🦅 **Falcon V9.2**\n"
                    f"✅ نماذج: {trained}/{len(self.config.SYMBOLS)}\n"
                    f"📊 صفقات: {self.strategy.total_trades}\n"
                    f"📈 نجاح: {self.strategy.current_win_rate:.1%}\n"
                    f"🎯 العتبة: {self.strategy.confidence_threshold:.0%}\n"
-                   f"📡 Alpha Vantage")
+                   f"📡 Hybrid Data")
             self.tb.reply_to(msg, text, parse_mode='Markdown')
         
         @self.tb.message_handler(commands=['train'])
         def train_cmd(msg):
             if str(msg.chat.id) != self.config.TELEGRAM_CHAT_ID:
                 return
-            self.tb.reply_to(msg, "🎓 جاري التدريب...")
+            self.tb.reply_to(msg, "🎓 تدريب (Yahoo)...")
             self._train_all_models()
             trained = sum(1 for m in self.models.values() if m.is_trained)
             self.tb.reply_to(msg, f"✅ جاهز: {trained}/{len(self.config.SYMBOLS)}")
@@ -530,24 +534,25 @@ class FalconV9:
             symbol = msg.text.strip().upper()
             self.tb.reply_to(msg, f"🔍 تحليل {symbol}...")
             
-            df_5m = self.fetcher.fetch_forex(symbol, '5min')
+            df = self.fetcher.fetch_live_data(symbol, '5min')
             
-            if df_5m is None or df_5m.empty:
-                self.tb.reply_to(msg, f"❌ لا بيانات لـ {symbol}")
+            if df is None or df.empty:
+                self.tb.reply_to(msg, f"❌ لا بيانات")
                 return
             
             model = self.models.get(symbol) or list(self.models.values())[0] if self.models else None
             
             if model is None or not model.is_trained:
-                self.tb.reply_to(msg, "❌ النموذج غير جاهز")
+                self.tb.reply_to(msg, "❌ نموذج غير جاهز")
                 return
             
-            dir_5m, conf_5m, pb_5m, ps_5m = model.predict(df_5m, 0.50)
-            price = float(df_5m['Close'].iloc[-1])
+            dir_m, conf_m, pb, ps = model.predict(df, 0.50)
+            price = float(df['Close'].iloc[-1])
             
             text = (f"📊 **{symbol}**\n\n"
                    f"💰 {price:.5f}\n\n"
-                   f"M5: {dir_5m} (B:{pb_5m:.0%} S:{ps_5m:.0%})")
+                   f"إشارة: {dir_m}\n"
+                   f"BUY: {pb:.0%} | SELL: {ps:.0%}")
             
             self.tb.reply_to(msg, text, parse_mode='Markdown')
     
@@ -565,16 +570,16 @@ class FalconV9:
         if self.db.was_recent(symbol, self.config.SIGNAL_COOLDOWN_MINUTES):
             return None
         
-        df_5m = self.fetcher.fetch_forex(symbol, '5min')
-        df_15m = self.fetcher.fetch_forex(symbol, '15min')
+        df_5m = self.fetcher.fetch_live_data(symbol, '5min')
+        df_15m = self.fetcher.fetch_live_data(symbol, '15min')
         
         if df_5m is None or df_15m is None:
             return None
         
         threshold = self.strategy.confidence_threshold
         
-        dir_5m, conf_5m, pb_5m, ps_5m = model.predict(df_5m, threshold)
-        dir_15m, conf_15m, pb_15m, ps_15m = model.predict(df_15m, threshold)
+        dir_5m, conf_5m, _, _ = model.predict(df_5m, threshold)
+        dir_15m, conf_15m, _, _ = model.predict(df_15m, threshold)
         
         if dir_5m != dir_15m or dir_5m == "NEUTRAL":
             return None
@@ -613,7 +618,7 @@ class FalconV9:
     def check_trades(self):
         for trade in self.db.get_expired_trades():
             try:
-                df = self.fetcher.fetch_forex(trade['symbol'], '5min')
+                df = self.fetcher.fetch_live_data(trade['symbol'], '5min')
                 if df is None:
                     continue
                 
@@ -648,7 +653,7 @@ class FalconV9:
                 pass
     
     def run(self):
-        logger.info(f"🦅 Falcon V9.1 - Alpha Vantage - {len(self.config.SYMBOLS)} زوج")
+        logger.info(f"🦅 Falcon V9.2 - Hybrid Data - {len(self.config.SYMBOLS)} زوج")
         
         def poll():
             while True:
@@ -662,7 +667,7 @@ class FalconV9:
         trained = sum(1 for m in self.models.values() if m.is_trained)
         try:
             self.tb.send_message(self.config.TELEGRAM_CHAT_ID,
-                f"🦅 **Falcon V9.1**\n✅ {trained}/{len(self.config.SYMBOLS)}\n📡 Alpha Vantage\n⚡️ يعمل...",
+                f"🦅 **Falcon V9.2**\n✅ {trained}/{len(self.config.SYMBOLS)}\n📡 Hybrid\n⚡️ يعمل...",
                 parse_mode='Markdown')
         except:
             pass
