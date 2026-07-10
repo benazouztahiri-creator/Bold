@@ -14,6 +14,7 @@ Falcon AI Pro v4 - Professional Trading System
 ✅ Adaptive indicator weights
 ✅ Real economic calendar filter
 ✅ Performance tracking per symbol
+✅ Auto-train on startup
 """
 
 import os
@@ -53,18 +54,16 @@ SYMBOLS = [
 SCAN_INTERVAL = 90
 MIN_CONFIDENCE = 0.55
 
-# ✅ جلسات التداول (UTC)
 SESSIONS = {
     'asian': (0, 9),
     'london': (8, 17),
     'ny': (13, 22),
-    'overlap': (13, 17)  # لندن + نيويورك
+    'overlap': (13, 17)
 }
 
-# ✅ أقصى تراجع مسموح
-MAX_DRAWDOWN = 0.15  # 15%
-MAX_DAILY_LOSS = 0.03  # 3%
-RISK_PER_TRADE = 0.01  # 1%
+MAX_DRAWDOWN = 0.15
+MAX_DAILY_LOSS = 0.03
+RISK_PER_TRADE = 0.01
 
 # ============================================================================
 # LOGGING
@@ -200,7 +199,6 @@ class Database:
                 exit_time=datetime('now', 'localtime') WHERE id=?
             ''', (exit_price, result, pnl, pips, high_p, low_p, sl_first, tp_first, signal_id))
             
-            # ✅ تحديث أداء الزوج
             symbol = conn.execute('SELECT symbol FROM signals WHERE id=?', (signal_id,)).fetchone()[0]
             conn.execute('''
                 UPDATE symbol_performance 
@@ -210,7 +208,6 @@ class Database:
                 WHERE symbol = ?
             ''', (1 if result == 'WIN' else 0, pnl, symbol))
             
-            # ✅ آخر 10 نتائج
             results = json.loads(conn.execute(
                 'SELECT last_10_results FROM symbol_performance WHERE symbol=?', (symbol,)
             ).fetchone()[0] or '[]')
@@ -227,7 +224,6 @@ class Database:
                 WHERE symbol = ?
             ''', (json.dumps(results), win_rate_10, win_rate_10, symbol))
             
-            # ✅ تحديث المخاطرة اليومية
             today = datetime.now().strftime('%Y-%m-%d')
             conn.execute('''
                 INSERT INTO risk_metrics (date, daily_pnl, total_trades)
@@ -293,9 +289,8 @@ class SessionFilter:
     def get_current_session() -> str:
         now = datetime.utcnow()
         hour = now.hour
-        
         if SESSIONS['overlap'][0] <= hour < SESSIONS['overlap'][1]:
-            return 'overlap'  # أفضل وقت
+            return 'overlap'
         elif SESSIONS['london'][0] <= hour < SESSIONS['london'][1]:
             return 'london'
         elif SESSIONS['ny'][0] <= hour < SESSIONS['ny'][1]:
@@ -307,15 +302,7 @@ class SessionFilter:
     
     @staticmethod
     def is_good_time() -> bool:
-        session = SessionFilter.get_current_session()
-        return session in ['overlap', 'london', 'ny']
-    
-    @staticmethod
-    def get_session_quality() -> float:
-        """0-1: جودة التداول في الجلسة الحالية"""
-        session = SessionFilter.get_current_session()
-        qualities = {'overlap': 1.0, 'london': 0.8, 'ny': 0.7, 'asian': 0.4, 'dead': 0.0}
-        return qualities.get(session, 0.0)
+        return SessionFilter.get_current_session() in ['overlap', 'london', 'ny']
 
 # ============================================================================
 # MARKET STRUCTURE
@@ -324,63 +311,37 @@ class SessionFilter:
 class MarketStructure:
     @staticmethod
     def detect(df: pd.DataFrame) -> Dict:
-        """✅ اكتشاف بنية السوق: HH/HL (صاعد) أو LH/LL (هابط) أو BOS/CHoCH"""
         if len(df) < 50:
             return {'structure': 'unknown', 'trend': 'neutral', 'bos': False, 'choch': False}
         
-        h = df['High'].values
-        l = df['Low'].values
-        c = df['Close'].values
+        h, l, c = df['High'].values, df['Low'].values, df['Close'].values
+        highs_20, lows_20 = h[-20:], l[-20:]
         
-        # ✅ إيجاد القمم والقيعان (آخر 20 شمعة)
-        highs_20 = h[-20:]
-        lows_20 = l[-20:]
-        
-        # Higher High / Higher Low
-        hh = False
-        hl = False
-        lh = False
-        ll = False
+        hh, ll = False, False
         
         for i in range(5, len(highs_20)-5):
             if highs_20[i] > highs_20[i-5] and highs_20[i] > highs_20[i+5]:
-                if i > 0:
-                    prev_high = max(highs_20[:i])
-                    if highs_20[i] > prev_high:
-                        hh = True
+                if i > 0 and highs_20[i] > max(highs_20[:i]):
+                    hh = True
         
         for i in range(5, len(lows_20)-5):
             if lows_20[i] < lows_20[i-5] and lows_20[i] < lows_20[i+5]:
-                if i > 0:
-                    prev_low = min(lows_20[:i])
-                    if lows_20[i] < prev_low:
-                        ll = True
+                if i > 0 and lows_20[i] < min(lows_20[:i]):
+                    ll = True
         
-        # ✅ تحديد الترند
         if hh:
-            structure = 'bullish'
-            trend = 'UP'
+            structure, trend = 'bullish', 'UP'
         elif ll:
-            structure = 'bearish'
-            trend = 'DOWN'
+            structure, trend = 'bearish', 'DOWN'
         else:
-            structure = 'ranging'
-            trend = 'neutral'
+            structure, trend = 'ranging', 'neutral'
         
-        # ✅ BOS (Break of Structure)
         ema50 = pd.Series(c).ewm(span=50).mean().values[-1]
         ema20 = pd.Series(c).ewm(span=20).mean().values[-1]
         bos = (trend == 'UP' and c[-1] > ema20) or (trend == 'DOWN' and c[-1] < ema20)
-        
-        # ✅ CHoCH (Change of Character) - انعكاس محتمل
         choch = (trend == 'UP' and c[-1] < ema50) or (trend == 'DOWN' and c[-1] > ema50)
         
-        return {
-            'structure': structure,
-            'trend': trend,
-            'bos': bos,
-            'choch': choch
-        }
+        return {'structure': structure, 'trend': trend, 'bos': bos, 'choch': choch}
 
 # ============================================================================
 # PRICE ACTION
@@ -400,10 +361,8 @@ class PriceAction:
         total1 = c1['High'] - c1['Low']
         
         if body1 > 0 and total1 > 0:
-            # Hammer
             if lower1 > body1 * 2 and upper1 < body1 * 0.3:
                 return "hammer", 0.6
-            # Shooting Star
             if upper1 > body1 * 2 and lower1 < body1 * 0.3:
                 return "shooting_star", -0.6
         
@@ -514,7 +473,7 @@ def calculate_all_indicators(df: pd.DataFrame, symbol: str) -> Dict:
     return result
 
 # ============================================================================
-# XGBoost MODEL
+# XGBoost MODEL - Auto Train
 # ============================================================================
 
 class MLModel:
@@ -523,70 +482,89 @@ class MLModel:
         self.scaler = None
         self.features = []
         self.is_trained = False
-        self._load_or_train()
+        
+        os.makedirs('models_v4', exist_ok=True)
+        
+        # ✅ تدريب تلقائي
+        if not self._load():
+            logger.info("🎓 تدريب XGBoost تلقائياً...")
+            self._train()
     
-    def _load_or_train(self):
-        try:
-            from sklearn.preprocessing import RobustScaler
-            import xgboost as xgb
-            
-            path = 'models_v4/xgb_model.pkl'
-            if os.path.exists(path):
+    def _load(self) -> bool:
+        path = 'models_v4/xgb_model.pkl'
+        if os.path.exists(path):
+            try:
                 data = joblib.load(path)
                 self.model = data['model']
                 self.scaler = data['scaler']
                 self.features = data['features']
                 self.is_trained = True
-            else:
-                self._quick_train()
-        except:
-            self._quick_train()
+                logger.info("📂 XGBoost محمل")
+                return True
+            except:
+                pass
+        return False
     
-    def _quick_train(self):
+    def _train(self):
         try:
             from sklearn.preprocessing import RobustScaler
             import xgboost as xgb
             
-            os.makedirs('models_v4', exist_ok=True)
-            
-            # تدريب سريع على EURUSD
+            logger.info("📥 جلب بيانات EURUSD للتدريب...")
             df = yf.download('EURUSD=X', period='3mo', interval='1h', progress=False)
+            
             if len(df) < 200:
+                logger.warning("⚠️ بيانات غير كافية")
                 return
             
             df.columns = [c.lower() for c in df.columns]
-            ind = calculate_all_indicators(df.rename(columns={'close': 'Close', 'high': 'High', 
-                                                             'low': 'Low', 'open': 'Open'}), 'EURUSD')
             
-            # ميزات بسيطة
             self.features = ['rsi', 'adx', 'bb_position', 'ret_1', 'ret_3', 'ret_5', 'volatility']
             
-            X_list = []
+            X_list, y_list = [], []
+            
             for i in range(50, len(df)-5):
                 chunk = df.iloc[i-50:i+1].rename(columns={'close': 'Close', 'high': 'High', 
                                                           'low': 'Low', 'open': 'Open'})
                 ind_chunk = calculate_all_indicators(chunk, 'EURUSD')
                 if ind_chunk:
                     X_list.append([ind_chunk.get(f, 0) for f in self.features])
+                    future_price = df['close'].values[i+5]
+                    current_price = df['close'].values[i]
+                    y_list.append(1 if future_price > current_price else 0)
             
             if len(X_list) < 100:
+                logger.warning("⚠️ عينات غير كافية")
                 return
             
             X = np.array(X_list)
-            y = (df['close'].values[55:55+len(X)] > df['close'].values[50:50+len(X)]).astype(int)
+            y = np.array(y_list)
             
             self.scaler = RobustScaler()
             X_s = self.scaler.fit_transform(X)
             
-            self.model = xgb.XGBClassifier(n_estimators=100, max_depth=4, learning_rate=0.05,
-                                           random_state=42, verbosity=0)
-            self.model.fit(X_s[:-20], y[:-20])
+            self.model = xgb.XGBClassifier(
+                n_estimators=100, max_depth=4, learning_rate=0.05,
+                random_state=42, verbosity=0
+            )
+            
+            split = int(len(X) * 0.8)
+            self.model.fit(X_s[:split], y[:split])
+            
+            # ✅ اختبار
+            y_pred = self.model.predict(X_s[split:])
+            acc = (y_pred == y[split:]).mean()
+            
             self.is_trained = True
             
-            joblib.dump({'model': self.model, 'scaler': self.scaler, 'features': self.features},
-                       'models_v4/xgb_model.pkl')
-        except:
-            pass
+            joblib.dump({
+                'model': self.model, 'scaler': self.scaler, 'features': self.features
+            }, 'models_v4/xgb_model.pkl')
+            
+            logger.info(f"✅ XGBoost مدرب - دقة: {acc:.1%}")
+            
+        except Exception as e:
+            logger.error(f"❌ تدريب XGBoost: {e}")
     
     def predict(self, indicators: Dict) -> float:
         if not self.is_trained:
@@ -610,18 +588,14 @@ class RiskManager:
     
     def can_trade(self) -> bool:
         daily_pnl = self.db.get_daily_pnl()
-        if daily_pnl < -MAX_DAILY_LOSS * self.account_balance:
-            return False
-        return True
+        return daily_pnl > -MAX_DAILY_LOSS * self.account_balance
     
     def calculate_position_size(self, symbol: str, entry: float, sl: float) -> float:
         risk_amount = self.account_balance * RISK_PER_TRADE
         pip_value = 0.01 if 'JPY' in symbol else 0.0001
         sl_pips = abs(entry - sl) / pip_value
-        
         if sl_pips < 5:
             return 0.01
-        
         position_size = risk_amount / (sl_pips * 10)
         return round(min(max(position_size, 0.01), 1.0), 2)
 
@@ -652,6 +626,17 @@ class FalconPro:
                    f"📊 XGBoost: {'نشط' if self.ml.is_trained else 'غير مدرب'}\n"
                    f"💰 ربح اليوم: {daily:.2f}%")
             self.tb.reply_to(msg, text, parse_mode='Markdown')
+        
+        @self.tb.message_handler(commands=['train'])
+        def train_cmd(msg):
+            if str(msg.chat.id) != TELEGRAM_CHAT_ID:
+                return
+            self.tb.reply_to(msg, "🎓 جاري تدريب XGBoost...")
+            self.ml._train()
+            if self.ml.is_trained:
+                self.tb.reply_to(msg, "✅ XGBoost جاهز!")
+            else:
+                self.tb.reply_to(msg, "❌ فشل التدريب")
     
     def fetch_data(self, symbol: str, interval: str, period: str) -> Optional[pd.DataFrame]:
         key = f"{symbol}_{interval}_{period}"
@@ -670,7 +655,6 @@ class FalconPro:
         return None
     
     def analyze(self, symbol: str) -> Optional[Dict]:
-        # ✅ فلاتر
         if EconomicCalendar.is_high_impact_now():
             return None
         if not SessionFilter.is_good_time():
@@ -684,7 +668,6 @@ class FalconPro:
         if self.db.was_recent(symbol):
             return None
         
-        # ✅ Multi-TF
         df_5m = self.fetch_data(symbol, '5m', '3d')
         df_15m = self.fetch_data(symbol, '15m', '5d')
         df_1h = self.fetch_data(symbol, '1h', '10d')
@@ -699,52 +682,36 @@ class FalconPro:
         if not ind_5m or not ind_15m or not ind_1h:
             return None
         
-        # ✅ ADX
         adx = ind_15m['adx']
         if adx < 20:
             return None
         
-        # ✅ Market Structure
         structure = MarketStructure.detect(df_1h)
-        
-        # ✅ Price Action
         pa_pattern, pa_score = PriceAction.detect(df_5m)
-        
-        # ✅ Session
         session = SessionFilter.get_current_session()
-        
-        # ✅ XGBoost prediction
         ml_proba = self.ml.predict(ind_5m)
         
-        # ✅ Score
         score = 0
         
-        # RSI
         rsi = ind_5m['rsi']
         if rsi < 30: score += 1.5
         elif rsi > 70: score -= 1.5
         
-        # MACD
         if ind_5m['macd'] > ind_5m['macd_signal']: score += 1.0
         else: score -= 1.0
         
-        # EMA
         if ind_5m['above_ema20']: score += 0.5
         else: score -= 0.5
         if ind_1h['ema_bullish']: score += 0.5
         
-        # BB
         if ind_5m['bb_position'] < -0.8: score += 1.5
         elif ind_5m['bb_position'] > 0.8: score -= 1.5
         
-        # Price Action
         score += pa_score
         
-        # ✅ ML opinion
         if ml_proba > 0.6: score += 1.0
         elif ml_proba < 0.4: score -= 1.0
         
-        # ✅ Decision
         trend = structure['trend']
         
         if score > 0 and trend == 'UP':
@@ -810,9 +777,7 @@ class FalconPro:
                 is_jpy = "JPY" in trade['symbol']
                 pip_value = 0.01 if is_jpy else 0.0001
                 
-                # ✅ أيهما ضُرب أولاً
-                sl_first = 0
-                tp_first = 0
+                sl_first, tp_first = 0, 0
                 
                 if direction == 'BUY':
                     for _, row in period.iterrows():
@@ -899,7 +864,8 @@ class FalconPro:
             pass
     
     def run(self):
-        logger.info("🦅 Falcon Pro v4")
+        logger.info("🦅 Falcon Pro v4 - Auto Train")
+        logger.info(f"📊 XGBoost: {'نشط' if self.ml.is_trained else 'غير مدرب'}")
         
         def poll():
             while True:
