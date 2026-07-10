@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """
-Falcon AI v5.1 - Enhanced 4 Strategies (Fixed)
-================================================
-Strategy 1: RSI Divergence + Support/Resistance
-Strategy 2: Breakout with Confirmed Retest (Candle Close)
-Strategy 3: EMA 20/50 Crossover (Price Proximity Check)
-Strategy 4: Fibonacci + Volume Confirmation
+Falcon AI v5.2 - Anti-Spam Protection
+========================================
+✅ 5-minute cooldown per symbol
+✅ Signal deduplication via hash
+✅ Pause after sending signals
+✅ All 4 professional strategies
+✅ Clean signal format
 """
 
 import os
@@ -39,8 +40,9 @@ SYMBOLS = [
     'USDCAD=X', 'EURGBP=X', 'EURJPY=X', 'GBPJPY=X'
 ]
 
-SCAN_INTERVAL = 20
+SCAN_INTERVAL = 15  # فحص كل 15 ثانية
 MIN_CONFIDENCE = 0.55
+COOLDOWN_MINUTES = 5  # تهدئة 5 دقائق لكل زوج
 
 # ============================================================================
 # LOGGING
@@ -101,12 +103,9 @@ class Database:
         self.db_path = 'falcon_v5.db'
         with sqlite3.connect(self.db_path) as conn:
             conn.execute('''CREATE TABLE IF NOT EXISTS signals (id INTEGER PRIMARY KEY AUTOINCREMENT, symbol TEXT, direction TEXT, entry_price REAL, exit_price REAL, stop_loss REAL, take_profit REAL, confidence REAL, score REAL, strategy TEXT, strategy_name TEXT, entry_time DATETIME DEFAULT CURRENT_TIMESTAMP, expiry_time DATETIME, exit_time DATETIME, result TEXT DEFAULT 'PENDING', pnl_percent REAL, pnl_pips REAL, signal_hash TEXT UNIQUE)''')
-            
             conn.execute('''CREATE TABLE IF NOT EXISTS strategy_performance (strategy TEXT PRIMARY KEY, total_trades INTEGER DEFAULT 0, wins INTEGER DEFAULT 0, total_pnl REAL DEFAULT 0, win_rate REAL DEFAULT 0.5)''')
-            
             for strat in ['divergence', 'breakout_retest', 'ema_cross', 'fibo_volume']:
                 conn.execute('INSERT OR IGNORE INTO strategy_performance (strategy) VALUES (?)', (strat,))
-            
             conn.commit()
     
     def save_signal(self, data):
@@ -128,7 +127,6 @@ class Database:
         with sqlite3.connect(self.db_path) as conn:
             conn.execute("UPDATE signals SET exit_price=?, result=?, pnl_percent=?, pnl_pips=?, exit_time=datetime('now','localtime') WHERE id=?",
                         (exit_price, result, pnl, pips, signal_id))
-            
             row = conn.execute('SELECT strategy FROM signals WHERE id=?', (signal_id,)).fetchone()
             if row and row[0]:
                 conn.execute('UPDATE strategy_performance SET total_trades=total_trades+1, wins=wins+?, total_pnl=total_pnl+? WHERE strategy=?',
@@ -140,7 +138,7 @@ class Database:
             c = conn.execute("SELECT COUNT(*) FROM signals WHERE symbol=? AND result='PENDING' AND expiry_time > datetime('now','localtime')", (symbol,)).fetchone()[0]
             return c > 0
     
-    def was_recent(self, symbol, minutes=10):
+    def was_recent(self, symbol, minutes=COOLDOWN_MINUTES):
         cutoff = (datetime.now() - timedelta(minutes=minutes)).strftime('%Y-%m-%d %H:%M:%S')
         with sqlite3.connect(self.db_path) as conn:
             c = conn.execute('SELECT COUNT(*) FROM signals WHERE symbol=? AND entry_time > ?', (symbol, cutoff)).fetchone()[0]
@@ -171,12 +169,10 @@ class DataFetcher:
         cached = data_cache.get(key)
         if cached is not None:
             return cached
-        
         try:
             import yfinance as yf
             yf_symbol = symbol if '=X' in symbol else f"{symbol}=X"
             imap = {'5m': '5m', '15m': '15m', '1h': '1h', '1m': '1m'}
-            
             df = yf.download(yf_symbol, period='5d', interval=imap.get(interval, '5m'), progress=False)
             df = safe_columns(df)
             if not df.empty:
@@ -235,12 +231,8 @@ def calc_fibo(df):
     l = df['Low'].values[-50:]
     sh, sl = float(np.max(h)), float(np.min(l))
     d = sh - sl
-    return {
-        'high': sh, 'low': sl,
-        'f382': round(sl + d * 0.382, 5),
-        'f500': round(sl + d * 0.500, 5),
-        'f618': round(sl + d * 0.618, 5),
-    }
+    return {'high': sh, 'low': sl, 'f382': round(sl + d * 0.382, 5),
+            'f500': round(sl + d * 0.500, 5), 'f618': round(sl + d * 0.618, 5)}
 
 def get_vol(df):
     if 'Volume' not in df.columns: return 1.0
@@ -253,11 +245,9 @@ def get_vol(df):
 
 def strat_divergence(df, symbol):
     if len(df) < 50: return None
-    
     c = df['Close'].values
     rsi_series = calc_rsi_series(df)
     if len(rsi_series) < 20: return None
-    
     price = float(c[-1])
     support, resistance = find_sr(df)
     atr = calc_atr(df)
@@ -270,14 +260,9 @@ def strat_divergence(df, symbol):
     
     if p20l < p40l and r20l > r40l and rsi_now < 45:
         if (price - support) / support * 100 < 0.1:
-            return {
-                'direction': 'BUY', 'price': price,
-                'stop_loss': round(support - atr * 0.5, 5),
-                'take_profit': round(price + atr * 3.0, 5),
-                'confidence': min(0.88, 0.5 + (45 - rsi_now) * 0.02),
-                'strategy': 'divergence',
-                'strategy_name': 'RSI انحراف صعودي + دعم', 'score': 5
-            }
+            return {'direction': 'BUY', 'price': price, 'stop_loss': round(support - atr * 0.5, 5),
+                    'take_profit': round(price + atr * 3.0, 5), 'confidence': min(0.88, 0.5 + (45 - rsi_now) * 0.02),
+                    'strategy': 'divergence', 'strategy_name': 'RSI انحراف صعودي + دعم', 'score': 5}
     
     p20h = float(np.max(c[-20:]))
     p40h = float(np.max(c[-40:-20]))
@@ -286,14 +271,9 @@ def strat_divergence(df, symbol):
     
     if p20h > p40h and r20h < r40h and rsi_now > 55:
         if (resistance - price) / price * 100 < 0.1:
-            return {
-                'direction': 'SELL', 'price': price,
-                'stop_loss': round(resistance + atr * 0.5, 5),
-                'take_profit': round(price - atr * 3.0, 5),
-                'confidence': min(0.88, 0.5 + (rsi_now - 55) * 0.02),
-                'strategy': 'divergence',
-                'strategy_name': 'RSI انحراف هبوطي + مقاومة', 'score': 5
-            }
+            return {'direction': 'SELL', 'price': price, 'stop_loss': round(resistance + atr * 0.5, 5),
+                    'take_profit': round(price - atr * 3.0, 5), 'confidence': min(0.88, 0.5 + (rsi_now - 55) * 0.02),
+                    'strategy': 'divergence', 'strategy_name': 'RSI انحراف هبوطي + مقاومة', 'score': 5}
     return None
 
 # ============================================================================
@@ -302,10 +282,8 @@ def strat_divergence(df, symbol):
 
 def strat_breakout(df, symbol):
     if len(df) < 40: return None
-    
     rl, rh, is_range = find_range(df)
     if not is_range: return None
-    
     c = df['Close'].values
     h = df['High'].values
     l = df['Low'].values
@@ -313,22 +291,14 @@ def strat_breakout(df, symbol):
     atr = calc_atr(df)
     
     if float(c[-2]) > rh and abs(float(l[-1]) - rh) / rh < 0.015 and float(c[-1]) >= rh:
-        return {
-            'direction': 'BUY', 'price': price,
-            'stop_loss': round(rl, 5),
-            'take_profit': round(price + atr * 3.5, 5),
-            'confidence': 0.80, 'strategy': 'breakout_retest',
-            'strategy_name': 'اختراق علوي + Retest مؤكد', 'score': 5
-        }
+        return {'direction': 'BUY', 'price': price, 'stop_loss': round(rl, 5),
+                'take_profit': round(price + atr * 3.5, 5), 'confidence': 0.80,
+                'strategy': 'breakout_retest', 'strategy_name': 'اختراق علوي + Retest مؤكد', 'score': 5}
     
     if float(c[-2]) < rl and abs(float(h[-1]) - rl) / rl < 0.015 and float(c[-1]) <= rl:
-        return {
-            'direction': 'SELL', 'price': price,
-            'stop_loss': round(rh, 5),
-            'take_profit': round(price - atr * 3.5, 5),
-            'confidence': 0.80, 'strategy': 'breakout_retest',
-            'strategy_name': 'اختراق سفلي + Retest مؤكد', 'score': 5
-        }
+        return {'direction': 'SELL', 'price': price, 'stop_loss': round(rh, 5),
+                'take_profit': round(price - atr * 3.5, 5), 'confidence': 0.80,
+                'strategy': 'breakout_retest', 'strategy_name': 'اختراق سفلي + Retest مؤكد', 'score': 5}
     return None
 
 # ============================================================================
@@ -337,35 +307,25 @@ def strat_breakout(df, symbol):
 
 def strat_ema(df, symbol):
     if len(df) < 60: return None
-    
     ema20 = calc_ema(df, 20)
     ema50 = calc_ema(df, 50)
     df_prev = df.iloc[:-2]
     ema20p = calc_ema(df_prev, 20)
     ema50p = calc_ema(df_prev, 50)
-    
     price = float(df['Close'].iloc[-1])
     atr = calc_atr(df)
     rsi = calc_rsi(df)
     dist = abs(price - ema20) / price * 100
     
     if ema20p <= ema50p and ema20 > ema50 and dist < 0.15 and rsi > 40:
-        return {
-            'direction': 'BUY', 'price': price,
-            'stop_loss': round(ema50 - atr, 5),
-            'take_profit': round(price + atr * 3.0, 5),
-            'confidence': 0.72, 'strategy': 'ema_cross',
-            'strategy_name': 'تقاطع EMA صعودي (قريب)', 'score': 4
-        }
+        return {'direction': 'BUY', 'price': price, 'stop_loss': round(ema50 - atr, 5),
+                'take_profit': round(price + atr * 3.0, 5), 'confidence': 0.72,
+                'strategy': 'ema_cross', 'strategy_name': 'تقاطع EMA صعودي (قريب)', 'score': 4}
     
     if ema20p >= ema50p and ema20 < ema50 and dist < 0.15 and rsi < 60:
-        return {
-            'direction': 'SELL', 'price': price,
-            'stop_loss': round(ema50 + atr, 5),
-            'take_profit': round(price - atr * 3.0, 5),
-            'confidence': 0.72, 'strategy': 'ema_cross',
-            'strategy_name': 'تقاطع EMA هبوطي (قريب)', 'score': 4
-        }
+        return {'direction': 'SELL', 'price': price, 'stop_loss': round(ema50 + atr, 5),
+                'take_profit': round(price - atr * 3.0, 5), 'confidence': 0.72,
+                'strategy': 'ema_cross', 'strategy_name': 'تقاطع EMA هبوطي (قريب)', 'score': 4}
     return None
 
 # ============================================================================
@@ -374,7 +334,6 @@ def strat_ema(df, symbol):
 
 def strat_fibo(df, df_1h, symbol):
     if len(df) < 50 or len(df_1h) < 50: return None
-    
     fibo = calc_fibo(df_1h)
     price = float(df['Close'].iloc[-1])
     trend_up = calc_ema(df_1h, 20) > calc_ema(df_1h, 50)
@@ -384,34 +343,19 @@ def strat_fibo(df, df_1h, symbol):
     
     if trend_up:
         if abs(price - fibo['f618']) / price * 100 < 0.1 and rsi < 45 and vol > 1.2:
-            return {
-                'direction': 'BUY', 'price': price,
-                'stop_loss': round(fibo['f500'], 5),
-                'take_profit': round(fibo['high'], 5),
-                'confidence': min(0.85, 0.5 + vol * 0.2),
-                'strategy': 'fibo_volume',
-                'strategy_name': 'فيبوناتشي 61.8% + حجم عالي', 'score': 5
-            }
+            return {'direction': 'BUY', 'price': price, 'stop_loss': round(fibo['f500'], 5),
+                    'take_profit': round(fibo['high'], 5), 'confidence': min(0.85, 0.5 + vol * 0.2),
+                    'strategy': 'fibo_volume', 'strategy_name': 'فيبوناتشي 61.8% + حجم عالي', 'score': 5}
         if abs(price - fibo['f500']) / price * 100 < 0.1 and rsi < 40 and vol > 1.3:
-            return {
-                'direction': 'BUY', 'price': price,
-                'stop_loss': round(fibo['f382'], 5),
-                'take_profit': round(fibo['high'], 5),
-                'confidence': min(0.88, 0.5 + vol * 0.2),
-                'strategy': 'fibo_volume',
-                'strategy_name': 'فيبوناتشي 50% + حجم قوي جداً', 'score': 5
-            }
+            return {'direction': 'BUY', 'price': price, 'stop_loss': round(fibo['f382'], 5),
+                    'take_profit': round(fibo['high'], 5), 'confidence': min(0.88, 0.5 + vol * 0.2),
+                    'strategy': 'fibo_volume', 'strategy_name': 'فيبوناتشي 50% + حجم قوي جداً', 'score': 5}
     
     if not trend_up:
         if abs(price - fibo['f618']) / price * 100 < 0.1 and rsi > 55 and vol > 1.2:
-            return {
-                'direction': 'SELL', 'price': price,
-                'stop_loss': round(fibo['f500'], 5),
-                'take_profit': round(fibo['low'], 5),
-                'confidence': min(0.85, 0.5 + vol * 0.2),
-                'strategy': 'fibo_volume',
-                'strategy_name': 'فيبوناتشي 61.8% + حجم عالي', 'score': 5
-            }
+            return {'direction': 'SELL', 'price': price, 'stop_loss': round(fibo['f500'], 5),
+                    'take_profit': round(fibo['low'], 5), 'confidence': min(0.85, 0.5 + vol * 0.2),
+                    'strategy': 'fibo_volume', 'strategy_name': 'فيبوناتشي 61.8% + حجم عالي', 'score': 5}
     return None
 
 # ============================================================================
@@ -423,6 +367,7 @@ class FalconPro:
         self.db = Database()
         self.tb = telebot.TeleBot(TELEGRAM_TOKEN)
         self._setup()
+        self.last_signal_time = {}  # ✅ تتبع آخر إشارة لكل زوج
     
     def _setup(self):
         try:
@@ -433,15 +378,23 @@ class FalconPro:
         @self.tb.message_handler(commands=['start'])
         def start(msg):
             w = self.db.get_strategy_weights()
-            text = (f"🦅 **Falcon Pro v5.1**\n\n"
+            text = (f"🦅 **Falcon Pro v5.2**\n\n"
                    f"1️⃣ انحراف RSI: {w.get('divergence', 0):.1%}\n"
                    f"2️⃣ اختراق+Retest: {w.get('breakout_retest', 0):.1%}\n"
                    f"3️⃣ تقاطع EMA: {w.get('ema_cross', 0):.1%}\n"
-                   f"4️⃣ فيبو+حجم: {w.get('fibo_volume', 0):.1%}")
+                   f"4️⃣ فيبو+حجم: {w.get('fibo_volume', 0):.1%}\n\n"
+                   f"⏱️ تهدئة: {COOLDOWN_MINUTES} دقائق")
             self.tb.reply_to(msg, text, parse_mode='Markdown')
     
     def analyze(self, symbol):
         results = []
+        
+        # ✅ فحص التهدئة أول حاجة
+        if self.db.has_active_signal(symbol):
+            return results
+        if self.db.was_recent(symbol):
+            return results
+        
         df_5m = DataFetcher.fetch(symbol, '5m')
         df_15m = DataFetcher.fetch(symbol, '15m')
         df_1h = DataFetcher.fetch(symbol, '1h')
@@ -450,26 +403,25 @@ class FalconPro:
             return results
         
         now = datetime.utcnow()
-        if now.weekday() >= 5: return results
-        if self.db.has_active_signal(symbol): return results
-        if self.db.was_recent(symbol): return results
+        if now.weekday() >= 5:
+            return results
         
-        for strat_fn, strat_key in [(strat_divergence, 'divergence'), 
-                                     (strat_breakout, 'breakout_retest'),
-                                     (strat_ema, 'ema_cross')]:
+        for strat_fn in [strat_divergence, strat_breakout, strat_ema]:
             s = strat_fn(df_15m, symbol)
             if s and s['confidence'] >= MIN_CONFIDENCE:
                 s['symbol'] = symbol
                 s['expiry_time'] = (datetime.now() + timedelta(minutes=10)).strftime('%Y-%m-%d %H:%M:%S')
                 results.append(s)
+                break  # ✅ خد أول إشارة بس لكل زوج
         
-        s = strat_fibo(df_5m, df_1h, symbol)
-        if s and s['confidence'] >= MIN_CONFIDENCE:
-            s['symbol'] = symbol
-            s['expiry_time'] = (datetime.now() + timedelta(minutes=10)).strftime('%Y-%m-%d %H:%M:%S')
-            results.append(s)
+        if not results:
+            s = strat_fibo(df_5m, df_1h, symbol)
+            if s and s['confidence'] >= MIN_CONFIDENCE:
+                s['symbol'] = symbol
+                s['expiry_time'] = (datetime.now() + timedelta(minutes=10)).strftime('%Y-%m-%d %H:%M:%S')
+                results.append(s)
         
-        return results
+        return results[:1]  # ✅ إشارة واحدة فقط لكل زوج
     
     def check_trades(self):
         for trade in self.db.get_expired_trades():
@@ -505,17 +457,23 @@ class FalconPro:
     def hunt(self):
         logger.info("🔍 بحث...")
         signals = 0
+        
         for symbol in SYMBOLS:
             try:
-                for s in self.analyze(symbol):
-                    self.db.save_signal(s)
-                    self.send_signal(s)
-                    signals += 1
+                results = self.analyze(symbol)
+                for s in results:
+                    sig_id = self.db.save_signal(s)
+                    if sig_id:
+                        self.send_signal(s)
+                        signals += 1
+                        time.sleep(1)  # ✅ استراحة بعد كل إشارة
                 time.sleep(0.3)
             except:
                 pass
+        
         if signals > 0:
             logger.info(f"📊 {signals} إشارة")
+            time.sleep(5)  # ✅ راحة إضافية بعد الإشارات
     
     def send_signal(self, signal):
         emoji = "🟢" if signal['direction'] == 'BUY' else "🔴"
@@ -531,7 +489,7 @@ class FalconPro:
             pass
     
     def run(self):
-        logger.info("🦅 Falcon Pro v5.1")
+        logger.info(f"🦅 Falcon Pro v5.2 | تهدئة: {COOLDOWN_MINUTES}د")
         
         def poll():
             while True:
@@ -550,7 +508,7 @@ class FalconPro:
             except KeyboardInterrupt:
                 break
             except:
-                time.sleep(30)
+                time.sleep(10)
 
 if __name__ == "__main__":
     bot = FalconPro()
