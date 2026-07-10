@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """
-Falcon AI Pro v4.2 - Dual Data Source Training
-================================================
-✅ Alpha Vantage (FH126TDYOVLOQED5) + Yahoo Finance
+Falcon AI Pro v4.2 - Yahoo First Training
+============================================
+✅ Yahoo Finance primary data source
+✅ Alpha Vantage (FH126TDYOVLOQED5) backup
 ✅ Multi-symbol XGBoost training
 ✅ 17 professional features
 ✅ Market Structure + Price Action + Session Filter
@@ -473,7 +474,7 @@ def calculate_indicators(df: pd.DataFrame, symbol: str) -> Dict:
     return result
 
 # ============================================================================
-# XGBoost - Multi-Symbol with Dual Data Source
+# XGBoost - Yahoo First Training
 # ============================================================================
 
 class MLModel:
@@ -524,50 +525,45 @@ class MLModel:
     
     def _fetch_training_data(self, symbol: str) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
         try:
-            logger.info(f"  📥 {symbol}: جلب البيانات...")
+            logger.info(f"  📥 {symbol}: جلب البيانات من Yahoo...")
             
-            # ✅ Alpha Vantage أولاً
-            params = {
-                'function': 'FX_INTRADAY',
-                'from_symbol': symbol[:3],
-                'to_symbol': symbol[3:],
-                'interval': '60min',
-                'outputsize': 'full',
-                'apikey': ALPHA_VANTAGE_KEY
-            }
+            import yfinance as yf
             
-            r = requests.get('https://www.alphavantage.co/query', params=params, timeout=20)
-            data = r.json()
+            yf_symbol = f"{symbol}=X"
+            df = yf.download(yf_symbol, period='3mo', interval='1h', progress=False)
             
-            time_key = 'Time Series FX (60min)'
-            df = None
-            
-            if time_key in data:
-                records = []
-                for ts, vals in data[time_key].items():
-                    records.append({
-                        'Date': ts, 'Open': float(vals['1. open']),
-                        'High': float(vals['2. high']), 'Low': float(vals['3. low']),
-                        'Close': float(vals['4. close'])
-                    })
-                df = pd.DataFrame(records)
-                df['Date'] = pd.to_datetime(df['Date'])
-                df = df.set_index('Date').sort_index()
-                logger.info(f"  ✅ {symbol}: {len(df)} صف (Alpha)")
-            else:
-                logger.warning(f"  ⚠️ {symbol}: Alpha فشل - جاري Yahoo...")
+            if df.empty or len(df) < 200:
+                logger.warning(f"  ⚠️ {symbol}: Yahoo فشل - جاري Alpha...")
                 
-                import yfinance as yf
-                yf_symbol = f"{symbol}=X"
-                df = yf.download(yf_symbol, period='3mo', interval='1h', progress=False)
+                params = {
+                    'function': 'FX_INTRADAY',
+                    'from_symbol': symbol[:3],
+                    'to_symbol': symbol[3:],
+                    'interval': '60min',
+                    'outputsize': 'full',
+                    'apikey': ALPHA_VANTAGE_KEY
+                }
                 
-                if not df.empty:
-                    df.columns = [c.capitalize() for c in df.columns]
-                    logger.info(f"  ✅ {symbol}: {len(df)} صف (Yahoo)")
+                r = requests.get('https://www.alphavantage.co/query', params=params, timeout=20)
+                data = r.json()
+                
+                time_key = 'Time Series FX (60min)'
+                if time_key in data:
+                    records = []
+                    for ts, vals in data[time_key].items():
+                        records.append({
+                            'Date': ts, 'Open': float(vals['1. open']),
+                            'High': float(vals['2. high']), 'Low': float(vals['3. low']),
+                            'Close': float(vals['4. close'])
+                        })
+                    df = pd.DataFrame(records)
+                    df['Date'] = pd.to_datetime(df['Date'])
+                    df = df.set_index('Date').sort_index()
             
             if df is None or len(df) < 200:
-                logger.warning(f"  ⚠️ {symbol}: بيانات غير كافية")
                 return None, None
+            
+            df.columns = [c.capitalize() for c in df.columns]
             
             X_list, y_list = [], []
             
@@ -582,10 +578,10 @@ class MLModel:
             if len(X_list) < 100:
                 return None, None
             
+            logger.info(f"  ✅ {symbol}: {len(X_list)} عينة")
             return np.array(X_list), np.array(y_list)
             
-        except Exception as e:
-            logger.error(f"  ❌ {symbol}: {e}")
+        except:
             return None, None
     
     def _train_all_symbols(self):
@@ -625,7 +621,6 @@ class MLModel:
             y_all = np.hstack(y_all)
             
             logger.info(f"📊 إجمالي: {len(X_all)} عينة من {len(symbols_used)} أزواج")
-            logger.info(f"📊 الأزواج: {symbols_used}")
             logger.info(f"📊 توزيع: BUY={y_all.mean():.1%}, SELL={1-y_all.mean():.1%}")
             
             self.feature_names = self.base_features + ['symbol_encoded']
@@ -926,7 +921,7 @@ class FalconPro:
             pass
     
     def run(self):
-        logger.info("🦅 Falcon Pro v4.2 - Dual Data Source")
+        logger.info("🦅 Falcon Pro v4.2 - Yahoo First")
         
         def poll():
             while True:
