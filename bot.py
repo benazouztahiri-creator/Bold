@@ -290,14 +290,14 @@ class FalconHunter:
             # Score نهائي
             final_score = tech_score * 0.7 + sentiment_score * 0.3
             
-            if final_score > 1.5:
+            if final_score > 0.8:
                 direction = 'BUY'
                 confidence = min(0.95, 0.5 + abs(final_score) * 0.15)
-            elif final_score < -1.5:
+            elif final_score < -0.8:
                 direction = 'SELL'
                 confidence = min(0.95, 0.5 + abs(final_score) * 0.15)
             else:
-                return None  # مش قوي كفاية
+                return None
             
             if confidence < MIN_CONFIDENCE:
                 return None
@@ -336,7 +336,7 @@ class FalconHunter:
                         logger.info(f"  ⭐ {symbol}: {result['direction']} | "
                                   f"Score={result['score']:.1f} | {result['reason']}")
                 
-                time.sleep(2)  # استراحة بين الأزواج
+                time.sleep(2)
                 
             except Exception as e:
                 logger.error(f"  ❌ {symbol}: {e}")
