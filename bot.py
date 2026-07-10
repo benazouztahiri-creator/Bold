@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """
-Falcon AI Pro v4.5 - Multi-Signal + Smart Duration
-====================================================
-✅ Sends ALL qualifying signals (not just best one)
-✅ Smart duration based on ATR and momentum
+Falcon AI Pro v4.6 - Candle-Based Duration
+============================================
+✅ Duration calculated in candles (not minutes)
+✅ Sends ALL qualifying signals
+✅ Smart candle counting based on momentum
 ✅ Clean signal format
 ✅ All MultiIndex errors fixed
 ✅ Scans every 60 seconds
@@ -121,7 +122,7 @@ class Database:
                     exit_price REAL, stop_loss REAL, take_profit REAL,
                     high_period REAL, low_period REAL,
                     confidence REAL, score REAL,
-                    adx REAL, atr REAL, duration INTEGER,
+                    adx REAL, atr REAL, candles INTEGER,
                     market_structure TEXT,
                     price_action TEXT,
                     session TEXT,
@@ -163,14 +164,14 @@ class Database:
                 conn.execute('''
                     INSERT OR IGNORE INTO signals 
                     (symbol, direction, entry_price, stop_loss, take_profit,
-                     confidence, score, adx, atr, duration, market_structure, price_action,
+                     confidence, score, adx, atr, candles, market_structure, price_action,
                      session, tf_5m, tf_15m, tf_1h, position_size,
                      expiry_time, signal_hash)
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ''', (data['symbol'], data['direction'], data['entry_price'],
                       data.get('stop_loss'), data.get('take_profit'),
                       data['confidence'], data.get('score', 0),
-                      data.get('adx', 0), data.get('atr', 0), data.get('duration', 7),
+                      data.get('adx', 0), data.get('atr', 0), data.get('candles', 3),
                       data.get('market_structure', ''), data.get('price_action', ''),
                       data.get('session', ''), data.get('tf_5m', ''), data.get('tf_15m', ''),
                       data.get('tf_1h', ''), data.get('position_size', 0.01),
@@ -419,50 +420,53 @@ def calculate_indicators(df: pd.DataFrame, symbol: str) -> Dict:
     return result
 
 # ============================================================================
-# SMART DURATION
+# CANDLE-BASED DURATION
 # ============================================================================
 
-def calculate_smart_duration(df: pd.DataFrame, direction: str) -> int:
+def calculate_candles(df: pd.DataFrame, direction: str) -> int:
     """
-    ✅ مدة ذكية مبنية على:
-    - سرعة الحركة (ATR)
-    - قوة الترند (ADX)
-    - الزخم (ROC)
+    ✅ عدد الشموع لإغلاق الصفقة
+    - السوق سريع = 3-5 شموع
+    - السوق متوسط = 6-8 شموع  
+    - السوق هادئ = 10-15 شمعة
     """
     if len(df) < 20:
-        return 7
+        return 5
     
     c = df['Close'].values
     h = df['High'].values
     l = df['Low'].values
     
-    # ATR percentage
+    # سرعة الحركة
     tr = np.array([max(h[i+1]-l[i+1], abs(h[i+1]-c[i]), abs(l[i+1]-c[i])) for i in range(len(c)-1)])
     atr = np.mean(tr[-14:])
     atr_pct = atr / c[-1] * 100
     
-    # ROC (Rate of Change)
+    # الزخم
     roc_3 = abs((c[-1] - c[-4]) / c[-4] * 100)
+    roc_5 = abs((c[-1] - c[-6]) / c[-6] * 100)
     
-    # RSI
+    # RSI للتشبع
     delta = np.diff(c[-20:])
     gain = np.mean(delta[delta > 0]) if any(delta > 0) else 0
     loss = np.mean(-delta[delta < 0]) if any(delta < 0) else 0
     rsi = 100 - (100 / (1 + gain / (loss + 1e-8))) if loss > 0 else 50
     
-    # ✅ تحديد المدة
-    if atr_pct > 0.08 and roc_3 > 0.1:
-        duration = 4  # حركة قوية
-    elif atr_pct > 0.05 and roc_3 > 0.06:
-        duration = 6  # حركة متوسطة
+    # ✅ عدد الشموع
+    if atr_pct > 0.1 and roc_3 > 0.15:
+        candles = 3  # حركة قوية جداً
+    elif atr_pct > 0.06 and roc_3 > 0.1:
+        candles = 5  # حركة قوية
+    elif atr_pct > 0.04 and roc_5 > 0.08:
+        candles = 7  # حركة متوسطة
     elif rsi > 70 or rsi < 30:
-        duration = 5  # تشبع - انعكاس متوقع
+        candles = 4  # تشبع - انعكاس قريب
     elif atr_pct < 0.02:
-        duration = 12  # سوق نايم
+        candles = 12  # سوق نايم
     else:
-        duration = 8  # طبيعي
+        candles = 8  # طبيعي
     
-    return min(15, max(3, duration))
+    return min(15, max(2, candles))
 
 # ============================================================================
 # XGBoost MODEL
@@ -533,7 +537,7 @@ class MLModel:
         try:
             from sklearn.preprocessing import RobustScaler
             from sklearn.model_selection import train_test_split
-            from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
+            from sklearn.metrics import accuracy_score, f1_score
             import xgboost as xgb
             
             logger.info("📥 جمع البيانات...")
@@ -561,8 +565,6 @@ class MLModel:
             
             X_all = np.vstack(X_all)
             y_all = np.hstack(y_all)
-            
-            logger.info(f"📊 {len(X_all)} عينة من {len(symbols_used)} زوج")
             
             self.feature_names = self.base_features + ['symbol_encoded']
             
@@ -619,13 +621,6 @@ class RiskManager:
     
     def can_trade(self) -> bool:
         return self.db.get_daily_pnl() > -MAX_DAILY_LOSS * self.balance
-    
-    def position_size(self, symbol: str, entry: float, sl: float) -> float:
-        risk = self.balance * RISK_PER_TRADE
-        pip_value = 0.01 if 'JPY' in symbol else 0.0001
-        sl_pips = abs(entry - sl) / pip_value
-        if sl_pips < 5: return 0.01
-        return round(min(max(risk / (sl_pips * 10), 0.01), 1.0), 2)
 
 # ============================================================================
 # MAIN BOT
@@ -654,7 +649,7 @@ class FalconPro:
                 data = joblib.load('models_v4/xgb_model.pkl')
                 metrics = data.get('metrics', {})
             
-            text = (f"🦅 **Falcon Pro v4.5**\n\n"
+            text = (f"🦅 **Falcon Pro v4.6**\n\n"
                    f"✅ نشطة: {len(active)}/8\n"
                    f"📊 XGBoost: {'نشط' if self.ml.is_trained else 'غير مدرب'}\n"
                    f"📊 دقة: {metrics.get('accuracy', 0):.1%}\n"
@@ -723,23 +718,24 @@ class FalconPro:
         if direction == 'BUY': sl, tp = ind_15m['sl_buy'], ind_15m['tp_buy']
         else: sl, tp = ind_15m['sl_sell'], ind_15m['tp_sell']
         
-        # ✅ مدة ذكية
-        duration = calculate_smart_duration(df_5m, direction)
+        # ✅ عدد الشموع
+        candles = calculate_candles(df_5m, direction)
+        duration_minutes = candles * 5  # كل شمعة 5 دقائق
         
         return {
             'symbol': symbol, 'direction': direction,
             'price': price, 'stop_loss': sl, 'take_profit': tp,
             'confidence': confidence, 'score': score,
             'adx': adx, 'atr': ind_15m['atr'],
-            'duration': duration,
+            'candles': candles,
             'market_structure': structure['structure'],
             'price_action': pa_pattern,
             'session': 'active',
-            'position_size': self.risk.position_size(symbol, price, sl),
+            'position_size': 0.01,
             'tf_5m': f"{'🟢' if score > 0 else '🔴'}",
             'tf_15m': f"{'🟢' if score > 0 else '🔴'}",
             'tf_1h': trend,
-            'expiry_time': (datetime.now() + timedelta(minutes=duration)).strftime('%Y-%m-%d %H:%M:%S')
+            'expiry_time': (datetime.now() + timedelta(minutes=duration_minutes)).strftime('%Y-%m-%d %H:%M:%S')
         }
     
     def check_trades(self):
@@ -824,17 +820,17 @@ class FalconPro:
         
         msg = (f"{emoji} **{signal['symbol']}** - {direction}\n\n"
                f"💰 السعر: {signal['price']:.5f}\n"
-               f"⏳ المدة: {signal['duration']} د\n"
+               f"🕯️ الشموع: {signal['candles']} شمعة\n"
                f"💪 الثقة: {signal['confidence']:.1%}")
         
         try:
             self.tb.send_message(TELEGRAM_CHAT_ID, msg, parse_mode='Markdown')
-            logger.info(f"✅ {signal['symbol']} {signal['direction']}")
+            logger.info(f"✅ {signal['symbol']} {signal['direction']} | {signal['candles']} شموع")
         except:
             pass
     
     def run(self):
-        logger.info("🦅 Falcon Pro v4.5 - Multi-Signal + Smart Duration")
+        logger.info("🦅 Falcon Pro v4.6 - Candle Duration")
         
         def poll():
             while True:
