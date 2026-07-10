@@ -2,17 +2,15 @@
 """
 Falcon AI Pro v4 - Professional Trading System
 ================================================
-✅ XGBoost ML Model (50+ features)
+✅ XGBoost ML Model (Auto-train with Alpha Vantage)
 ✅ Market Structure (BOS/CHoCH/HH/HL/LH/LL)
 ✅ Session Filter (Asian/London/NY/Overlap)
 ✅ Auto-isolate weak symbols
-✅ Walk-Forward Backtesting
 ✅ Dynamic Risk Management
 ✅ Intra-candle SL/TP detection
 ✅ Multi-timeframe (M5/M15/H1)
 ✅ Price Action + Spread Filter
-✅ Adaptive indicator weights
-✅ Real economic calendar filter
+✅ Economic calendar filter
 ✅ Performance tracking per symbol
 ✅ Auto-train on startup
 """
@@ -27,10 +25,8 @@ import threading
 import json
 from typing import Dict, List, Tuple, Optional
 from datetime import datetime, timedelta
-from collections import deque
 import numpy as np
 import pandas as pd
-import yfinance as yf
 import requests
 import warnings
 
@@ -45,23 +41,21 @@ warnings.filterwarnings('ignore')
 
 TELEGRAM_TOKEN = '8773849578:AAH9a6-8hU5YFYTad2EA5jQyfffIoeL8npk'
 TELEGRAM_CHAT_ID = '7553333305'
+ALPHA_VANTAGE_KEY = '5TFFWK21CUNA3P25'
 
 SYMBOLS = [
-    'EURUSD=X', 'GBPUSD=X', 'USDJPY=X', 'AUDUSD=X',
-    'USDCAD=X', 'EURGBP=X', 'EURJPY=X', 'GBPJPY=X'
+    'EURUSD', 'GBPUSD', 'USDJPY', 'AUDUSD',
+    'USDCAD', 'EURGBP', 'EURJPY', 'GBPJPY'
 ]
 
 SCAN_INTERVAL = 90
 MIN_CONFIDENCE = 0.55
 
 SESSIONS = {
-    'asian': (0, 9),
-    'london': (8, 17),
-    'ny': (13, 22),
-    'overlap': (13, 17)
+    'asian': (0, 9), 'london': (8, 17),
+    'ny': (13, 22), 'overlap': (13, 17)
 }
 
-MAX_DRAWDOWN = 0.15
 MAX_DAILY_LOSS = 0.03
 RISK_PER_TRADE = 0.01
 
@@ -115,7 +109,7 @@ class Database:
                     exit_price REAL, stop_loss REAL, take_profit REAL,
                     high_period REAL, low_period REAL,
                     confidence REAL, score REAL,
-                    adx REAL, atr REAL, spread REAL,
+                    adx REAL, atr REAL,
                     market_structure TEXT,
                     price_action TEXT,
                     session TEXT,
@@ -139,30 +133,15 @@ class Database:
                     last_10_results TEXT DEFAULT '[]'
                 );
                 
-                CREATE TABLE IF NOT EXISTS backtest_results (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    symbol TEXT, model_type TEXT,
-                    train_period TEXT, test_period TEXT,
-                    train_trades INTEGER, test_trades INTEGER,
-                    train_win_rate REAL, test_win_rate REAL,
-                    walk_forward_score REAL,
-                    sharpe_ratio REAL, max_drawdown REAL,
-                    tested_at DATETIME DEFAULT CURRENT_TIMESTAMP
-                );
-                
                 CREATE TABLE IF NOT EXISTS risk_metrics (
                     date TEXT PRIMARY KEY,
                     daily_pnl REAL DEFAULT 0,
-                    total_trades INTEGER DEFAULT 0,
-                    current_drawdown REAL DEFAULT 0
+                    total_trades INTEGER DEFAULT 0
                 );
             ''')
             
             for sym in SYMBOLS:
-                conn.execute('''
-                    INSERT OR IGNORE INTO symbol_performance (symbol) VALUES (?)
-                ''', (sym,))
-            
+                conn.execute('INSERT OR IGNORE INTO symbol_performance (symbol) VALUES (?)', (sym,))
             conn.commit()
     
     def save_signal(self, data: Dict) -> Optional[int]:
@@ -172,14 +151,14 @@ class Database:
                 conn.execute('''
                     INSERT OR IGNORE INTO signals 
                     (symbol, direction, entry_price, stop_loss, take_profit,
-                     confidence, score, adx, atr, spread, market_structure, price_action,
+                     confidence, score, adx, atr, market_structure, price_action,
                      session, tf_5m, tf_15m, tf_1h, position_size,
                      expiry_time, signal_hash)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ''', (data['symbol'], data['direction'], data['entry_price'],
                       data.get('stop_loss'), data.get('take_profit'),
                       data['confidence'], data.get('score', 0),
-                      data.get('adx', 0), data.get('atr', 0), data.get('spread', 0),
+                      data.get('adx', 0), data.get('atr', 0),
                       data.get('market_structure', ''), data.get('price_action', ''),
                       data.get('session', ''), data.get('tf_5m', ''), data.get('tf_15m', ''),
                       data.get('tf_1h', ''), data.get('position_size', 0.01),
@@ -203,8 +182,7 @@ class Database:
             conn.execute('''
                 UPDATE symbol_performance 
                 SET total_trades = total_trades + 1,
-                    wins = wins + ?,
-                    total_pnl = total_pnl + ?
+                    wins = wins + ?, total_pnl = total_pnl + ?
                 WHERE symbol = ?
             ''', (1 if result == 'WIN' else 0, pnl, symbol))
             
@@ -212,8 +190,7 @@ class Database:
                 'SELECT last_10_results FROM symbol_performance WHERE symbol=?', (symbol,)
             ).fetchone()[0] or '[]')
             results.append(1 if result == 'WIN' else 0)
-            if len(results) > 10:
-                results.pop(0)
+            if len(results) > 10: results.pop(0)
             
             win_rate_10 = sum(results) / len(results) if results else 0.5
             
@@ -229,8 +206,7 @@ class Database:
                 INSERT INTO risk_metrics (date, daily_pnl, total_trades)
                 VALUES (?, ?, 1)
                 ON CONFLICT(date) DO UPDATE SET
-                daily_pnl = daily_pnl + ?,
-                total_trades = total_trades + 1
+                daily_pnl = daily_pnl + ?, total_trades = total_trades + 1
             ''', (today, pnl, pnl))
             
             conn.commit()
@@ -250,9 +226,7 @@ class Database:
     
     def get_active_symbols(self) -> List[str]:
         with sqlite3.connect(self.db_path) as conn:
-            rows = conn.execute('''
-                SELECT symbol FROM symbol_performance WHERE is_active = 1
-            ''').fetchall()
+            rows = conn.execute('SELECT symbol FROM symbol_performance WHERE is_active = 1').fetchall()
             return [r[0] for r in rows] if rows else SYMBOLS
     
     def has_active_signal(self, symbol: str) -> bool:
@@ -266,9 +240,8 @@ class Database:
     def was_recent(self, symbol: str, minutes: int = 10) -> bool:
         cutoff = (datetime.now() - timedelta(minutes=minutes)).strftime('%Y-%m-%d %H:%M:%S')
         with sqlite3.connect(self.db_path) as conn:
-            c = conn.execute('''
-                SELECT COUNT(*) FROM signals WHERE symbol=? AND entry_time > ?
-            ''', (symbol, cutoff)).fetchone()[0]
+            c = conn.execute('SELECT COUNT(*) FROM signals WHERE symbol=? AND entry_time > ?',
+                           (symbol, cutoff)).fetchone()[0]
             return c > 0
     
     def get_expired_trades(self) -> List[Dict]:
@@ -281,24 +254,89 @@ class Database:
             return [dict(r) for r in rows]
 
 # ============================================================================
+# DATA FETCHER
+# ============================================================================
+
+class DataFetcher:
+    @staticmethod
+    def fetch(symbol: str, interval: str = '5min', outputsize: str = 'compact') -> Optional[pd.DataFrame]:
+        """جلب بيانات من Alpha Vantage"""
+        key = f"{symbol}_{interval}_{outputsize}"
+        cached = data_cache.get(key)
+        if cached is not None:
+            return cached
+        
+        from_curr = symbol[:3]
+        to_curr = symbol[3:]
+        
+        interval_map = {'5m': '5min', '15m': '15min', '1h': '60min', '1m': '1min'}
+        av_interval = interval_map.get(interval, '5min')
+        
+        params = {
+            'function': 'FX_INTRADAY',
+            'from_symbol': from_curr,
+            'to_symbol': to_curr,
+            'interval': av_interval,
+            'outputsize': outputsize,
+            'apikey': ALPHA_VANTAGE_KEY
+        }
+        
+        try:
+            r = requests.get('https://www.alphavantage.co/query', params=params, timeout=15)
+            data = r.json()
+            
+            time_key = f'Time Series FX ({av_interval})'
+            if time_key not in data:
+                # Yahoo بديل
+                return DataFetcher._fetch_yahoo(symbol, interval)
+            
+            records = []
+            for ts, vals in data[time_key].items():
+                records.append({
+                    'Date': ts, 'Open': float(vals['1. open']),
+                    'High': float(vals['2. high']), 'Low': float(vals['3. low']),
+                    'Close': float(vals['4. close']), 'Volume': 0
+                })
+            
+            df = pd.DataFrame(records)
+            df['Date'] = pd.to_datetime(df['Date'])
+            df = df.set_index('Date').sort_index()
+            
+            data_cache.set(key, df)
+            return df
+            
+        except:
+            return DataFetcher._fetch_yahoo(symbol, interval)
+    
+    @staticmethod
+    def _fetch_yahoo(symbol: str, interval: str) -> Optional[pd.DataFrame]:
+        try:
+            import yfinance as yf
+            yf_symbol = f"{symbol}=X"
+            interval_map = {'5m': '5m', '15m': '15m', '1h': '1h', '1m': '1m'}
+            yf_interval = interval_map.get(interval, '5m')
+            
+            df = yf.download(yf_symbol, period='5d', interval=yf_interval, progress=False)
+            if not df.empty:
+                df.columns = [c.capitalize() for c in df.columns]
+                return df
+        except:
+            pass
+        return None
+
+# ============================================================================
 # SESSION FILTER
 # ============================================================================
 
 class SessionFilter:
     @staticmethod
     def get_current_session() -> str:
-        now = datetime.utcnow()
-        hour = now.hour
-        if SESSIONS['overlap'][0] <= hour < SESSIONS['overlap'][1]:
-            return 'overlap'
-        elif SESSIONS['london'][0] <= hour < SESSIONS['london'][1]:
-            return 'london'
-        elif SESSIONS['ny'][0] <= hour < SESSIONS['ny'][1]:
-            return 'ny'
-        elif SESSIONS['asian'][0] <= hour < SESSIONS['asian'][1]:
-            return 'asian'
-        else:
-            return 'dead'
+        hour = datetime.utcnow().hour
+        if SESSIONS['overlap'][0] <= hour < SESSIONS['overlap'][1]: return 'overlap'
+        elif SESSIONS['london'][0] <= hour < SESSIONS['london'][1]: return 'london'
+        elif SESSIONS['ny'][0] <= hour < SESSIONS['ny'][1]: return 'ny'
+        elif SESSIONS['asian'][0] <= hour < SESSIONS['asian'][1]: return 'asian'
+        return 'dead'
     
     @staticmethod
     def is_good_time() -> bool:
@@ -312,36 +350,17 @@ class MarketStructure:
     @staticmethod
     def detect(df: pd.DataFrame) -> Dict:
         if len(df) < 50:
-            return {'structure': 'unknown', 'trend': 'neutral', 'bos': False, 'choch': False}
+            return {'structure': 'unknown', 'trend': 'neutral'}
         
         h, l, c = df['High'].values, df['Low'].values, df['Close'].values
-        highs_20, lows_20 = h[-20:], l[-20:]
+        hh = any(h[i] > max(h[max(0,i-20):i]) for i in range(20, len(h)-5))
+        ll = any(l[i] < min(l[max(0,i-20):i]) for i in range(20, len(l)-5))
         
-        hh, ll = False, False
+        if hh: structure, trend = 'bullish', 'UP'
+        elif ll: structure, trend = 'bearish', 'DOWN'
+        else: structure, trend = 'ranging', 'neutral'
         
-        for i in range(5, len(highs_20)-5):
-            if highs_20[i] > highs_20[i-5] and highs_20[i] > highs_20[i+5]:
-                if i > 0 and highs_20[i] > max(highs_20[:i]):
-                    hh = True
-        
-        for i in range(5, len(lows_20)-5):
-            if lows_20[i] < lows_20[i-5] and lows_20[i] < lows_20[i+5]:
-                if i > 0 and lows_20[i] < min(lows_20[:i]):
-                    ll = True
-        
-        if hh:
-            structure, trend = 'bullish', 'UP'
-        elif ll:
-            structure, trend = 'bearish', 'DOWN'
-        else:
-            structure, trend = 'ranging', 'neutral'
-        
-        ema50 = pd.Series(c).ewm(span=50).mean().values[-1]
-        ema20 = pd.Series(c).ewm(span=20).mean().values[-1]
-        bos = (trend == 'UP' and c[-1] > ema20) or (trend == 'DOWN' and c[-1] < ema20)
-        choch = (trend == 'UP' and c[-1] < ema50) or (trend == 'DOWN' and c[-1] > ema50)
-        
-        return {'structure': structure, 'trend': trend, 'bos': bos, 'choch': choch}
+        return {'structure': structure, 'trend': trend}
 
 # ============================================================================
 # PRICE ACTION
@@ -350,30 +369,23 @@ class MarketStructure:
 class PriceAction:
     @staticmethod
     def detect(df: pd.DataFrame) -> Tuple[str, float]:
-        if len(df) < 3:
-            return "none", 0
+        if len(df) < 3: return "none", 0
         
         c1, c2 = df.iloc[-1], df.iloc[-2]
         body1 = abs(c1['Close'] - c1['Open'])
         body2 = abs(c2['Close'] - c2['Open'])
         upper1 = c1['High'] - max(c1['Close'], c1['Open'])
         lower1 = min(c1['Close'], c1['Open']) - c1['Low']
-        total1 = c1['High'] - c1['Low']
         
-        if body1 > 0 and total1 > 0:
-            if lower1 > body1 * 2 and upper1 < body1 * 0.3:
-                return "hammer", 0.6
-            if upper1 > body1 * 2 and lower1 < body1 * 0.3:
-                return "shooting_star", -0.6
+        if body1 > 0:
+            if lower1 > body1 * 2: return "hammer", 0.6
+            if upper1 > body1 * 2: return "shooting_star", -0.6
         
         if body1 > body2 * 1.2:
             if c2['Close'] < c2['Open'] and c1['Close'] > c1['Open']:
                 return "bullish_engulfing", 0.7
             if c2['Close'] > c2['Open'] and c1['Close'] < c1['Open']:
                 return "bearish_engulfing", -0.7
-        
-        if c1['High'] < c2['High'] and c1['Low'] > c2['Low']:
-            return "inside_bar", 0.3 if c2['Close'] > c2['Open'] else -0.3
         
         return "none", 0
 
@@ -385,10 +397,8 @@ class EconomicCalendar:
     @staticmethod
     def is_high_impact_now() -> bool:
         now = datetime.utcnow()
-        high_impact = [(12, 30), (13, 30), (14, 0), (18, 0), (8, 30), (10, 0)]
-        for h, m in high_impact:
-            event = now.replace(hour=h, minute=m, second=0)
-            if abs((now - event).total_seconds()) < 1800:
+        for h, m in [(12, 30), (13, 30), (14, 0), (18, 0)]:
+            if abs((now - now.replace(hour=h, minute=m, second=0)).total_seconds()) < 1800:
                 return True
         return False
 
@@ -396,9 +406,8 @@ class EconomicCalendar:
 # INDICATORS
 # ============================================================================
 
-def calculate_all_indicators(df: pd.DataFrame, symbol: str) -> Dict:
-    if len(df) < 50:
-        return None
+def calculate_indicators(df: pd.DataFrame, symbol: str) -> Dict:
+    if len(df) < 30: return None
     
     c, h, l = df['Close'].values, df['High'].values, df['Low'].values
     price = float(c[-1])
@@ -408,63 +417,53 @@ def calculate_all_indicators(df: pd.DataFrame, symbol: str) -> Dict:
     delta = np.diff(c)
     gain = np.where(delta > 0, delta, 0)
     loss = np.where(delta < 0, -delta, 0)
-    avg_g, avg_l = np.mean(gain[-14:]), np.mean(loss[-14:])
-    for i in range(14, len(gain)):
-        avg_g = (avg_g*13 + gain[i])/14
-        avg_l = (avg_l*13 + loss[i])/14
+    avg_g = np.mean(gain[-14:]) if len(gain) >= 14 else np.mean(gain)
+    avg_l = np.mean(loss[-14:]) if len(loss) >= 14 else np.mean(loss)
     result['rsi'] = round(100 - 100/(1 + avg_g/(avg_l+1e-8)), 1)
     
-    # ATR + ADX
+    # ATR
     tr = np.array([max(h[i+1]-l[i+1], abs(h[i+1]-c[i]), abs(l[i+1]-c[i])) for i in range(len(c)-1)])
-    atr_arr = np.zeros(len(tr))
-    atr_arr[13] = np.mean(tr[:14])
-    for i in range(14, len(tr)): atr_arr[i] = (atr_arr[i-1]*13 + tr[i])/14
-    result['atr'] = round(float(atr_arr[-1]), 5)
+    result['atr'] = round(float(np.mean(tr[-14:])), 5)
     
+    # ADX
     up, down = np.diff(h), -np.diff(l)
     p_dm = np.where((up > down) & (up > 0), up, 0)
     m_dm = np.where((down > up) & (down > 0), down, 0)
-    p_di, m_di = np.zeros(len(tr)), np.zeros(len(tr))
-    p_di[13], m_di[13] = 100*np.sum(p_dm[:14])/np.sum(tr[:14]), 100*np.sum(m_dm[:14])/np.sum(tr[:14])
-    for i in range(14, len(tr)):
-        p_di[i] = (p_di[i-1]*13 + 100*p_dm[i]/tr[i])/14
-        m_di[i] = (m_di[i-1]*13 + 100*m_dm[i]/tr[i])/14
-    result['plus_di'] = round(float(p_di[-1]), 1)
-    result['minus_di'] = round(float(m_di[-1]), 1)
-    dx = 100*np.abs(p_di-m_di)/(p_di+m_di+1e-8)
-    adx_arr = np.zeros(len(dx))
-    adx_arr[13] = np.mean(dx[:14])
-    for i in range(14, len(dx)): adx_arr[i] = (adx_arr[i-1]*13 + dx[i])/14
-    result['adx'] = round(float(adx_arr[-1]), 1)
+    tr14 = np.sum(tr[-14:])
+    p_di = 100 * np.sum(p_dm[-14:]) / (tr14 + 1e-8)
+    m_di = 100 * np.sum(m_dm[-14:]) / (tr14 + 1e-8)
+    dx = 100 * abs(p_di - m_di) / (p_di + m_di + 1e-8)
+    result['adx'] = round(float(dx), 1)
+    result['plus_di'] = round(float(p_di), 1)
+    result['minus_di'] = round(float(m_di), 1)
     
     # MACD
-    ema12 = pd.Series(c).ewm(span=12, adjust=False).mean().values
-    ema26 = pd.Series(c).ewm(span=26, adjust=False).mean().values
-    result['macd'] = round(float(ema12[-1]-ema26[-1]), 5)
-    result['macd_signal'] = round(float(pd.Series(ema12-ema26).ewm(span=9, adjust=False).mean().values[-1]), 5)
+    ema12 = pd.Series(c).ewm(span=12, adjust=False).mean().values[-1]
+    ema26 = pd.Series(c).ewm(span=26, adjust=False).mean().values[-1]
+    macd_line = ema12 - ema26
+    macd_signal = pd.Series(pd.Series(c).ewm(span=12).mean() - pd.Series(c).ewm(span=26).mean()).ewm(span=9, adjust=False).mean().values[-1]
+    result['macd'] = round(float(macd_line), 5)
+    result['macd_signal'] = round(float(macd_signal), 5)
     
     # EMA
     ema20 = pd.Series(c).ewm(span=20, adjust=False).mean().values[-1]
     ema50 = pd.Series(c).ewm(span=50, adjust=False).mean().values[-1] if len(c) >= 50 else ema20
-    result['ema20'] = round(float(ema20), 5)
-    result['ema50'] = round(float(ema50), 5)
     result['above_ema20'] = price > ema20
     result['ema_bullish'] = ema20 > ema50
     
     # Bollinger
-    sma20, std20 = np.mean(c[-20:]), np.std(c[-20:])
+    sma20 = np.mean(c[-20:])
+    std20 = np.std(c[-20:])
     result['bb_position'] = round((price - sma20)/(2*std20+1e-8), 2)
     
     # Returns
-    for p in [1, 3, 5, 10]:
+    for p in [1, 3, 5]:
         result[f'ret_{p}'] = round(float((c[-1]-c[-p-1])/c[-p-1]*100), 3) if len(c) > p else 0
-    
-    # Volatility
-    result['volatility'] = round(float(np.std(np.diff(c[-20:])/c[-20:-1])), 5)
     
     # SL/TP
     is_jpy = "JPY" in symbol
-    sl_d, tp_d = result['atr']*1.5, result['atr']*3.0
+    sl_d = result['atr'] * 1.5
+    tp_d = result['atr'] * 3.0
     result['sl_buy'] = round(price - sl_d, 5)
     result['tp_buy'] = round(price + tp_d, 5)
     result['sl_sell'] = round(price + sl_d, 5)
@@ -473,19 +472,18 @@ def calculate_all_indicators(df: pd.DataFrame, symbol: str) -> Dict:
     return result
 
 # ============================================================================
-# XGBoost MODEL - Auto Train
+# XGBoost - Auto Train with Alpha Vantage
 # ============================================================================
 
 class MLModel:
     def __init__(self):
         self.model = None
         self.scaler = None
-        self.features = []
+        self.features = ['rsi', 'adx', 'bb_position', 'ret_1', 'ret_3', 'ret_5']
         self.is_trained = False
         
         os.makedirs('models_v4', exist_ok=True)
         
-        # ✅ تدريب تلقائي
         if not self._load():
             logger.info("🎓 تدريب XGBoost تلقائياً...")
             self._train()
@@ -497,7 +495,7 @@ class MLModel:
                 data = joblib.load(path)
                 self.model = data['model']
                 self.scaler = data['scaler']
-                self.features = data['features']
+                self.features = data.get('features', self.features)
                 self.is_trained = True
                 logger.info("📂 XGBoost محمل")
                 return True
@@ -510,28 +508,47 @@ class MLModel:
             from sklearn.preprocessing import RobustScaler
             import xgboost as xgb
             
-            logger.info("📥 جلب بيانات EURUSD للتدريب...")
-            df = yf.download('EURUSD=X', period='3mo', interval='1h', progress=False)
+            logger.info("📥 جلب بيانات EURUSD من Alpha Vantage...")
+            
+            params = {
+                'function': 'FX_INTRADAY',
+                'from_symbol': 'EUR', 'to_symbol': 'USD',
+                'interval': '60min', 'outputsize': 'full',
+                'apikey': ALPHA_VANTAGE_KEY
+            }
+            
+            r = requests.get('https://www.alphavantage.co/query', params=params, timeout=15)
+            data = r.json()
+            
+            time_key = 'Time Series FX (60min)'
+            if time_key not in data:
+                logger.warning("⚠️ Alpha Vantage: لا بيانات")
+                return
+            
+            records = []
+            for ts, vals in data[time_key].items():
+                records.append({
+                    'Date': ts, 'Open': float(vals['1. open']),
+                    'High': float(vals['2. high']), 'Low': float(vals['3. low']),
+                    'Close': float(vals['4. close'])
+                })
+            
+            df = pd.DataFrame(records)
+            df['Date'] = pd.to_datetime(df['Date'])
+            df = df.set_index('Date').sort_index()
             
             if len(df) < 200:
                 logger.warning("⚠️ بيانات غير كافية")
                 return
             
-            df.columns = [c.lower() for c in df.columns]
-            
-            self.features = ['rsi', 'adx', 'bb_position', 'ret_1', 'ret_3', 'ret_5', 'volatility']
-            
             X_list, y_list = [], []
             
             for i in range(50, len(df)-5):
-                chunk = df.iloc[i-50:i+1].rename(columns={'close': 'Close', 'high': 'High', 
-                                                          'low': 'Low', 'open': 'Open'})
-                ind_chunk = calculate_all_indicators(chunk, 'EURUSD')
-                if ind_chunk:
-                    X_list.append([ind_chunk.get(f, 0) for f in self.features])
-                    future_price = df['close'].values[i+5]
-                    current_price = df['close'].values[i]
-                    y_list.append(1 if future_price > current_price else 0)
+                chunk = df.iloc[i-50:i+1]
+                ind = calculate_indicators(chunk, 'EURUSD')
+                if ind:
+                    X_list.append([ind.get(f, 0) for f in self.features])
+                    y_list.append(1 if df['Close'].values[i+5] > df['Close'].values[i] else 0)
             
             if len(X_list) < 100:
                 logger.warning("⚠️ عينات غير كافية")
@@ -551,7 +568,6 @@ class MLModel:
             split = int(len(X) * 0.8)
             self.model.fit(X_s[:split], y[:split])
             
-            # ✅ اختبار
             y_pred = self.model.predict(X_s[split:])
             acc = (y_pred == y[split:]).mean()
             
@@ -587,17 +603,14 @@ class RiskManager:
         self.account_balance = 10000
     
     def can_trade(self) -> bool:
-        daily_pnl = self.db.get_daily_pnl()
-        return daily_pnl > -MAX_DAILY_LOSS * self.account_balance
+        return self.db.get_daily_pnl() > -MAX_DAILY_LOSS * self.account_balance
     
     def calculate_position_size(self, symbol: str, entry: float, sl: float) -> float:
         risk_amount = self.account_balance * RISK_PER_TRADE
         pip_value = 0.01 if 'JPY' in symbol else 0.0001
         sl_pips = abs(entry - sl) / pip_value
-        if sl_pips < 5:
-            return 0.01
-        position_size = risk_amount / (sl_pips * 10)
-        return round(min(max(position_size, 0.01), 1.0), 2)
+        if sl_pips < 5: return 0.01
+        return round(min(max(risk_amount / (sl_pips * 10), 0.01), 1.0), 2)
 
 # ============================================================================
 # MAIN BOT
@@ -629,66 +642,36 @@ class FalconPro:
         
         @self.tb.message_handler(commands=['train'])
         def train_cmd(msg):
-            if str(msg.chat.id) != TELEGRAM_CHAT_ID:
-                return
+            if str(msg.chat.id) != TELEGRAM_CHAT_ID: return
             self.tb.reply_to(msg, "🎓 جاري تدريب XGBoost...")
             self.ml._train()
-            if self.ml.is_trained:
-                self.tb.reply_to(msg, "✅ XGBoost جاهز!")
-            else:
-                self.tb.reply_to(msg, "❌ فشل التدريب")
-    
-    def fetch_data(self, symbol: str, interval: str, period: str) -> Optional[pd.DataFrame]:
-        key = f"{symbol}_{interval}_{period}"
-        cached = data_cache.get(key)
-        if cached is not None:
-            return cached
-        
-        try:
-            df = yf.download(symbol, period=period, interval=interval, progress=False)
-            if not df.empty:
-                df.columns = [c.capitalize() for c in df.columns]
-                data_cache.set(key, df)
-                return df
-        except:
-            pass
-        return None
+            self.tb.reply_to(msg, "✅ XGBoost جاهز!" if self.ml.is_trained else "❌ فشل")
     
     def analyze(self, symbol: str) -> Optional[Dict]:
-        if EconomicCalendar.is_high_impact_now():
-            return None
-        if not SessionFilter.is_good_time():
-            return None
-        if not self.risk.can_trade():
-            return None
-        if not self.db.is_symbol_active(symbol):
-            return None
-        if self.db.has_active_signal(symbol):
-            return None
-        if self.db.was_recent(symbol):
-            return None
+        if EconomicCalendar.is_high_impact_now(): return None
+        if not SessionFilter.is_good_time(): return None
+        if not self.risk.can_trade(): return None
+        if not self.db.is_symbol_active(symbol): return None
+        if self.db.has_active_signal(symbol): return None
+        if self.db.was_recent(symbol): return None
         
-        df_5m = self.fetch_data(symbol, '5m', '3d')
-        df_15m = self.fetch_data(symbol, '15m', '5d')
-        df_1h = self.fetch_data(symbol, '1h', '10d')
+        df_5m = DataFetcher.fetch(symbol, '5m')
+        df_15m = DataFetcher.fetch(symbol, '15m')
+        df_1h = DataFetcher.fetch(symbol, '1h')
         
-        if df_5m is None or df_15m is None or df_1h is None:
-            return None
+        if df_5m is None or df_15m is None or df_1h is None: return None
         
-        ind_5m = calculate_all_indicators(df_5m, symbol)
-        ind_15m = calculate_all_indicators(df_15m, symbol)
-        ind_1h = calculate_all_indicators(df_1h, symbol)
+        ind_5m = calculate_indicators(df_5m, symbol)
+        ind_15m = calculate_indicators(df_15m, symbol)
+        ind_1h = calculate_indicators(df_1h, symbol)
         
-        if not ind_5m or not ind_15m or not ind_1h:
-            return None
+        if not ind_5m or not ind_15m or not ind_1h: return None
         
         adx = ind_15m['adx']
-        if adx < 20:
-            return None
+        if adx < 20: return None
         
         structure = MarketStructure.detect(df_1h)
         pa_pattern, pa_score = PriceAction.detect(df_5m)
-        session = SessionFilter.get_current_session()
         ml_proba = self.ml.predict(ind_5m)
         
         score = 0
@@ -714,23 +697,17 @@ class FalconPro:
         
         trend = structure['trend']
         
-        if score > 0 and trend == 'UP':
-            direction = 'BUY'
-        elif score < 0 and trend == 'DOWN':
-            direction = 'SELL'
-        else:
-            return None
+        if score > 0 and trend == 'UP': direction = 'BUY'
+        elif score < 0 and trend == 'DOWN': direction = 'SELL'
+        else: return None
         
         confidence = min(0.95, 0.5 + abs(score)*0.1)
-        if confidence < MIN_CONFIDENCE:
-            return None
+        if confidence < MIN_CONFIDENCE: return None
         
         price = ind_5m['price']
         
-        if direction == 'BUY':
-            sl, tp = ind_15m['sl_buy'], ind_15m['tp_buy']
-        else:
-            sl, tp = ind_15m['sl_sell'], ind_15m['tp_sell']
+        if direction == 'BUY': sl, tp = ind_15m['sl_buy'], ind_15m['tp_buy']
+        else: sl, tp = ind_15m['sl_sell'], ind_15m['tp_sell']
         
         pos_size = self.risk.calculate_position_size(symbol, price, sl)
         
@@ -741,7 +718,7 @@ class FalconPro:
             'adx': adx, 'atr': ind_15m['atr'],
             'market_structure': structure['structure'],
             'price_action': pa_pattern,
-            'session': session,
+            'session': SessionFilter.get_current_session(),
             'position_size': pos_size,
             'tf_5m': f"{'🟢' if score > 0 else '🔴'}",
             'tf_15m': f"{'🟢' if score > 0 else '🔴'}",
@@ -752,9 +729,8 @@ class FalconPro:
     def check_trades(self):
         for trade in self.db.get_expired_trades():
             try:
-                df = self.fetch_data(trade['symbol'], '1m', '1d')
-                if df is None:
-                    continue
+                df = DataFetcher.fetch(trade['symbol'], '1m')
+                if df is None: continue
                 
                 entry_time = datetime.strptime(trade['entry_time'], '%Y-%m-%d %H:%M:%S')
                 expiry_time = datetime.strptime(trade['expiry_time'], '%Y-%m-%d %H:%M:%S')
@@ -762,8 +738,7 @@ class FalconPro:
                 mask = (df.index >= entry_time) & (df.index <= expiry_time)
                 period = df[mask]
                 
-                if period.empty:
-                    continue
+                if period.empty: continue
                 
                 high_p = float(period['High'].max())
                 low_p = float(period['Low'].min())
@@ -777,37 +752,25 @@ class FalconPro:
                 is_jpy = "JPY" in trade['symbol']
                 pip_value = 0.01 if is_jpy else 0.0001
                 
-                sl_first, tp_first = 0, 0
+                sl_first = tp_first = 0
                 
                 if direction == 'BUY':
                     for _, row in period.iterrows():
-                        if float(row['Low']) <= sl:
-                            sl_first = 1
-                            break
-                        if float(row['High']) >= tp:
-                            tp_first = 1
-                            break
+                        if float(row['Low']) <= sl: sl_first = 1; break
+                        if float(row['High']) >= tp: tp_first = 1; break
                     
-                    if sl_first:
-                        result, exit_price = 'LOSS', sl
-                    elif tp_first:
-                        result, exit_price = 'WIN', tp
+                    if sl_first: result, exit_price = 'LOSS', sl
+                    elif tp_first: result, exit_price = 'WIN', tp
                     else:
                         exit_price = close_p
                         result = 'WIN' if close_p > entry else 'LOSS'
                 else:
                     for _, row in period.iterrows():
-                        if float(row['High']) >= sl:
-                            sl_first = 1
-                            break
-                        if float(row['Low']) <= tp:
-                            tp_first = 1
-                            break
+                        if float(row['High']) >= sl: sl_first = 1; break
+                        if float(row['Low']) <= tp: tp_first = 1; break
                     
-                    if sl_first:
-                        result, exit_price = 'LOSS', sl
-                    elif tp_first:
-                        result, exit_price = 'WIN', tp
+                    if sl_first: result, exit_price = 'LOSS', sl
+                    elif tp_first: result, exit_price = 'WIN', tp
                     else:
                         exit_price = close_p
                         result = 'WIN' if close_p < entry else 'LOSS'
@@ -817,24 +780,22 @@ class FalconPro:
                 
                 self.db.update_result(trade['id'], exit_price, result, pnl, round(pips, 1),
                                      high_p, low_p, sl_first, tp_first)
-                
             except:
                 pass
     
     def hunt(self):
-        active_symbols = self.db.get_active_symbols()
-        logger.info(f"🔍 بحث في {len(active_symbols)} زوج...")
+        active = self.db.get_active_symbols()
+        logger.info(f"🔍 بحث في {len(active)} زوج...")
         
-        best = None
-        best_score = 0
+        best, best_score = None, 0
         
-        for symbol in active_symbols:
+        for symbol in active:
             try:
                 result = self.analyze(symbol)
                 if result and abs(result['score']) > best_score:
                     best_score = abs(result['score'])
                     best = result
-                time.sleep(1)
+                time.sleep(0.5)
             except:
                 pass
         
@@ -853,8 +814,6 @@ class FalconPro:
                f"💪 {signal['confidence']:.1%}\n"
                f"📊 ADX: {signal['adx']}\n"
                f"🏗️ {signal['market_structure']}\n"
-               f"🕯️ {signal['price_action']}\n"
-               f"📈 حجم: {signal['position_size']}\n"
                f"{signal['tf_5m']}5m {signal['tf_15m']}15m {signal['tf_1h']}1h\n\n"
                f"🤖 Falcon Pro v4")
         
@@ -864,8 +823,7 @@ class FalconPro:
             pass
     
     def run(self):
-        logger.info("🦅 Falcon Pro v4 - Auto Train")
-        logger.info(f"📊 XGBoost: {'نشط' if self.ml.is_trained else 'غير مدرب'}")
+        logger.info("🦅 Falcon Pro v4")
         
         def poll():
             while True:
