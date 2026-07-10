@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """
-Falcon AI Pro v4.4 - Final Stable Version
-============================================
+Falcon AI Pro v4.5 - Multi-Signal + Smart Duration
+====================================================
+✅ Sends ALL qualifying signals (not just best one)
+✅ Smart duration based on ATR and momentum
+✅ Clean signal format
 ✅ All MultiIndex errors fixed
 ✅ Scans every 60 seconds
 ✅ 8 symbols trained
-✅ Auto-train + Auto-hunt
-✅ Ready for signals
 """
 
 import os
@@ -39,8 +40,8 @@ TELEGRAM_CHAT_ID = '7553333305'
 ALPHA_VANTAGE_KEY = 'FH126TDYOVLOQED5'
 
 SYMBOLS = [
-    'EURUSD', 'GBPUSD', 'USDJPY', 'AUDUSD',
-    'USDCAD', 'EURGBP', 'EURJPY', 'GBPJPY'
+    'EURUSD=X', 'GBPUSD=X', 'USDJPY=X', 'AUDUSD=X',
+    'USDCAD=X', 'EURGBP=X', 'EURJPY=X', 'GBPJPY=X'
 ]
 
 SCAN_INTERVAL = 60
@@ -91,11 +92,10 @@ class DataCache:
 data_cache = DataCache()
 
 # ============================================================================
-# HELPER: Fix MultiIndex
+# HELPER
 # ============================================================================
 
 def safe_columns(df: pd.DataFrame) -> pd.DataFrame:
-    """✅ إصلاح أعمدة MultiIndex - تُستخدم في كل مكان"""
     if df is None or df.empty:
         return df
     try:
@@ -121,7 +121,7 @@ class Database:
                     exit_price REAL, stop_loss REAL, take_profit REAL,
                     high_period REAL, low_period REAL,
                     confidence REAL, score REAL,
-                    adx REAL, atr REAL,
+                    adx REAL, atr REAL, duration INTEGER,
                     market_structure TEXT,
                     price_action TEXT,
                     session TEXT,
@@ -163,14 +163,14 @@ class Database:
                 conn.execute('''
                     INSERT OR IGNORE INTO signals 
                     (symbol, direction, entry_price, stop_loss, take_profit,
-                     confidence, score, adx, atr, market_structure, price_action,
+                     confidence, score, adx, atr, duration, market_structure, price_action,
                      session, tf_5m, tf_15m, tf_1h, position_size,
                      expiry_time, signal_hash)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ''', (data['symbol'], data['direction'], data['entry_price'],
                       data.get('stop_loss'), data.get('take_profit'),
                       data['confidence'], data.get('score', 0),
-                      data.get('adx', 0), data.get('atr', 0),
+                      data.get('adx', 0), data.get('atr', 0), data.get('duration', 7),
                       data.get('market_structure', ''), data.get('price_action', ''),
                       data.get('session', ''), data.get('tf_5m', ''), data.get('tf_15m', ''),
                       data.get('tf_1h', ''), data.get('position_size', 0.01),
@@ -277,51 +277,15 @@ class DataFetcher:
         if cached is not None:
             return cached
         
-        # Yahoo first
         try:
             import yfinance as yf
-            yf_symbol = f"{symbol}=X"
+            yf_symbol = symbol if '=X' in symbol else f"{symbol}=X"
             interval_map = {'5m': '5m', '15m': '15m', '1h': '1h', '1m': '1m'}
             yf_interval = interval_map.get(interval, '5m')
             
             df = yf.download(yf_symbol, period='5d', interval=yf_interval, progress=False)
             df = safe_columns(df)
             if not df.empty:
-                data_cache.set(key, df)
-                return df
-        except:
-            pass
-        
-        # Alpha Vantage fallback
-        try:
-            from_curr = symbol[:3]
-            to_curr = symbol[3:]
-            av_interval = interval.replace('m', 'min')
-            
-            params = {
-                'function': 'FX_INTRADAY',
-                'from_symbol': from_curr,
-                'to_symbol': to_curr,
-                'interval': av_interval,
-                'outputsize': 'compact',
-                'apikey': ALPHA_VANTAGE_KEY
-            }
-            
-            r = requests.get('https://www.alphavantage.co/query', params=params, timeout=15)
-            data = r.json()
-            
-            time_key = f'Time Series FX ({av_interval})'
-            if time_key in data:
-                records = []
-                for ts, vals in data[time_key].items():
-                    records.append({
-                        'Date': ts, 'Open': float(vals['1. open']),
-                        'High': float(vals['2. high']), 'Low': float(vals['3. low']),
-                        'Close': float(vals['4. close']), 'Volume': 0
-                    })
-                df = pd.DataFrame(records)
-                df['Date'] = pd.to_datetime(df['Date'])
-                df = df.set_index('Date').sort_index()
                 data_cache.set(key, df)
                 return df
         except:
@@ -455,6 +419,52 @@ def calculate_indicators(df: pd.DataFrame, symbol: str) -> Dict:
     return result
 
 # ============================================================================
+# SMART DURATION
+# ============================================================================
+
+def calculate_smart_duration(df: pd.DataFrame, direction: str) -> int:
+    """
+    ✅ مدة ذكية مبنية على:
+    - سرعة الحركة (ATR)
+    - قوة الترند (ADX)
+    - الزخم (ROC)
+    """
+    if len(df) < 20:
+        return 7
+    
+    c = df['Close'].values
+    h = df['High'].values
+    l = df['Low'].values
+    
+    # ATR percentage
+    tr = np.array([max(h[i+1]-l[i+1], abs(h[i+1]-c[i]), abs(l[i+1]-c[i])) for i in range(len(c)-1)])
+    atr = np.mean(tr[-14:])
+    atr_pct = atr / c[-1] * 100
+    
+    # ROC (Rate of Change)
+    roc_3 = abs((c[-1] - c[-4]) / c[-4] * 100)
+    
+    # RSI
+    delta = np.diff(c[-20:])
+    gain = np.mean(delta[delta > 0]) if any(delta > 0) else 0
+    loss = np.mean(-delta[delta < 0]) if any(delta < 0) else 0
+    rsi = 100 - (100 / (1 + gain / (loss + 1e-8))) if loss > 0 else 50
+    
+    # ✅ تحديد المدة
+    if atr_pct > 0.08 and roc_3 > 0.1:
+        duration = 4  # حركة قوية
+    elif atr_pct > 0.05 and roc_3 > 0.06:
+        duration = 6  # حركة متوسطة
+    elif rsi > 70 or rsi < 30:
+        duration = 5  # تشبع - انعكاس متوقع
+    elif atr_pct < 0.02:
+        duration = 12  # سوق نايم
+    else:
+        duration = 8  # طبيعي
+    
+    return min(15, max(3, duration))
+
+# ============================================================================
 # XGBoost MODEL
 # ============================================================================
 
@@ -485,10 +495,6 @@ class MLModel:
             return False
         try:
             data = joblib.load(path)
-            train_date = data.get('train_date')
-            if train_date:
-                if (datetime.now() - datetime.fromisoformat(train_date)).days >= RETRAIN_DAYS:
-                    return False
             self.model = data['model']
             self.scaler = data['scaler']
             self.feature_names = data['feature_names']
@@ -501,7 +507,7 @@ class MLModel:
     def _fetch_training(self, symbol: str) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
         try:
             import yfinance as yf
-            df = yf.download(f"{symbol}=X", period='6mo', interval='1h', progress=False)
+            df = yf.download(symbol, period='6mo', interval='1h', progress=False)
             df = safe_columns(df)
             
             if df.empty or len(df) < 200:
@@ -519,7 +525,6 @@ class MLModel:
             if len(X_list) < 100:
                 return None, None
             
-            logger.info(f"  ✅ {symbol}: {len(X_list)} عينة")
             return np.array(X_list), np.array(y_list)
         except:
             return None, None
@@ -575,8 +580,6 @@ class MLModel:
             
             y_pred = self.model.predict(X_test_s)
             acc = accuracy_score(y_test, y_pred)
-            prec = precision_score(y_test, y_pred, zero_division=0)
-            rec = recall_score(y_test, y_pred, zero_division=0)
             f1 = f1_score(y_test, y_pred, zero_division=0)
             
             self.is_trained = True
@@ -585,8 +588,7 @@ class MLModel:
                 'model': self.model, 'scaler': self.scaler,
                 'feature_names': self.feature_names,
                 'train_date': datetime.now().isoformat(),
-                'metrics': {'accuracy': acc, 'precision': prec, 'recall': rec, 'f1_score': f1,
-                           'samples': len(X_all), 'symbols': len(symbols_used)}
+                'metrics': {'accuracy': acc, 'f1_score': f1, 'samples': len(X_all), 'symbols': len(symbols_used)}
             }, 'models_v4/xgb_model.pkl')
             
             logger.info(f"✅ Accuracy: {acc:.1%} | F1: {f1:.3f} | {len(symbols_used)} أزواج")
@@ -652,11 +654,10 @@ class FalconPro:
                 data = joblib.load('models_v4/xgb_model.pkl')
                 metrics = data.get('metrics', {})
             
-            text = (f"🦅 **Falcon Pro v4.4**\n\n"
+            text = (f"🦅 **Falcon Pro v4.5**\n\n"
                    f"✅ نشطة: {len(active)}/8\n"
                    f"📊 XGBoost: {'نشط' if self.ml.is_trained else 'غير مدرب'}\n"
                    f"📊 دقة: {metrics.get('accuracy', 0):.1%}\n"
-                   f"📊 F1: {metrics.get('f1_score', 0):.3f}\n"
                    f"💰 اليوم: {daily:.2f}%")
             self.tb.reply_to(msg, text, parse_mode='Markdown')
     
@@ -722,11 +723,15 @@ class FalconPro:
         if direction == 'BUY': sl, tp = ind_15m['sl_buy'], ind_15m['tp_buy']
         else: sl, tp = ind_15m['sl_sell'], ind_15m['tp_sell']
         
+        # ✅ مدة ذكية
+        duration = calculate_smart_duration(df_5m, direction)
+        
         return {
             'symbol': symbol, 'direction': direction,
             'price': price, 'stop_loss': sl, 'take_profit': tp,
             'confidence': confidence, 'score': score,
             'adx': adx, 'atr': ind_15m['atr'],
+            'duration': duration,
             'market_structure': structure['structure'],
             'price_action': pa_pattern,
             'session': 'active',
@@ -734,7 +739,7 @@ class FalconPro:
             'tf_5m': f"{'🟢' if score > 0 else '🔴'}",
             'tf_15m': f"{'🟢' if score > 0 else '🔴'}",
             'tf_1h': trend,
-            'expiry_time': (datetime.now() + timedelta(minutes=7)).strftime('%Y-%m-%d %H:%M:%S')
+            'expiry_time': (datetime.now() + timedelta(minutes=duration)).strftime('%Y-%m-%d %H:%M:%S')
         }
     
     def check_trades(self):
@@ -795,44 +800,41 @@ class FalconPro:
     
     def hunt(self):
         active = self.db.get_active_symbols()
+        logger.info(f"🔍 بحث في {len(active)} زوج...")
         
-        best, best_score = None, 0
+        signals_sent = 0
         
         for symbol in active:
             try:
                 result = self.analyze(symbol)
-                if result and abs(result['score']) > best_score:
-                    best_score = abs(result['score'])
-                    best = result
-                time.sleep(0.3)
+                if result:
+                    self.db.save_signal(result)
+                    self.send_signal(result)
+                    signals_sent += 1
+                time.sleep(0.5)
             except:
                 pass
         
-        if best:
-            self.db.save_signal(best)
-            self.send_signal(best)
+        if signals_sent > 0:
+            logger.info(f"📊 تم إرسال {signals_sent} إشارة")
     
     def send_signal(self, signal: Dict):
         emoji = "🟢" if signal['direction'] == 'BUY' else "🔴"
-        direction = "شراء ▲" if signal['direction'] == 'BUY' else "بيع ▼"
+        direction = "شراء" if signal['direction'] == 'BUY' else "بيع"
         
         msg = (f"{emoji} **{signal['symbol']}** - {direction}\n\n"
-               f"💰 {signal['price']:.5f}\n"
-               f"🛑 SL: {signal['stop_loss']:.5f}\n"
-               f"🎯 TP: {signal['take_profit']:.5f}\n"
-               f"💪 {signal['confidence']:.1%}\n"
-               f"📊 ADX: {signal['adx']}\n"
-               f"🏗️ {signal['market_structure']}\n"
-               f"{signal['tf_5m']}5m {signal['tf_15m']}15m {signal['tf_1h']}1h\n\n"
-               f"🤖 Falcon Pro v4.4")
+               f"💰 السعر: {signal['price']:.5f}\n"
+               f"⏳ المدة: {signal['duration']} د\n"
+               f"💪 الثقة: {signal['confidence']:.1%}")
         
         try:
             self.tb.send_message(TELEGRAM_CHAT_ID, msg, parse_mode='Markdown')
+            logger.info(f"✅ {signal['symbol']} {signal['direction']}")
         except:
             pass
     
     def run(self):
-        logger.info("🦅 Falcon Pro v4.4 - Final")
+        logger.info("🦅 Falcon Pro v4.5 - Multi-Signal + Smart Duration")
         
         def poll():
             while True:
