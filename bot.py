@@ -39,7 +39,7 @@ SYMBOLS = [
     'USDCAD=X', 'EURGBP=X', 'EURJPY=X', 'GBPJPY=X'
 ]
 
-SCAN_INTERVAL = 60
+SCAN_INTERVAL = 20
 MIN_CONFIDENCE = 0.55
 
 # ============================================================================
