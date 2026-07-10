@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
 """
-Falcon AI Pro v4.1 - Multi-Symbol XGBoost Training
-====================================================
-✅ Trains ONE model on ALL symbols
-✅ LabelEncoder for symbol identity
-✅ Multi-threaded data loading
-✅ Early stopping + all CPU cores
+Falcon AI Pro v4.2 - Dual Data Source Training
+================================================
+✅ Alpha Vantage (FH126TDYOVLOQED5) + Yahoo Finance
+✅ Multi-symbol XGBoost training
 ✅ 17 professional features
-✅ Auto-retrain every 7 days
-✅ Full metrics (Accuracy, Precision, Recall, F1, ROC AUC)
-✅ Robust error handling per symbol
+✅ Market Structure + Price Action + Session Filter
+✅ Dynamic Risk Management
+✅ Intra-candle SL/TP detection
+✅ Performance tracking per symbol
+✅ Auto-train on startup
 """
 
 import os
@@ -39,7 +39,7 @@ warnings.filterwarnings('ignore')
 
 TELEGRAM_TOKEN = '8773849578:AAH9a6-8hU5YFYTad2EA5jQyfffIoeL8npk'
 TELEGRAM_CHAT_ID = '7553333305'
-ALPHA_VANTAGE_KEY = '5TFFWK21CUNA3P25'
+ALPHA_VANTAGE_KEY = 'FH126TDYOVLOQED5'
 
 SYMBOLS = [
     'EURUSD', 'GBPUSD', 'USDJPY', 'AUDUSD',
@@ -338,13 +338,6 @@ class SessionFilter:
     @staticmethod
     def is_good_time() -> bool:
         return SessionFilter.get_current_session() in ['overlap', 'london', 'ny']
-    
-    @staticmethod
-    def get_session_feature() -> int:
-        """0=dead, 1=asian, 2=london, 3=ny, 4=overlap"""
-        session = SessionFilter.get_current_session()
-        mapping = {'dead': 0, 'asian': 1, 'london': 2, 'ny': 3, 'overlap': 4}
-        return mapping.get(session, 0)
 
 # ============================================================================
 # MARKET STRUCTURE
@@ -392,12 +385,6 @@ class PriceAction:
                 return "bearish_engulfing", -0.7
         
         return "none", 0
-    
-    @staticmethod
-    def get_pattern_feature(pattern: str) -> int:
-        mapping = {'none': 0, 'hammer': 1, 'shooting_star': -1,
-                   'bullish_engulfing': 2, 'bearish_engulfing': -2, 'inside_bar': 0}
-        return mapping.get(pattern, 0)
 
 # ============================================================================
 # ECONOMIC CALENDAR
@@ -413,17 +400,17 @@ class EconomicCalendar:
         return False
 
 # ============================================================================
-# INDICATORS (17 Features)
+# INDICATORS
 # ============================================================================
 
 def calculate_indicators(df: pd.DataFrame, symbol: str) -> Dict:
-    if len(df) < 50: return None
+    if len(df) < 30: return None
     
     c, h, l = df['Close'].values, df['High'].values, df['Low'].values
     price = float(c[-1])
     result = {'price': price}
     
-    # 1. RSI
+    # RSI
     delta = np.diff(c)
     gain = np.where(delta > 0, delta, 0)
     loss = np.where(delta < 0, -delta, 0)
@@ -431,11 +418,11 @@ def calculate_indicators(df: pd.DataFrame, symbol: str) -> Dict:
     avg_l = np.mean(loss[-14:]) if len(loss) >= 14 else np.mean(loss)
     result['rsi'] = round(100 - 100/(1 + avg_g/(avg_l+1e-8)), 1)
     
-    # 2. ATR
+    # ATR
     tr = np.array([max(h[i+1]-l[i+1], abs(h[i+1]-c[i]), abs(l[i+1]-c[i])) for i in range(len(c)-1)])
     result['atr'] = round(float(np.mean(tr[-14:])), 5)
     
-    # 3. ADX, 4. +DI, 5. -DI
+    # ADX, +DI, -DI
     up, down = np.diff(h), -np.diff(l)
     p_dm = np.where((up > down) & (up > 0), up, 0)
     m_dm = np.where((down > up) & (down > 0), down, 0)
@@ -447,34 +434,34 @@ def calculate_indicators(df: pd.DataFrame, symbol: str) -> Dict:
     result['plus_di'] = round(float(p_di), 1)
     result['minus_di'] = round(float(m_di), 1)
     
-    # 6. EMA20, 7. EMA50, 8. EMA200
+    # EMAs
     result['ema20'] = round(float(pd.Series(c).ewm(span=20, adjust=False).mean().values[-1]), 5)
     result['ema50'] = round(float(pd.Series(c).ewm(span=50, adjust=False).mean().values[-1]), 5) if len(c) >= 50 else result['ema20']
     result['ema200'] = round(float(pd.Series(c).ewm(span=200, adjust=False).mean().values[-1]), 5) if len(c) >= 200 else result['ema50']
     
-    # 9. MACD, 10. MACD Signal
+    # MACD
     ema12 = pd.Series(c).ewm(span=12, adjust=False).mean().values[-1]
     ema26 = pd.Series(c).ewm(span=26, adjust=False).mean().values[-1]
     result['macd'] = round(float(ema12 - ema26), 5)
     result['macd_signal'] = round(float(pd.Series(pd.Series(c).ewm(span=12).mean() - pd.Series(c).ewm(span=26).mean()).ewm(span=9, adjust=False).mean().values[-1]), 5)
     
-    # 11. Bollinger Position
+    # Bollinger
     sma20 = np.mean(c[-20:])
     std20 = np.std(c[-20:])
     result['bb_position'] = round((price - sma20)/(2*std20+1e-8), 2)
     
-    # 12. Returns 1, 13. Returns 3, 14. Returns 5
+    # Returns
     for p in [1, 3, 5]:
         result[f'ret_{p}'] = round(float((c[-1]-c[-p-1])/c[-p-1]*100), 3) if len(c) > p else 0
     
-    # 15. Volatility
+    # Volatility
     result['volatility'] = round(float(np.std(np.diff(c[-20:])/c[-20:-1])), 5)
     
-    # 16. EMA Alignment (Bullish/Bearish)
+    # EMA flags
     result['above_ema20'] = 1 if price > result['ema20'] else 0
     result['ema_bullish'] = 1 if result['ema20'] > result['ema50'] else 0
     
-    # 17. SL/TP
+    # SL/TP
     is_jpy = "JPY" in symbol
     sl_d = result['atr'] * 1.5
     tp_d = result['atr'] * 3.0
@@ -486,7 +473,7 @@ def calculate_indicators(df: pd.DataFrame, symbol: str) -> Dict:
     return result
 
 # ============================================================================
-# XGBoost - Multi-Symbol Training
+# XGBoost - Multi-Symbol with Dual Data Source
 # ============================================================================
 
 class MLModel:
@@ -494,11 +481,9 @@ class MLModel:
         self.model = None
         self.scaler = None
         self.feature_names = []
-        self.label_encoder = None
         self.is_trained = False
         self.train_date = None
         
-        # ✅ الميزات الـ 17
         self.base_features = [
             'rsi', 'atr', 'adx', 'plus_di', 'minus_di',
             'ema20', 'ema50', 'ema200',
@@ -520,8 +505,6 @@ class MLModel:
         
         try:
             data = joblib.load(path)
-            
-            # ✅ إعادة تدريب لو النموذج قديم
             train_date = data.get('train_date')
             if train_date:
                 train_dt = datetime.fromisoformat(train_date)
@@ -532,19 +515,18 @@ class MLModel:
             self.model = data['model']
             self.scaler = data['scaler']
             self.feature_names = data['feature_names']
-            self.label_encoder = data.get('label_encoder')
             self.is_trained = True
             self.train_date = data.get('train_date')
-            logger.info("📂 XGBoost محمل (متعدد الأزواج)")
+            logger.info("📂 XGBoost محمل")
             return True
         except:
             return False
     
     def _fetch_training_data(self, symbol: str) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
-        """جلب بيانات التدريب لزوج واحد"""
         try:
             logger.info(f"  📥 {symbol}: جلب البيانات...")
             
+            # ✅ Alpha Vantage أولاً
             params = {
                 'function': 'FX_INTRADAY',
                 'from_symbol': symbol[:3],
@@ -558,24 +540,33 @@ class MLModel:
             data = r.json()
             
             time_key = 'Time Series FX (60min)'
-            if time_key not in data:
-                logger.warning(f"  ⚠️ {symbol}: Alpha Vantage فشل")
-                return None, None
+            df = None
             
-            records = []
-            for ts, vals in data[time_key].items():
-                records.append({
-                    'Date': ts, 'Open': float(vals['1. open']),
-                    'High': float(vals['2. high']), 'Low': float(vals['3. low']),
-                    'Close': float(vals['4. close'])
-                })
+            if time_key in data:
+                records = []
+                for ts, vals in data[time_key].items():
+                    records.append({
+                        'Date': ts, 'Open': float(vals['1. open']),
+                        'High': float(vals['2. high']), 'Low': float(vals['3. low']),
+                        'Close': float(vals['4. close'])
+                    })
+                df = pd.DataFrame(records)
+                df['Date'] = pd.to_datetime(df['Date'])
+                df = df.set_index('Date').sort_index()
+                logger.info(f"  ✅ {symbol}: {len(df)} صف (Alpha)")
+            else:
+                logger.warning(f"  ⚠️ {symbol}: Alpha فشل - جاري Yahoo...")
+                
+                import yfinance as yf
+                yf_symbol = f"{symbol}=X"
+                df = yf.download(yf_symbol, period='3mo', interval='1h', progress=False)
+                
+                if not df.empty:
+                    df.columns = [c.capitalize() for c in df.columns]
+                    logger.info(f"  ✅ {symbol}: {len(df)} صف (Yahoo)")
             
-            df = pd.DataFrame(records)
-            df['Date'] = pd.to_datetime(df['Date'])
-            df = df.set_index('Date').sort_index()
-            
-            if len(df) < 200:
-                logger.warning(f"  ⚠️ {symbol}: بيانات غير كافية ({len(df)})")
+            if df is None or len(df) < 200:
+                logger.warning(f"  ⚠️ {symbol}: بيانات غير كافية")
                 return None, None
             
             X_list, y_list = [], []
@@ -589,10 +580,8 @@ class MLModel:
                     y_list.append(1 if df['Close'].values[i+5] > df['Close'].values[i] else 0)
             
             if len(X_list) < 100:
-                logger.warning(f"  ⚠️ {symbol}: عينات غير كافية ({len(X_list)})")
                 return None, None
             
-            logger.info(f"  ✅ {symbol}: {len(X_list)} عينة")
             return np.array(X_list), np.array(y_list)
             
         except Exception as e:
@@ -600,9 +589,8 @@ class MLModel:
             return None, None
     
     def _train_all_symbols(self):
-        """✅ تدريب نموذج واحد على جميع الأزواج"""
         try:
-            from sklearn.preprocessing import RobustScaler, LabelEncoder
+            from sklearn.preprocessing import RobustScaler
             from sklearn.model_selection import train_test_split
             from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, roc_auc_score
             import xgboost as xgb
@@ -611,7 +599,6 @@ class MLModel:
             
             X_all, y_all, symbols_used = [], [], []
             
-            # ✅ تحميل متوازي
             with ThreadPoolExecutor(max_workers=4) as executor:
                 futures = {executor.submit(self._fetch_training_data, sym): sym for sym in SYMBOLS}
                 
@@ -620,7 +607,6 @@ class MLModel:
                     try:
                         X, y = future.result(timeout=30)
                         if X is not None and y is not None:
-                            # ✅ إضافة ترميز الزوج
                             symbol_encoded = SYMBOLS.index(symbol)
                             symbol_col = np.full((len(X), 1), symbol_encoded)
                             X = np.hstack([X, symbol_col])
@@ -629,7 +615,7 @@ class MLModel:
                             y_all.append(y)
                             symbols_used.append(symbol)
                     except:
-                        logger.warning(f"  ⏰ {symbol}: timeout")
+                        pass
             
             if not X_all:
                 logger.error("❌ لا توجد بيانات كافية للتدريب")
@@ -642,37 +628,24 @@ class MLModel:
             logger.info(f"📊 الأزواج: {symbols_used}")
             logger.info(f"📊 توزيع: BUY={y_all.mean():.1%}, SELL={1-y_all.mean():.1%}")
             
-            # ✅ الميزات النهائية
             self.feature_names = self.base_features + ['symbol_encoded']
             
-            # ✅ تقسيم
             X_train, X_test, y_train, y_test = train_test_split(
                 X_all, y_all, test_size=0.2, random_state=42, shuffle=True
             )
             
-            # ✅ Scaling
             self.scaler = RobustScaler()
             X_train_s = self.scaler.fit_transform(X_train)
             X_test_s = self.scaler.transform(X_test)
             
-            # ✅ Label Encoder (للرمز)
-            self.label_encoder = LabelEncoder()
-            self.label_encoder.fit(symbols_used)
-            
-            # ✅ تدريب XGBoost
             self.model = xgb.XGBClassifier(
                 n_estimators=200, max_depth=6, learning_rate=0.03,
                 random_state=42, n_jobs=-1, verbosity=0,
                 early_stopping_rounds=20
             )
             
-            self.model.fit(
-                X_train_s, y_train,
-                eval_set=[(X_test_s, y_test)],
-                verbose=False
-            )
+            self.model.fit(X_train_s, y_train, eval_set=[(X_test_s, y_test)], verbose=False)
             
-            # ✅ تقييم
             y_pred = self.model.predict(X_test_s)
             y_proba = self.model.predict_proba(X_test_s)[:, 1]
             
@@ -685,12 +658,9 @@ class MLModel:
             self.is_trained = True
             self.train_date = datetime.now().isoformat()
             
-            # ✅ حفظ
             joblib.dump({
-                'model': self.model,
-                'scaler': self.scaler,
+                'model': self.model, 'scaler': self.scaler,
                 'feature_names': self.feature_names,
-                'label_encoder': self.label_encoder,
                 'train_date': self.train_date,
                 'symbols_used': symbols_used,
                 'metrics': {
@@ -714,13 +684,7 @@ class MLModel:
         
         try:
             features = [indicators.get(f, 0) for f in self.base_features]
-            
-            # ✅ ترميز الزوج
-            if symbol in SYMBOLS:
-                symbol_encoded = SYMBOLS.index(symbol)
-            else:
-                symbol_encoded = 0
-            
+            symbol_encoded = SYMBOLS.index(symbol) if symbol in SYMBOLS else 0
             features.append(symbol_encoded)
             
             X = np.array([features])
@@ -771,14 +735,13 @@ class FalconPro:
             active = self.db.get_active_symbols()
             daily = self.db.get_daily_pnl()
             
-            # ✅ تحميل مقاييس النموذج
             metrics = {}
             path = 'models_v4/xgb_model.pkl'
             if os.path.exists(path):
                 data = joblib.load(path)
                 metrics = data.get('metrics', {})
             
-            text = (f"🦅 **Falcon Pro v4.1**\n\n"
+            text = (f"🦅 **Falcon Pro v4.2**\n\n"
                    f"✅ أزواج نشطة: {len(active)}/8\n"
                    f"📊 XGBoost: {'نشط' if self.ml.is_trained else 'غير مدرب'}\n"
                    f"📊 دقة: {metrics.get('accuracy', 0):.1%}\n"
@@ -786,13 +749,6 @@ class FalconPro:
                    f"📊 أزواج مدربة: {metrics.get('symbols', 0)}\n"
                    f"💰 ربح اليوم: {daily:.2f}%")
             self.tb.reply_to(msg, text, parse_mode='Markdown')
-        
-        @self.tb.message_handler(commands=['train'])
-        def train_cmd(msg):
-            if str(msg.chat.id) != TELEGRAM_CHAT_ID: return
-            self.tb.reply_to(msg, "🎓 جاري تدريب XGBoost على جميع الأزواج...")
-            self.ml._train_all_symbols()
-            self.tb.reply_to(msg, "✅ XGBoost جاهز!" if self.ml.is_trained else "❌ فشل")
     
     def analyze(self, symbol: str) -> Optional[Dict]:
         if EconomicCalendar.is_high_impact_now(): return None
@@ -819,8 +775,6 @@ class FalconPro:
         
         structure = MarketStructure.detect(df_1h)
         pa_pattern, pa_score = PriceAction.detect(df_5m)
-        
-        # ✅ XGBoost متعدد الأزواج
         ml_proba = self.ml.predict(ind_5m, symbol)
         
         score = 0
@@ -964,7 +918,7 @@ class FalconPro:
                f"📊 ADX: {signal['adx']}\n"
                f"🏗️ {signal['market_structure']}\n"
                f"{signal['tf_5m']}5m {signal['tf_15m']}15m {signal['tf_1h']}1h\n\n"
-               f"🤖 Falcon Pro v4.1")
+               f"🤖 Falcon Pro v4.2")
         
         try:
             self.tb.send_message(TELEGRAM_CHAT_ID, msg, parse_mode='Markdown')
@@ -972,7 +926,7 @@ class FalconPro:
             pass
     
     def run(self):
-        logger.info("🦅 Falcon Pro v4.1 - Multi-Symbol XGBoost")
+        logger.info("🦅 Falcon Pro v4.2 - Dual Data Source")
         
         def poll():
             while True:
