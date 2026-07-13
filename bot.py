@@ -1,15 +1,16 @@
 #!/usr/bin/env python3
 """
-Falcon AI v5.3 - No Polling (Zero 409)
-========================================
+Falcon AI v5.3 - No Polling (Zero 409) + Fixed Deprecation
+============================================================
 ✅ 4 independent strategies
 ✅ No infinity_polling - No 409 error
 ✅ Send-only Telegram mode
+✅ Fixed utcnow() deprecation
 ✅ Each strategy works independently
 """
 
 import os, sys, time, logging, sqlite3, hashlib
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import numpy as np, pandas as pd, yfinance as yf
 import telebot
 import requests
@@ -30,14 +31,13 @@ TRADE_DURATION = 5
 logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(levelname)-7s | %(message)s', datefmt='%H:%M:%S', handlers=[logging.StreamHandler(sys.stdout)])
 logger = logging.getLogger('FalconV5')
 
-# ✅ حذف Webhook أول حاجة
+# حذف Webhook
 try:
     requests.get(f'https://api.telegram.org/bot{TELEGRAM_TOKEN}/deleteWebhook', timeout=5)
     time.sleep(1)
-    logger.info("✅ Webhook deleted")
+    logger.info("Webhook deleted")
 except: pass
 
-# ✅ بوت إرسال فقط - مفيش polling
 tb = telebot.TeleBot(TELEGRAM_TOKEN)
 
 class DataCache:
@@ -57,6 +57,10 @@ def safe_columns(df):
         df.columns = [str(c).capitalize() for c in df.columns]
     except: pass
     return df
+
+def utc_now():
+    """✅ بديل لـ utcnow()"""
+    return datetime.now(timezone.utc)
 
 class Database:
     def __init__(self):
@@ -206,7 +210,7 @@ def strat_fibo(df, df_1h, symbol):
         return {'direction':'SELL','price':price,'stop_loss':round(fibo['f618'],5),'take_profit':round(fibo['low'],5),'confidence':0.68,'strategy':'fibo_volume','strategy_name':'فيبو 50% هابط'}
     return None
 
-# ========== SEND MESSAGE SAFELY ==========
+# ========== SEND MESSAGE ==========
 
 def send_message(text):
     try:
@@ -221,9 +225,9 @@ def send_message(text):
 
 def main():
     db = Database()
-    logger.info("🦅 Falcon Pro v5.3 - No Polling")
+    logger.info("Falcon Pro v5.3 - No Polling")
     
-    send_message("🦅 **Falcon Pro v5.3**\n✅ 4 استراتيجيات\n⚡️ يعمل...")
+    send_message("Falcon Pro v5.3\n4 Strategies\nWorking...")
     
     while True:
         try:
@@ -243,11 +247,11 @@ def main():
                         result = 'WIN' if close_p < entry else 'LOSS'
                     
                     db.update_result(trade['id'], close_p, result, pnl, round(pips,1))
-                    logger.info(f"{'✅' if result=='WIN' else '❌'} {trade['symbol']}: {result} | {trade.get('strategy_name','')}")
+                    logger.info(f"{'WIN' if result=='WIN' else 'LOSS'} {trade['symbol']}: {result} | {trade.get('strategy_name','')}")
             
-            # بحث عن فرص
-            now = datetime.utcnow()
-            if now.weekday() < 5:  # مش ويكند
+            # ✅ استخدام utc_now() بدل utcnow()
+            now = utc_now()
+            if now.weekday() < 5:
                 for symbol in SYMBOLS:
                     if db.has_active_signal(symbol): continue
                     if db.was_recent(symbol): continue
@@ -257,7 +261,6 @@ def main():
                     
                     if df_15m is None: continue
                     
-                    # ✅ كل الاستراتيجيات تشتغل
                     strategies = [
                         strat_rsi_sr(df_15m, symbol),
                         strat_ema_trend(df_15m, symbol),
@@ -271,11 +274,11 @@ def main():
                             s['symbol'] = symbol
                             s['expiry_time'] = (datetime.now() + timedelta(minutes=TRADE_DURATION)).strftime('%Y-%m-%d %H:%M:%S')
                             if db.save_signal(s):
-                                emoji = "🟢" if s['direction']=='BUY' else "🔴"
-                                direction = "شراء" if s['direction']=='BUY' else "بيع"
-                                msg = f"{emoji} **{symbol}** - {direction}\n\n💰 {s['price']:.5f}\n💪 {s['confidence']:.1%}\n📊 {s['strategy_name']}"
+                                emoji = "BUY" if s['direction']=='BUY' else "SELL"
+                                direction = "Buy" if s['direction']=='BUY' else "Sell"
+                                msg = f"{emoji} {symbol} - {direction}\n\n{s['price']:.5f}\n{s['confidence']:.1%}\n{s['strategy_name']}"
                                 send_message(msg)
-                                logger.info(f"✅ {symbol} {s['direction']} | {s['strategy_name']}")
+                                logger.info(f"SIGNAL: {symbol} {s['direction']} | {s['strategy_name']}")
                     
                     time.sleep(1)
             
@@ -283,7 +286,7 @@ def main():
             
         except KeyboardInterrupt: break
         except Exception as e:
-            logger.error(f"خطأ: {e}")
+            logger.error(f"Error: {e}")
             time.sleep(10)
 
 if __name__ == "__main__":
