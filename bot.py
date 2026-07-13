@@ -1,20 +1,22 @@
 #!/usr/bin/env python3
 """
-Falcon Institutional Strategy - Clean
-=======================================
+Falcon Institutional Strategy - Railway Ready
+================================================
 ✅ SMC Strategy: BOS/CHoCH + Order Blocks + Liquidity
-✅ Multi-timeframe (H1/M15/M5)
+✅ Health check server for Railway
 ✅ Full error handling
 ✅ Auto-restart on failure
 """
 
-import os, sys, time, logging, sqlite3, hashlib
+import os, sys, time, logging, sqlite3, hashlib, threading
 from datetime import datetime, timedelta, timezone
+from http.server import HTTPServer, BaseHTTPRequestHandler
 import numpy as np, pandas as pd, yfinance as yf
 import telebot, requests
 
 TELEGRAM_TOKEN = '8773849578:AAH9a6-8hU5YFYTad2EA5jQyfffIoeL8npk'
 TELEGRAM_CHAT_ID = '7553333305'
+PORT = int(os.environ.get('PORT', 8000))
 
 SYMBOLS = ['EURUSD=X', 'GBPUSD=X', 'USDJPY=X', 'AUDUSD=X']
 SCAN_INTERVAL = 60
@@ -30,6 +32,22 @@ try:
 except: pass
 
 tb = telebot.TeleBot(TELEGRAM_TOKEN)
+
+class HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"OK")
+    
+    def log_message(self, format, *args):
+        pass
+
+def start_health_server():
+    try:
+        server = HTTPServer(('0.0.0.0', PORT), HealthHandler)
+        logger.info(f"Health server on port {PORT}")
+        server.serve_forever()
+    except: pass
 
 class Database:
     def __init__(self):
@@ -173,15 +191,15 @@ def analyze_institutional(symbol):
             'setup_type': setup,
             'expiry_time': (datetime.now() + timedelta(minutes=10)).strftime('%Y-%m-%d %H:%M:%S')
         }
-    except Exception as e:
-        logger.error(f"analyze {symbol}: {e}")
-        return None
+    except: return None
 
 def send_message(text):
     try: tb.send_message(TELEGRAM_CHAT_ID, text)
     except: pass
 
 def main():
+    threading.Thread(target=start_health_server, daemon=True).start()
+    
     db = Database()
     logger.info("Falcon Institutional - Started")
     
