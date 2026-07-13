@@ -1,19 +1,18 @@
 #!/usr/bin/env python3
 """
-Falcon AI v5.3 - Independent Strategies
-==========================================
+Falcon AI v5.3 - No Polling (Zero 409)
+========================================
+✅ 4 independent strategies
+✅ No infinity_polling - No 409 error
+✅ Send-only Telegram mode
 ✅ Each strategy works independently
-✅ Sends signal when ANY strategy triggers
-✅ 4 strategies running in parallel
-✅ No agreement needed between strategies
 """
 
-import os, sys, time, logging, sqlite3, hashlib, threading, json
-from typing import Dict, List, Tuple, Optional
+import os, sys, time, logging, sqlite3, hashlib
 from datetime import datetime, timedelta
-import numpy as np, pandas as pd, requests, warnings, telebot
-
-warnings.filterwarnings('ignore')
+import numpy as np, pandas as pd, yfinance as yf
+import telebot
+import requests
 
 TELEGRAM_TOKEN = '8773849578:AAH9a6-8hU5YFYTad2EA5jQyfffIoeL8npk'
 TELEGRAM_CHAT_ID = '7553333305'
@@ -26,10 +25,20 @@ SYMBOLS = [
 SCAN_INTERVAL = 15
 MIN_CONFIDENCE = 0.50
 COOLDOWN_MINUTES = 2
-TRADE_DURATION = 5  # مدة الصفقة بالدقائق
+TRADE_DURATION = 5
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(levelname)-7s | %(message)s', datefmt='%H:%M:%S', handlers=[logging.StreamHandler(sys.stdout)])
 logger = logging.getLogger('FalconV5')
+
+# ✅ حذف Webhook أول حاجة
+try:
+    requests.get(f'https://api.telegram.org/bot{TELEGRAM_TOKEN}/deleteWebhook', timeout=5)
+    time.sleep(1)
+    logger.info("✅ Webhook deleted")
+except: pass
+
+# ✅ بوت إرسال فقط - مفيش polling
+tb = telebot.TeleBot(TELEGRAM_TOKEN)
 
 class DataCache:
     def __init__(self): self.cache = {}; self.ttl = 30
@@ -39,7 +48,6 @@ class DataCache:
             if time.time() - t < self.ttl: return d.copy()
         return None
     def set(self, key, data): self.cache[key] = (data, time.time())
-
 data_cache = DataCache()
 
 def safe_columns(df):
@@ -99,7 +107,6 @@ class DataFetcher:
         cached = data_cache.get(key)
         if cached is not None: return cached
         try:
-            import yfinance as yf
             imap = {'5m':'5m','15m':'15m','1h':'1h','1m':'1m'}
             df = yf.download(symbol, period='5d', interval=imap.get(interval,'5m'), progress=False)
             df = safe_columns(df)
@@ -109,7 +116,7 @@ class DataFetcher:
 
 # ========== INDICATORS ==========
 
-def calc_rsi(df, period=14):
+def calc_rsi(df):
     try:
         c = df['Close'].values; delta = np.diff(c)
         gain = np.mean(delta[delta>0]) if any(delta>0) else 0
@@ -117,11 +124,11 @@ def calc_rsi(df, period=14):
         return round(100-100/(1+gain/(loss+1e-8)),1) if loss>0 else 50
     except: return 50
 
-def calc_atr(df, period=14):
+def calc_atr(df):
     try:
         h,l,c = df['High'].values, df['Low'].values, df['Close'].values
         tr = np.array([max(h[i+1]-l[i+1], abs(h[i+1]-c[i]), abs(l[i+1]-c[i])) for i in range(len(c)-1)])
-        return round(float(np.mean(tr[-period:])),5)
+        return round(float(np.mean(tr[-14:])),5)
     except: return 0.0001
 
 def calc_ema(df, period):
@@ -148,56 +155,45 @@ def calc_fibo(df):
         return {'high':sh,'low':sl,'f382':round(sl+d*0.382,5),'f500':round(sl+d*0.500,5),'f618':round(sl+d*0.618,5)}
     except: return {'high':0,'low':0,'f382':0,'f500':0,'f618':0}
 
-# ========== 4 STRATEGIES (كل واحدة تشتغل لوحدها) ==========
+# ========== 4 STRATEGIES ==========
 
 def strat_rsi_sr(df, symbol):
-    """✅ RSI + دعم/مقاومة"""
     if len(df) < 50: return None
-    price = float(df['Close'].iloc[-1])
-    rsi = calc_rsi(df)
-    atr = calc_atr(df)
+    price = float(df['Close'].iloc[-1]); rsi = calc_rsi(df); atr = calc_atr(df)
     support, resistance = find_sr(df)
-    if support == 0 or resistance == 0: return None
+    if support == 0: return None
     
     if rsi < 40 and (price-support)/support*100 < 0.15:
         return {'direction':'BUY','price':price,'stop_loss':round(support,5),'take_profit':round(price+atr*2,5),'confidence':min(0.80,0.5+(40-rsi)*0.02),'strategy':'divergence','strategy_name':'RSI + دعم'}
-    
     if rsi > 60 and (resistance-price)/price*100 < 0.15:
         return {'direction':'SELL','price':price,'stop_loss':round(resistance,5),'take_profit':round(price-atr*2,5),'confidence':min(0.80,0.5+(rsi-60)*0.02),'strategy':'divergence','strategy_name':'RSI + مقاومة'}
     return None
 
 def strat_ema_trend(df, symbol):
-    """✅ EMA ترند"""
     if len(df) < 60: return None
-    price = float(df['Close'].iloc[-1])
-    ema20 = calc_ema(df,20); ema50 = calc_ema(df,50)
+    price = float(df['Close'].iloc[-1]); ema20=calc_ema(df,20); ema50=calc_ema(df,50)
     atr = calc_atr(df); rsi = calc_rsi(df)
     
     if price > ema20 and ema20 > ema50 and rsi < 60:
         return {'direction':'BUY','price':price,'stop_loss':round(ema50,5),'take_profit':round(price+atr*2,5),'confidence':0.65,'strategy':'ema_cross','strategy_name':'EMA ترند صاعد'}
-    
     if price < ema20 and ema20 < ema50 and rsi > 40:
         return {'direction':'SELL','price':price,'stop_loss':round(ema50,5),'take_profit':round(price-atr*2,5),'confidence':0.65,'strategy':'ema_cross','strategy_name':'EMA ترند هابط'}
     return None
 
 def strat_breakout(df, symbol):
-    """✅ اختراق النطاق"""
     if len(df) < 40: return None
     rl, rh, is_range = find_range(df)
     if not is_range: return None
-    c = df['Close'].values; h = df['High'].values; l = df['Low'].values
-    price = float(c[-1]); atr = calc_atr(df)
+    c = df['Close'].values; price = float(c[-1]); atr = calc_atr(df)
     
     if float(c[-2]) > rh and float(c[-1]) >= rh:
         return {'direction':'BUY','price':price,'stop_loss':round(rl,5),'take_profit':round(price+atr*3,5),'confidence':0.70,'strategy':'breakout_retest','strategy_name':'اختراق علوي'}
-    
     if float(c[-2]) < rl and float(c[-1]) <= rl:
         return {'direction':'SELL','price':price,'stop_loss':round(rh,5),'take_profit':round(price-atr*3,5),'confidence':0.70,'strategy':'breakout_retest','strategy_name':'اختراق سفلي'}
     return None
 
 def strat_fibo(df, df_1h, symbol):
-    """✅ فيبوناتشي"""
-    if len(df) < 50 or len(df_1h) < 50: return None
+    if len(df) < 50 or df_1h is None or len(df_1h) < 50: return None
     fibo = calc_fibo(df_1h)
     if fibo['f500'] == 0: return None
     price = float(df['Close'].iloc[-1])
@@ -206,123 +202,89 @@ def strat_fibo(df, df_1h, symbol):
     
     if trend_up and abs(price-fibo['f500'])/price*100 < 0.15 and rsi < 50:
         return {'direction':'BUY','price':price,'stop_loss':round(fibo['f618'],5),'take_profit':round(fibo['high'],5),'confidence':0.68,'strategy':'fibo_volume','strategy_name':'فيبو 50% صاعد'}
-    
     if not trend_up and abs(price-fibo['f500'])/price*100 < 0.15 and rsi > 50:
         return {'direction':'SELL','price':price,'stop_loss':round(fibo['f618'],5),'take_profit':round(fibo['low'],5),'confidence':0.68,'strategy':'fibo_volume','strategy_name':'فيبو 50% هابط'}
     return None
 
-# ========== MAIN BOT ==========
+# ========== SEND MESSAGE SAFELY ==========
 
-class FalconPro:
-    def __init__(self):
-        self.db = Database()
-        self.tb = telebot.TeleBot(TELEGRAM_TOKEN)
-        self._setup()
+def send_message(text):
+    try:
+        tb.send_message(TELEGRAM_CHAT_ID, text, parse_mode='Markdown')
+    except:
+        try:
+            tb.send_message(TELEGRAM_CHAT_ID, text)
+        except:
+            pass
+
+# ========== MAIN ==========
+
+def main():
+    db = Database()
+    logger.info("🦅 Falcon Pro v5.3 - No Polling")
     
-    def _setup(self):
-        try: requests.get(f'https://api.telegram.org/bot{TELEGRAM_TOKEN}/deleteWebhook', timeout=3)
-        except: pass
-        
-        @self.tb.message_handler(commands=['start'])
-        def start(msg):
-            self.tb.reply_to(msg, "🦅 **Falcon Pro v5.3**\n\n✅ 4 استراتيجيات مستقلة\n⚡️ كل استراتيجية تشتغل لوحدها", parse_mode='Markdown')
+    send_message("🦅 **Falcon Pro v5.3**\n✅ 4 استراتيجيات\n⚡️ يعمل...")
     
-    def analyze(self, symbol):
-        """✅ كل الاستراتيجيات تشتغل - اللي تنجح تتبعت"""
-        results = []
-        
-        if self.db.has_active_signal(symbol): return results
-        if self.db.was_recent(symbol): return results
-        
-        df_15m = DataFetcher.fetch(symbol, '15m')
-        df_1h = DataFetcher.fetch(symbol, '1h')
-        
-        if df_15m is None: return results
-        
-        now = datetime.utcnow()
-        if now.weekday() >= 5: return results
-        
-        # ✅ كل استراتيجية تشتغل لوحدها
-        strategies = [
-            strat_rsi_sr(df_15m, symbol),
-            strat_ema_trend(df_15m, symbol),
-            strat_breakout(df_15m, symbol),
-        ]
-        
-        if df_1h is not None:
-            strategies.append(strat_fibo(df_15m, df_1h, symbol))
-        
-        for s in strategies:
-            if s and s['confidence'] >= MIN_CONFIDENCE:
-                s['symbol'] = symbol
-                s['expiry_time'] = (datetime.now() + timedelta(minutes=TRADE_DURATION)).strftime('%Y-%m-%d %H:%M:%S')
-                results.append(s)
-        
-        return results  # ✅ كل الإشارات الجاهزة
-    
-    def check_trades(self):
-        for trade in self.db.get_expired_trades():
-            try:
+    while True:
+        try:
+            # فحص الصفقات المنتهية
+            for trade in db.get_expired_trades():
                 df = DataFetcher.fetch(trade['symbol'], '1m')
-                if df is None: continue
-                et = datetime.strptime(trade['entry_time'], '%Y-%m-%d %H:%M:%S')
-                xt = datetime.strptime(trade['expiry_time'], '%Y-%m-%d %H:%M:%S')
-                period = df[(df.index >= et) & (df.index <= xt)]
-                if period.empty: continue
-                
-                close_p = float(period['Close'].iloc[-1])
-                entry = trade['entry_price']; direction = trade['direction']
-                is_jpy = "JPY" in trade['symbol']; pv = 0.01 if is_jpy else 0.0001
-                
-                if direction == 'BUY':
-                    pnl = (close_p-entry)/entry*100; pips = (close_p-entry)/pv
-                    result = 'WIN' if close_p > entry else 'LOSS'
-                else:
-                    pnl = (entry-close_p)/entry*100; pips = (entry-close_p)/pv
-                    result = 'WIN' if close_p < entry else 'LOSS'
-                
-                self.db.update_result(trade['id'], close_p, result, pnl, round(pips,1))
-                logger.info(f"{'✅' if result=='WIN' else '❌'} {trade['symbol']}: {result} | {pnl:+.2f}% | {trade.get('strategy_name','')}")
-            except: pass
-    
-    def hunt(self):
-        signals = 0
-        for symbol in SYMBOLS:
-            try:
-                results = self.analyze(symbol)
-                for s in results:
-                    if self.db.save_signal(s):
-                        self.send_signal(s)
-                        signals += 1
-                        time.sleep(0.5)
-                time.sleep(0.2)
-            except: pass
-        if signals > 0: logger.info(f"📊 {signals} إشارة")
-    
-    def send_signal(self, signal):
-        emoji = "🟢" if signal['direction']=='BUY' else "🔴"
-        direction = "شراء" if signal['direction']=='BUY' else "بيع"
-        msg = f"{emoji} **{signal['symbol']}** - {direction}\n\n💰 {signal['price']:.5f}\n💪 {signal['confidence']:.1%}\n📊 {signal['strategy_name']}"
-        try: self.tb.send_message(TELEGRAM_CHAT_ID, msg, parse_mode='Markdown')
-        except: pass
-    
-    def run(self):
-        logger.info("🦅 Falcon Pro v5.3 - 4 Independent Strategies")
-        
-        def poll():
-            while True:
-                try: self.tb.infinity_polling(timeout=10, long_polling_timeout=5)
-                except: time.sleep(5)
-        threading.Thread(target=poll, daemon=True).start()
-        time.sleep(1)
-        
-        while True:
-            try:
-                self.check_trades()
-                self.hunt()
-                time.sleep(SCAN_INTERVAL)
-            except KeyboardInterrupt: break
-            except: time.sleep(10)
+                if df is not None and len(df) > 0:
+                    close_p = float(df['Close'].iloc[-1])
+                    entry = trade['entry_price']; direction = trade['direction']
+                    is_jpy = "JPY" in trade['symbol']; pv = 0.01 if is_jpy else 0.0001
+                    
+                    if direction == 'BUY':
+                        pnl = (close_p-entry)/entry*100; pips = (close_p-entry)/pv
+                        result = 'WIN' if close_p > entry else 'LOSS'
+                    else:
+                        pnl = (entry-close_p)/entry*100; pips = (entry-close_p)/pv
+                        result = 'WIN' if close_p < entry else 'LOSS'
+                    
+                    db.update_result(trade['id'], close_p, result, pnl, round(pips,1))
+                    logger.info(f"{'✅' if result=='WIN' else '❌'} {trade['symbol']}: {result} | {trade.get('strategy_name','')}")
+            
+            # بحث عن فرص
+            now = datetime.utcnow()
+            if now.weekday() < 5:  # مش ويكند
+                for symbol in SYMBOLS:
+                    if db.has_active_signal(symbol): continue
+                    if db.was_recent(symbol): continue
+                    
+                    df_15m = DataFetcher.fetch(symbol, '15m')
+                    df_1h = DataFetcher.fetch(symbol, '1h')
+                    
+                    if df_15m is None: continue
+                    
+                    # ✅ كل الاستراتيجيات تشتغل
+                    strategies = [
+                        strat_rsi_sr(df_15m, symbol),
+                        strat_ema_trend(df_15m, symbol),
+                        strat_breakout(df_15m, symbol),
+                    ]
+                    if df_1h is not None:
+                        strategies.append(strat_fibo(df_15m, df_1h, symbol))
+                    
+                    for s in strategies:
+                        if s and s['confidence'] >= MIN_CONFIDENCE:
+                            s['symbol'] = symbol
+                            s['expiry_time'] = (datetime.now() + timedelta(minutes=TRADE_DURATION)).strftime('%Y-%m-%d %H:%M:%S')
+                            if db.save_signal(s):
+                                emoji = "🟢" if s['direction']=='BUY' else "🔴"
+                                direction = "شراء" if s['direction']=='BUY' else "بيع"
+                                msg = f"{emoji} **{symbol}** - {direction}\n\n💰 {s['price']:.5f}\n💪 {s['confidence']:.1%}\n📊 {s['strategy_name']}"
+                                send_message(msg)
+                                logger.info(f"✅ {symbol} {s['direction']} | {s['strategy_name']}")
+                    
+                    time.sleep(1)
+            
+            time.sleep(SCAN_INTERVAL)
+            
+        except KeyboardInterrupt: break
+        except Exception as e:
+            logger.error(f"خطأ: {e}")
+            time.sleep(10)
 
 if __name__ == "__main__":
-    bot = FalconPro(); bot.run()
+    main()
