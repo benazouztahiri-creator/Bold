@@ -17,8 +17,6 @@ from datetime import datetime, timedelta, timezone
 import numpy as np, pandas as pd, yfinance as yf
 import telebot, requests
 
-warnings = __import__('warnings')
-warnings.filterwarnings('ignore')
 
 TELEGRAM_TOKEN = '8773849578:AAH9a6-8hU5YFYTad2EA5jQyfffIoeL8npk'
 TELEGRAM_CHAT_ID = '7553333305'
