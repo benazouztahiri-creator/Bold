@@ -1,17 +1,18 @@
 #!/usr/bin/env python3
 """
-Falcon AI v6 - Quality Over Quantity
-======================================
-✅ One proven strategy: RSI + Support/Resistance
-✅ High confidence only (>65%)
-✅ 5-min trades
+Falcon AI v6 - Quality Over Quantity (No 409)
+================================================
+✅ RSI + Support/Resistance strategy
+✅ No getUpdates - No 409 error
+✅ Send-only mode
 ✅ Max 2 trades per hour
 """
 
-import os, sys, time, logging, sqlite3, hashlib, threading
+import os, sys, time, logging, sqlite3, hashlib
 from datetime import datetime, timedelta
 import numpy as np, pandas as pd, yfinance as yf
 import telebot
+import requests
 
 TELEGRAM_TOKEN = '8773849578:AAH9a6-8hU5YFYTad2EA5jQyfffIoeL8npk'
 TELEGRAM_CHAT_ID = '7553333305'
@@ -21,6 +22,16 @@ MIN_CONFIDENCE = 0.65
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(levelname)-7s | %(message)s', datefmt='%H:%M:%S', handlers=[logging.StreamHandler(sys.stdout)])
 logger = logging.getLogger('FalconV6')
+
+# ✅ حذف Webhook أول حاجة
+try:
+    requests.get(f'https://api.telegram.org/bot{TELEGRAM_TOKEN}/deleteWebhook', timeout=5)
+    time.sleep(1)
+except:
+    pass
+
+# ✅ بوت إرسال فقط
+tb = telebot.TeleBot(TELEGRAM_TOKEN)
 
 class Database:
     def __init__(self):
@@ -58,12 +69,6 @@ class Database:
         with sqlite3.connect(self.db_path) as conn:
             conn.row_factory = sqlite3.Row
             return [dict(r) for r in conn.execute("SELECT * FROM signals WHERE result='PENDING' AND expiry_time <= datetime('now','localtime')").fetchall()]
-    
-    def stats(self):
-        with sqlite3.connect(self.db_path) as conn:
-            total = conn.execute("SELECT COUNT(*) FROM signals WHERE result!='PENDING'").fetchone()[0]
-            wins = conn.execute("SELECT COUNT(*) FROM signals WHERE result='WIN'").fetchone()[0]
-            return total, wins, wins/total if total > 0 else 0
 
 def get_data(symbol):
     try:
@@ -100,7 +105,6 @@ def analyze(symbol):
     atr = calc_atr(df)
     support, resistance = find_levels(df)
     
-    # ✅ RSI متطرف + قريب من المستوى
     if rsi < 35 and abs(price - support) / support < 0.001:
         sl = round(support - atr * 0.5, 5)
         tp = round(price + atr * 2.0, 5)
@@ -119,71 +123,54 @@ def analyze(symbol):
     
     return None
 
-class FalconPro:
-    def __init__(self):
-        self.db = Database()
-        self.tb = telebot.TeleBot(TELEGRAM_TOKEN)
-        self._setup()
+def main():
+    db = Database()
+    logger.info("🦅 Falcon v6 - Started")
     
-    def _setup(self):
+    # رسالة بداية
+    try: tb.send_message(TELEGRAM_CHAT_ID, "🦅 **Falcon v6**\n✅ جاهز\n⚡️ يراقب السوق...", parse_mode='Markdown')
+    except: pass
+    
+    while True:
         try:
-            import requests
-            requests.get(f'https://api.telegram.org/bot{TELEGRAM_TOKEN}/deleteWebhook', timeout=3)
-        except: pass
-        
-        @self.tb.message_handler(commands=['start'])
-        def start(msg):
-            t, w, r = self.db.stats()
-            self.tb.reply_to(msg, f"🦅 **Falcon v6**\n\n📊 الصفقات: {t}\n✅ الرابحة: {w}\n📈 النسبة: {r:.1%}", parse_mode='Markdown')
-    
-    def run(self):
-        logger.info("🦅 Falcon v6 - Quality First")
-        
-        def poll():
-            while True:
-                try: self.tb.infinity_polling(timeout=10, long_polling_timeout=5)
-                except: time.sleep(5)
-        threading.Thread(target=poll, daemon=True).start()
-        time.sleep(1)
-        
-        while True:
-            try:
-                # فحص الصفقات المنتهية
-                for trade in self.db.get_expired():
-                    df = get_data(trade['symbol'])
-                    if df is not None:
-                        close_p = float(df['Close'].iloc[-1])
-                        entry = trade['entry_price']
-                        direction = trade['direction']
-                        pnl = (close_p-entry)/entry*100 if direction=='BUY' else (entry-close_p)/entry*100
-                        result = 'WIN' if pnl > 0 else 'LOSS'
-                        self.db.update(trade['id'], close_p, result, pnl)
-                        logger.info(f"{'✅' if result=='WIN' else '❌'} {trade['symbol']}: {result} | {pnl:+.2f}%")
+            # فحص الصفقات المنتهية
+            for trade in db.get_expired():
+                df = get_data(trade['symbol'])
+                if df is not None:
+                    close_p = float(df['Close'].iloc[-1])
+                    entry = trade['entry_price']
+                    direction = trade['direction']
+                    pnl = (close_p-entry)/entry*100 if direction=='BUY' else (entry-close_p)/entry*100
+                    result = 'WIN' if pnl > 0 else 'LOSS'
+                    db.update(trade['id'], close_p, result, pnl)
+                    logger.info(f"{'✅' if result=='WIN' else '❌'} {trade['symbol']}: {result} | {pnl:+.2f}%")
+            
+            # حد أقصى 2 صفقة في الساعة
+            if db.recent_count(1) >= 2:
+                time.sleep(60)
+                continue
+            
+            # بحث عن فرصة
+            for symbol in SYMBOLS:
+                if db.was_recent(symbol): continue
                 
-                # ✅ حد أقصى 2 صفقة في الساعة
-                if self.db.recent_count(1) >= 2:
-                    time.sleep(60)
-                    continue
-                
-                # بحث عن فرصة
-                for symbol in SYMBOLS:
-                    if self.db.was_recent(symbol): continue
-                    
-                    signal = analyze(symbol)
-                    if signal and signal['confidence'] >= MIN_CONFIDENCE:
-                        if self.db.save(signal):
-                            emoji = "🟢" if signal['direction']=='BUY' else "🔴"
-                            direction = "شراء" if signal['direction']=='BUY' else "بيع"
-                            msg = f"{emoji} **{symbol}** - {direction}\n\n💰 {signal['price']:.5f}\n💪 {signal['confidence']:.1%}"
-                            try: self.tb.send_message(TELEGRAM_CHAT_ID, msg, parse_mode='Markdown')
-                            except: pass
-                            logger.info(f"✅ {symbol} {signal['direction']} | {signal['confidence']:.1%}")
-                    time.sleep(2)
-                
-                time.sleep(SCAN_INTERVAL)
-                
-            except KeyboardInterrupt: break
-            except: time.sleep(10)
+                signal = analyze(symbol)
+                if signal and signal['confidence'] >= MIN_CONFIDENCE:
+                    if db.save(signal):
+                        emoji = "🟢" if signal['direction']=='BUY' else "🔴"
+                        direction = "شراء" if signal['direction']=='BUY' else "بيع"
+                        msg = f"{emoji} **{symbol}** - {direction}\n\n💰 {signal['price']:.5f}\n💪 {signal['confidence']:.1%}"
+                        try: tb.send_message(TELEGRAM_CHAT_ID, msg, parse_mode='Markdown')
+                        except: pass
+                        logger.info(f"✅ {symbol} {signal['direction']} | {signal['confidence']:.1%}")
+                time.sleep(2)
+            
+            time.sleep(SCAN_INTERVAL)
+            
+        except KeyboardInterrupt: break
+        except Exception as e: 
+            logger.error(f"خطأ: {e}")
+            time.sleep(10)
 
 if __name__ == "__main__":
-    bot = FalconPro(); bot.run()
+    main()
