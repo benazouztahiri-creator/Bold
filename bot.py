@@ -1,18 +1,14 @@
 #!/usr/bin/env python3
 """
-Falcon AI v5.3 - Balanced Quality
-====================================
-✅ 4 professional strategies with optimized thresholds
-✅ More signals, same quality
-✅ RSI Divergence + Breakout + EMA Cross + Fibonacci
-✅ Each strategy independent
-✅ 15-second scanning
-✅ Full error handling
+Falcon AI v5.3 - No Polling (Zero 409)
+========================================
+✅ 4 strategies - Optimized thresholds
+✅ No infinity_polling - Send only
 ✅ Health check for Railway
+✅ Each strategy independent
 """
 
 import os, sys, time, logging, sqlite3, hashlib, threading, json
-from typing import Dict, List, Tuple, Optional
 from datetime import datetime, timedelta, timezone
 from http.server import HTTPServer, BaseHTTPRequestHandler
 import numpy as np, pandas as pd, yfinance as yf
@@ -32,6 +28,7 @@ TRADE_DURATION = 7
 logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(levelname)-7s | %(message)s', datefmt='%H:%M:%S', handlers=[logging.StreamHandler(sys.stdout)])
 logger = logging.getLogger('FalconV5')
 
+# حذف webhook
 try:
     requests.get(f'https://api.telegram.org/bot{TELEGRAM_TOKEN}/deleteWebhook', timeout=5)
     time.sleep(1)
@@ -41,17 +38,10 @@ tb = telebot.TeleBot(TELEGRAM_TOKEN)
 
 class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
-        self.send_response(200)
-        self.end_headers()
-        self.wfile.write(b"OK")
+        self.send_response(200); self.end_headers(); self.wfile.write(b"OK")
     def log_message(self, format, *args): pass
 
-def start_health():
-    try:
-        HTTPServer(('0.0.0.0', PORT), HealthHandler).serve_forever()
-    except: pass
-
-threading.Thread(target=start_health, daemon=True).start()
+threading.Thread(target=lambda: HTTPServer(('0.0.0.0', PORT), HealthHandler).serve_forever(), daemon=True).start()
 
 class DataCache:
     def __init__(self): self.cache = {}; self.ttl = 30
@@ -120,13 +110,6 @@ class Database:
                 conn.row_factory = sqlite3.Row
                 return [dict(r) for r in conn.execute("SELECT * FROM signals WHERE result='PENDING' AND expiry_time <= datetime('now','localtime')").fetchall()]
         except: return []
-    
-    def get_weights(self):
-        try:
-            with sqlite3.connect(self.db_path) as conn:
-                rows = conn.execute('SELECT strategy, wins, total_trades FROM strategy_performance').fetchall()
-                return {r[0]: r[1]/r[2] if r[2]>5 else 0.5 for r in rows}
-        except: return {}
 
 class DataFetcher:
     @staticmethod
@@ -141,8 +124,6 @@ class DataFetcher:
             if not df.empty: data_cache.set(key, df); return df
         except: pass
         return None
-
-# ========== INDICATORS ==========
 
 def calc_rsi(c):
     try:
@@ -174,190 +155,131 @@ def find_range(h, l):
 
 def calc_fibo(h, l):
     try:
-        sh, sl = float(np.max(h)), float(np.min(l))
-        d = sh-sl
+        sh, sl = float(np.max(h)), float(np.min(l)); d = sh-sl
         return {'high':sh,'low':sl,'f382':round(sl+d*0.382,5),'f500':round(sl+d*0.500,5),'f618':round(sl+d*0.618,5)}
     except: return {'high':0,'low':0,'f382':0,'f500':0,'f618':0}
 
-# ========== 4 STRATEGIES (OPTIMIZED) ==========
-
-def strat_rsi_sr(df, symbol):
-    """✅ RSI + دعم/مقاومة - شروط محسنة"""
+def strat_rsi_sr(df):
     if len(df) < 50: return None
     c = df['Close'].values; h = df['High'].values; l = df['Low'].values
     price = float(c[-1]); rsi = calc_rsi(c); atr = calc_atr(h, l, c)
     support, resistance = find_sr(h, l)
     if support == 0: return None
-    
-    # ✅ شراء: RSI < 48 + قريب من الدعم
     if rsi < 48 and (price-support)/support*100 < 0.2:
         return {'direction':'BUY','price':price,'stop_loss':round(support,5),'take_profit':round(price+atr*2,5),'confidence':min(0.78, 0.5+(48-rsi)*0.02),'strategy':'divergence','strategy_name':'RSI + دعم'}
-    
-    # ✅ بيع: RSI > 52 + قريب من المقاومة
     if rsi > 52 and (resistance-price)/price*100 < 0.2:
         return {'direction':'SELL','price':price,'stop_loss':round(resistance,5),'take_profit':round(price-atr*2,5),'confidence':min(0.78, 0.5+(rsi-52)*0.02),'strategy':'divergence','strategy_name':'RSI + مقاومة'}
     return None
 
-def strat_ema_trend(df, symbol):
-    """✅ EMA ترند - شروط محسنة"""
+def strat_ema(df):
     if len(df) < 50: return None
     c = df['Close'].values; h = df['High'].values; l = df['Low'].values
     price = float(c[-1]); ema20 = calc_ema(c, 20); ema50 = calc_ema(c, 50)
     atr = calc_atr(h, l, c); rsi = calc_rsi(c)
-    
     if price > ema20 and ema20 > ema50 and rsi < 65:
         return {'direction':'BUY','price':price,'stop_loss':round(ema50,5),'take_profit':round(price+atr*2,5),'confidence':0.68,'strategy':'ema_cross','strategy_name':'EMA ترند صاعد'}
     if price < ema20 and ema20 < ema50 and rsi > 35:
         return {'direction':'SELL','price':price,'stop_loss':round(ema50,5),'take_profit':round(price-atr*2,5),'confidence':0.68,'strategy':'ema_cross','strategy_name':'EMA ترند هابط'}
     return None
 
-def strat_breakout(df, symbol):
-    """✅ اختراق - شروط محسنة"""
+def strat_breakout(df):
     if len(df) < 40: return None
     c = df['Close'].values; h = df['High'].values; l = df['Low'].values
     rl, rh, is_range = find_range(h, l)
     if not is_range: return None
     price = float(c[-1]); atr = calc_atr(h, l, c)
-    
     if float(c[-2]) > rh and float(c[-1]) >= rh:
         return {'direction':'BUY','price':price,'stop_loss':round(rl,5),'take_profit':round(price+atr*3,5),'confidence':0.72,'strategy':'breakout_retest','strategy_name':'اختراق علوي'}
     if float(c[-2]) < rl and float(c[-1]) <= rl:
         return {'direction':'SELL','price':price,'stop_loss':round(rh,5),'take_profit':round(price-atr*3,5),'confidence':0.72,'strategy':'breakout_retest','strategy_name':'اختراق سفلي'}
     return None
 
-def strat_fibo(df, df_1h, symbol):
-    """✅ فيبوناتشي - شروط محسنة"""
+def strat_fibo(df, df_1h):
     if len(df) < 50 or df_1h is None or len(df_1h) < 50: return None
     fibo = calc_fibo(df_1h['High'].values, df_1h['Low'].values)
     if fibo['f500'] == 0: return None
-    
     c = df['Close'].values; h = df['High'].values; l = df['Low'].values
     price = float(c[-1])
     trend_up = calc_ema(df_1h['Close'].values, 20) > calc_ema(df_1h['Close'].values, 50)
     rsi = calc_rsi(c); atr = calc_atr(h, l, c)
-    
     if trend_up and abs(price-fibo['f500'])/price*100 < 0.2 and rsi < 55:
         return {'direction':'BUY','price':price,'stop_loss':round(fibo['f618'],5),'take_profit':round(fibo['high'],5),'confidence':0.70,'strategy':'fibo_volume','strategy_name':'فيبو 50% صاعد'}
     if not trend_up and abs(price-fibo['f500'])/price*100 < 0.2 and rsi > 45:
         return {'direction':'SELL','price':price,'stop_loss':round(fibo['f618'],5),'take_profit':round(fibo['low'],5),'confidence':0.70,'strategy':'fibo_volume','strategy_name':'فيبو 50% هابط'}
     return None
 
-# ========== MAIN ==========
+def send_message(text):
+    try: tb.send_message(TELEGRAM_CHAT_ID, text)
+    except: pass
 
-class FalconPro:
-    def __init__(self):
-        self.db = Database()
-        self.tb = telebot.TeleBot(TELEGRAM_TOKEN)
-        self._setup()
+def main():
+    db = Database()
+    logger.info("Falcon Pro v5.3 - No Polling")
+    send_message("Falcon Pro v5.3\nReady")
     
-    def _setup(self):
-        try: requests.get(f'https://api.telegram.org/bot{TELEGRAM_TOKEN}/deleteWebhook', timeout=3)
-        except: pass
-        
-        @self.tb.message_handler(commands=['start'])
-        def start(msg):
-            w = self.db.get_weights()
-            text = (f"🦅 **Falcon Pro v5.3**\n\n"
-                   f"1️⃣ RSI+SR: {w.get('divergence',0):.1%}\n"
-                   f"2️⃣ Breakout: {w.get('breakout_retest',0):.1%}\n"
-                   f"3️⃣ EMA: {w.get('ema_cross',0):.1%}\n"
-                   f"4️⃣ Fibo: {w.get('fibo_volume',0):.1%}")
-            self.tb.reply_to(msg, text, parse_mode='Markdown')
-    
-    def analyze(self, symbol):
-        results = []
-        if self.db.has_active(symbol): return results
-        if self.db.was_recent(symbol): return results
-        
-        df_15m = DataFetcher.fetch(symbol, '15m')
-        df_1h = DataFetcher.fetch(symbol, '1h')
-        if df_15m is None: return results
-        
-        now = datetime.now(timezone.utc)
-        if now.weekday() >= 5: return results
-        
-        # ✅ كل الاستراتيجيات تشتغل بشكل مستقل
-        s1 = strat_rsi_sr(df_15m, symbol)
-        if s1 and s1['confidence'] >= MIN_CONFIDENCE:
-            s1['symbol'] = symbol; s1['expiry_time'] = (datetime.now()+timedelta(minutes=TRADE_DURATION)).strftime('%Y-%m-%d %H:%M:%S'); results.append(s1)
-        
-        s2 = strat_ema_trend(df_15m, symbol)
-        if s2 and s2['confidence'] >= MIN_CONFIDENCE:
-            s2['symbol'] = symbol; s2['expiry_time'] = (datetime.now()+timedelta(minutes=TRADE_DURATION)).strftime('%Y-%m-%d %H:%M:%S'); results.append(s2)
-        
-        s3 = strat_breakout(df_15m, symbol)
-        if s3 and s3['confidence'] >= MIN_CONFIDENCE:
-            s3['symbol'] = symbol; s3['expiry_time'] = (datetime.now()+timedelta(minutes=TRADE_DURATION)).strftime('%Y-%m-%d %H:%M:%S'); results.append(s3)
-        
-        if df_1h is not None:
-            s4 = strat_fibo(df_15m, df_1h, symbol)
-            if s4 and s4['confidence'] >= MIN_CONFIDENCE:
-                s4['symbol'] = symbol; s4['expiry_time'] = (datetime.now()+timedelta(minutes=TRADE_DURATION)).strftime('%Y-%m-%d %H:%M:%S'); results.append(s4)
-        
-        return results
-    
-    def check_trades(self):
-        for trade in self.db.get_expired():
-            try:
-                df = DataFetcher.fetch(trade['symbol'], '1m')
-                if df is None: continue
-                et = datetime.strptime(trade['entry_time'], '%Y-%m-%d %H:%M:%S')
-                xt = datetime.strptime(trade['expiry_time'], '%Y-%m-%d %H:%M:%S')
-                period = df[(df.index >= et) & (df.index <= xt)]
-                if period.empty: continue
-                
-                close_p = float(period['Close'].iloc[-1])
-                entry = trade['entry_price']; direction = trade['direction']
-                is_jpy = "JPY" in trade['symbol']; pv = 0.01 if is_jpy else 0.0001
-                
-                if direction == 'BUY':
-                    pnl = (close_p-entry)/entry*100; pips = (close_p-entry)/pv
-                    result = 'WIN' if close_p > entry else 'LOSS'
-                else:
-                    pnl = (entry-close_p)/entry*100; pips = (entry-close_p)/pv
-                    result = 'WIN' if close_p < entry else 'LOSS'
-                
-                self.db.update(trade['id'], close_p, result, pnl, round(pips,1))
-                logger.info(f"{'WIN' if result=='WIN' else 'LOSS'} {trade['symbol']}: {pnl:+.2f}% | {trade.get('strategy_name','')}")
-            except: pass
-    
-    def hunt(self):
-        signals = 0
-        for symbol in SYMBOLS:
-            try:
-                for s in self.analyze(symbol):
-                    if self.db.save(s):
-                        self.send_signal(s); signals += 1
-                        time.sleep(0.5)
-                time.sleep(0.2)
-            except: pass
-        if signals > 0: logger.info(f"{signals} signals")
-    
-    def send_signal(self, signal):
-        emoji = "🟢" if signal['direction']=='BUY' else "🔴"
-        direction = "شراء" if signal['direction']=='BUY' else "بيع"
-        msg = f"{emoji} **{signal['symbol']}** - {direction}\n\n💰 {signal['price']:.5f}\n💪 {signal['confidence']:.1%}\n📊 {signal['strategy_name']}"
-        try: self.tb.send_message(TELEGRAM_CHAT_ID, msg, parse_mode='Markdown')
-        except: pass
-    
-    def run(self):
-        logger.info("Falcon Pro v5.3 - Optimized")
-        
-        def poll():
-            while True:
-                try: self.tb.infinity_polling(timeout=10, long_polling_timeout=5)
-                except: time.sleep(5)
-        threading.Thread(target=poll, daemon=True).start()
-        time.sleep(1)
-        
-        while True:
-            try:
-                self.check_trades()
-                self.hunt()
-                time.sleep(SCAN_INTERVAL)
-            except KeyboardInterrupt: break
-            except: time.sleep(10)
+    while True:
+        try:
+            for trade in db.get_expired():
+                try:
+                    df = DataFetcher.fetch(trade['symbol'], '1m')
+                    if df is None: continue
+                    et = datetime.strptime(trade['entry_time'], '%Y-%m-%d %H:%M:%S')
+                    xt = datetime.strptime(trade['expiry_time'], '%Y-%m-%d %H:%M:%S')
+                    period = df[(df.index >= et) & (df.index <= xt)]
+                    if period.empty: continue
+                    close_p = float(period['Close'].iloc[-1])
+                    entry = trade['entry_price']; direction = trade['direction']
+                    is_jpy = "JPY" in trade['symbol']; pv = 0.01 if is_jpy else 0.0001
+                    if direction == 'BUY':
+                        pnl = (close_p-entry)/entry*100; pips = (close_p-entry)/pv
+                        result = 'WIN' if close_p > entry else 'LOSS'
+                    else:
+                        pnl = (entry-close_p)/entry*100; pips = (entry-close_p)/pv
+                        result = 'WIN' if close_p < entry else 'LOSS'
+                    db.update(trade['id'], close_p, result, pnl, round(pips,1))
+                    logger.info(f"{'WIN' if result=='WIN' else 'LOSS'} {trade['symbol']}: {pnl:+.2f}%")
+                except: pass
+            
+            now = datetime.now(timezone.utc)
+            if now.weekday() < 5:
+                for symbol in SYMBOLS:
+                    try:
+                        if db.has_active(symbol): continue
+                        if db.was_recent(symbol): continue
+                        
+                        df_15m = DataFetcher.fetch(symbol, '15m')
+                        df_1h = DataFetcher.fetch(symbol, '1h')
+                        if df_15m is None: continue
+                        
+                        signals = []
+                        for fn in [strat_rsi_sr, strat_ema, strat_breakout]:
+                            s = fn(df_15m)
+                            if s and s['confidence'] >= MIN_CONFIDENCE: signals.append(s)
+                        if df_1h is not None:
+                            s = strat_fibo(df_15m, df_1h)
+                            if s and s['confidence'] >= MIN_CONFIDENCE: signals.append(s)
+                        
+                        for s in signals:
+                            s['symbol'] = symbol
+                            s['expiry_time'] = (datetime.now() + timedelta(minutes=TRADE_DURATION)).strftime('%Y-%m-%d %H:%M:%S')
+                            if db.save(s):
+                                emoji = "BUY" if s['direction']=='BUY' else "SELL"
+                                direction = "Buy" if s['direction']=='BUY' else "Sell"
+                                msg = f"{emoji} {symbol} - {direction}\n{s['price']:.5f}\n{s['confidence']:.1%}\n{s['strategy_name']}"
+                                send_message(msg)
+                                logger.info(f"SIGNAL: {symbol} {s['direction']} | {s['strategy_name']}")
+                        time.sleep(1)
+                    except: pass
+            
+            time.sleep(SCAN_INTERVAL)
+            
+        except KeyboardInterrupt: break
+        except Exception as e:
+            logger.error(f"Loop: {e}")
+            time.sleep(10)
 
 if __name__ == "__main__":
-    bot = FalconPro()
-    bot.run()
+    while True:
+        try: main()
+        except KeyboardInterrupt: break
+        except: time.sleep(30)
