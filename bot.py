@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """
-Falcon AI v5.3 - No Polling (Zero 409)
-========================================
+Falcon AI v5.3 - Stable No Polling
+====================================
 ✅ 4 strategies - Optimized thresholds
-✅ No infinity_polling - Send only
+✅ No infinity_polling - Zero 409 error
 ✅ Health check for Railway
-✅ Each strategy independent
+✅ Delayed startup message
+✅ Full error handling
 """
 
 import os, sys, time, logging, sqlite3, hashlib, threading, json
@@ -28,7 +29,6 @@ TRADE_DURATION = 7
 logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(levelname)-7s | %(message)s', datefmt='%H:%M:%S', handlers=[logging.StreamHandler(sys.stdout)])
 logger = logging.getLogger('FalconV5')
 
-# حذف webhook
 try:
     requests.get(f'https://api.telegram.org/bot{TELEGRAM_TOKEN}/deleteWebhook', timeout=5)
     time.sleep(1)
@@ -38,7 +38,9 @@ tb = telebot.TeleBot(TELEGRAM_TOKEN)
 
 class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
-        self.send_response(200); self.end_headers(); self.wfile.write(b"OK")
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"OK")
     def log_message(self, format, *args): pass
 
 threading.Thread(target=lambda: HTTPServer(('0.0.0.0', PORT), HealthHandler).serve_forever(), daemon=True).start()
@@ -214,11 +216,16 @@ def send_message(text):
 
 def main():
     db = Database()
-    logger.info("Falcon Pro v5.3 - No Polling")
-    send_message("Falcon Pro v5.3\nReady")
+    logger.info("Falcon Pro v5.3 - Started")
+    
+    # ✅ تأخير رسالة البداية
+    time.sleep(3)
+    try: send_message("Falcon Pro v5.3 Ready")
+    except: pass
     
     while True:
         try:
+            # فحص الصفقات المنتهية
             for trade in db.get_expired():
                 try:
                     df = DataFetcher.fetch(trade['symbol'], '1m')
@@ -240,6 +247,7 @@ def main():
                     logger.info(f"{'WIN' if result=='WIN' else 'LOSS'} {trade['symbol']}: {pnl:+.2f}%")
                 except: pass
             
+            # بحث عن فرص
             now = datetime.now(timezone.utc)
             if now.weekday() < 5:
                 for symbol in SYMBOLS:
