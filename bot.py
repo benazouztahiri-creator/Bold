@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-Falcon AI v6.2 - Railway Optimized
-====================================
-✅ 2 symbols only (EURUSD, USDJPY)
+Falcon AI v6.2 - Railway Optimized (Fixed Symbols)
+====================================================
+✅ EURUSD=X and USDJPY=X with =X suffix
 ✅ 60-second scan interval
 ✅ Minimal memory usage
 ✅ Precision liquidity detection
@@ -19,7 +19,8 @@ TELEGRAM_TOKEN = '8773849578:AAH9a6-8hU5YFYTad2EA5jQyfffIoeL8npk'
 TELEGRAM_CHAT_ID = '7553333305'
 PORT = int(os.environ.get('PORT', 8000))
 
-SYMBOLS = ['EURUSD', 'USDJPY']
+# ✅ الرموز بـ =X
+SYMBOLS = ['EURUSD=X', 'USDJPY=X']
 SCAN_INTERVAL = 60
 MIN_CONFIDENCE = 0.60
 COOLDOWN_MINUTES = 5
@@ -86,6 +87,7 @@ class Database:
         except: return []
 
 def get_data(symbol, interval='15m'):
+    """✅ جلب البيانات - الرمز زي ما هو"""
     try:
         imap = {'15m':'15m','1h':'1h','1m':'1m'}
         df = yf.download(symbol, period='5d', interval=imap.get(interval,'15m'), progress=False)
@@ -93,7 +95,8 @@ def get_data(symbol, interval='15m'):
             if isinstance(df.columns, pd.MultiIndex): df.columns = df.columns.get_level_values(0)
             df.columns = [str(c).lower() for c in df.columns]
             return df
-    except: pass
+    except Exception as e:
+        logger.error(f"get_data {symbol}: {e}")
     return None
 
 def rsi(c):
@@ -144,7 +147,7 @@ def send(text):
 
 def main():
     db = Database()
-    logger.info("Falcon v6.2 - Railway Optimized")
+    logger.info("Falcon v6.2 - Started")
     
     while True:
         try:
