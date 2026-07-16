@@ -1,15 +1,14 @@
 #!/usr/bin/env python3
 """
-Falcon AI v6.2 - Railway Optimized (Fixed Symbols)
-====================================================
-✅ EURUSD=X and USDJPY=X with =X suffix
-✅ 60-second scan interval
-✅ Minimal memory usage
-✅ Precision liquidity detection
-✅ Health check for Railway
+Falcon AI v6.3 - Auto-detect Yahoo symbols
+============================================
+✅ Tries multiple symbol formats until success
+✅ EURUSD and USDJPY
+✅ 60-second scan
+✅ Railway optimized
 """
 
-import os, sys, time, logging, sqlite3, hashlib, threading
+import os, time, logging, sqlite3, hashlib, threading
 from datetime import datetime, timedelta, timezone
 from http.server import HTTPServer, BaseHTTPRequestHandler
 import numpy as np, pandas as pd, yfinance as yf
@@ -19,8 +18,13 @@ TELEGRAM_TOKEN = '8773849578:AAH9a6-8hU5YFYTad2EA5jQyfffIoeL8npk'
 TELEGRAM_CHAT_ID = '7553333305'
 PORT = int(os.environ.get('PORT', 8000))
 
-# ✅ الرموز بـ =X
-SYMBOLS = ['EURUSD=X', 'USDJPY=X']
+# ✅ كل الصيغ الممكنة
+SYMBOL_FORMATS = [
+    ['EURUSD=X', 'USDJPY=X'],
+    ['EURUSD', 'USDJPY'],
+    ['EUR/USD', 'USD/JPY'],
+]
+
 SCAN_INTERVAL = 60
 MIN_CONFIDENCE = 0.60
 COOLDOWN_MINUTES = 5
@@ -42,6 +46,23 @@ class HealthHandler(BaseHTTPRequestHandler):
 
 threading.Thread(target=lambda: HTTPServer(('0.0.0.0', PORT), HealthHandler).serve_forever(), daemon=True).start()
 
+# ✅ اكتشاف أفضل صيغة تلقائياً
+WORKING_SYMBOLS = None
+
+def find_working_symbols():
+    global WORKING_SYMBOLS
+    for fmt in SYMBOL_FORMATS:
+        try:
+            test = yf.download(fmt[0], period='1d', interval='1h', progress=False)
+            if test is not None and not test.empty and len(test) > 5:
+                WORKING_SYMBOLS = fmt
+                logger.info(f"✅ Working format: {fmt}")
+                return
+        except: pass
+    logger.error("❌ No working symbol format found")
+
+find_working_symbols()
+
 class Database:
     def __init__(self):
         self.db_path = 'falcon_v6.db'
@@ -56,8 +77,7 @@ class Database:
                 conn.execute('INSERT OR IGNORE INTO signals (symbol, direction, entry_price, stop_loss, take_profit, confidence, strategy, expiry_time, signal_hash) VALUES (?,?,?,?,?,?,?,?,?)',
                            (d['symbol'], d['direction'], d['entry_price'], d.get('stop_loss'), d.get('take_profit'), d['confidence'], d.get('strategy','v2'), d['expiry_time'], h))
                 conn.commit()
-                return conn.execute('SELECT last_insert_rowid()').fetchone()[0]
-        except: return None
+        except: pass
     
     def update(self, sid, ep, r, pnl, pips):
         try:
@@ -86,17 +106,14 @@ class Database:
                 return [dict(r) for r in conn.execute("SELECT * FROM signals WHERE result='PENDING' AND expiry_time <= datetime('now','localtime')").fetchall()]
         except: return []
 
-def get_data(symbol, interval='15m'):
-    """✅ جلب البيانات - الرمز زي ما هو"""
+def get_data(symbol):
     try:
-        imap = {'15m':'15m','1h':'1h','1m':'1m'}
-        df = yf.download(symbol, period='5d', interval=imap.get(interval,'15m'), progress=False)
+        df = yf.download(symbol, period='5d', interval='15m', progress=False)
         if df is not None and not df.empty:
             if isinstance(df.columns, pd.MultiIndex): df.columns = df.columns.get_level_values(0)
             df.columns = [str(c).lower() for c in df.columns]
             return df
-    except Exception as e:
-        logger.error(f"get_data {symbol}: {e}")
+    except: pass
     return None
 
 def rsi(c):
@@ -146,15 +163,23 @@ def send(text):
     except: pass
 
 def main():
+    if WORKING_SYMBOLS is None:
+        logger.error("Cannot start - no working symbols")
+        send("Error: No data source available")
+        return
+    
     db = Database()
-    logger.info("Falcon v6.2 - Started")
+    logger.info(f"Falcon v6.3 - Using {WORKING_SYMBOLS}")
+    send(f"Falcon v6.3 Started\n{WORKING_SYMBOLS[0]}, {WORKING_SYMBOLS[1]}")
     
     while True:
         try:
             for t in db.get_expired():
                 try:
-                    df = get_data(t['symbol'], '1m')
-                    if df is None: continue
+                    df = yf.download(t['symbol'], period='1d', interval='1m', progress=False)
+                    if df is None or df.empty: continue
+                    if isinstance(df.columns, pd.MultiIndex): df.columns = df.columns.get_level_values(0)
+                    df.columns = [str(c).lower() for c in df.columns]
                     et = datetime.strptime(t['entry_time'], '%Y-%m-%d %H:%M:%S')
                     xt = datetime.strptime(t['expiry_time'], '%Y-%m-%d %H:%M:%S')
                     period = df[(df.index >= et) & (df.index <= xt)]
@@ -170,13 +195,17 @@ def main():
             
             now = datetime.now(timezone.utc)
             if now.weekday() < 5:
-                for symbol in SYMBOLS:
+                for symbol in WORKING_SYMBOLS:
                     try:
                         if db.has_active(symbol): continue
                         if db.was_recent(symbol): continue
                         
-                        df_15m = get_data(symbol, '15m')
-                        df_1h = get_data(symbol, '1h')
+                        df_15m = get_data(symbol)
+                        df_1h = yf.download(symbol, period='5d', interval='1h', progress=False)
+                        if df_1h is not None and not df_1h.empty:
+                            if isinstance(df_1h.columns, pd.MultiIndex): df_1h.columns = df_1h.columns.get_level_values(0)
+                            df_1h.columns = [str(c).lower() for c in df_1h.columns]
+                        
                         if df_15m is None or df_1h is None: continue
                         
                         s = analyze(df_15m, df_1h, symbol)
