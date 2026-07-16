@@ -6,9 +6,10 @@ Falcon AI v6.3 - Auto-detect Yahoo symbols
 ✅ EURUSD and USDJPY
 ✅ 60-second scan
 ✅ Railway optimized
+✅ Fixed: import sys
 """
 
-import os, time, logging, sqlite3, hashlib, threading
+import os, sys, time, logging, sqlite3, hashlib, threading
 from datetime import datetime, timedelta, timezone
 from http.server import HTTPServer, BaseHTTPRequestHandler
 import numpy as np, pandas as pd, yfinance as yf
@@ -18,7 +19,6 @@ TELEGRAM_TOKEN = '8773849578:AAH9a6-8hU5YFYTad2EA5jQyfffIoeL8npk'
 TELEGRAM_CHAT_ID = '7553333305'
 PORT = int(os.environ.get('PORT', 8000))
 
-# ✅ كل الصيغ الممكنة
 SYMBOL_FORMATS = [
     ['EURUSD=X', 'USDJPY=X'],
     ['EURUSD', 'USDJPY'],
@@ -46,7 +46,6 @@ class HealthHandler(BaseHTTPRequestHandler):
 
 threading.Thread(target=lambda: HTTPServer(('0.0.0.0', PORT), HealthHandler).serve_forever(), daemon=True).start()
 
-# ✅ اكتشاف أفضل صيغة تلقائياً
 WORKING_SYMBOLS = None
 
 def find_working_symbols():
@@ -56,10 +55,10 @@ def find_working_symbols():
             test = yf.download(fmt[0], period='1d', interval='1h', progress=False)
             if test is not None and not test.empty and len(test) > 5:
                 WORKING_SYMBOLS = fmt
-                logger.info(f"✅ Working format: {fmt}")
+                logger.info(f"Working format: {fmt}")
                 return
         except: pass
-    logger.error("❌ No working symbol format found")
+    logger.error("No working symbol format found")
 
 find_working_symbols()
 
